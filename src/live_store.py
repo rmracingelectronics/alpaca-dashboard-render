@@ -185,6 +185,49 @@ class LiveStore:
                 payload_json TEXT
             )
             """,
+            """
+            CREATE TABLE IF NOT EXISTS live_candidate_audit (
+                audit_key TEXT PRIMARY KEY,
+                run_id TEXT,
+                created_at_utc TEXT,
+                updated_at_utc TEXT,
+                candidate_time_utc TEXT,
+                candidate_time_et TEXT,
+                session_date TEXT,
+                symbol TEXT,
+                strategy_side TEXT,
+                trigger_type TEXT,
+                strategy_variant TEXT,
+                strategy_preset TEXT,
+                strategy_profile TEXT,
+                quality_gate TEXT,
+                pattern_mode TEXT,
+                selection_mode TEXT,
+                audit_stage TEXT,
+                decision_status TEXT,
+                reject_reason TEXT,
+                rank_before_filter INTEGER,
+                rank_after_filter INTEGER,
+                candidate_score REAL,
+                final_rank_score REAL,
+                entry_reference_price REAL,
+                stop_price REAL,
+                target_price REAL,
+                risk_budget REAL,
+                rvol_time_of_day REAL,
+                daily_atr14_percent REAL,
+                gap_percent REAL,
+                day_relative_strength REAL,
+                open_relative_strength REAL,
+                vwap_extension_atr REAL,
+                qqq_change_from_open REAL,
+                qqq_day_change_percent REAL,
+                atr5m14 REAL,
+                entry_candle_pattern TEXT,
+                candle_pattern_score REAL,
+                payload_json TEXT
+            )
+            """,
             f"""
             CREATE TABLE IF NOT EXISTS live_account_snapshots (
                 id {id_col},
@@ -216,6 +259,9 @@ class LiveStore:
             "CREATE INDEX IF NOT EXISTS idx_live_plans_symbol ON live_signal_plans(symbol)",
             "CREATE INDEX IF NOT EXISTS idx_live_plans_status ON live_signal_plans(status)",
             "CREATE INDEX IF NOT EXISTS idx_live_positions_open ON live_positions(is_open)",
+            "CREATE INDEX IF NOT EXISTS idx_live_candidate_audit_time ON live_candidate_audit(candidate_time_utc)",
+            "CREATE INDEX IF NOT EXISTS idx_live_candidate_audit_status ON live_candidate_audit(decision_status)",
+            "CREATE INDEX IF NOT EXISTS idx_live_candidate_audit_symbol ON live_candidate_audit(symbol)",
         ]
         for stmt in indexes:
             self._execute(stmt)
@@ -281,6 +327,46 @@ class LiveStore:
             "live_events": [
                 ("payload_json", "TEXT"),
                 ("message", "TEXT"),
+            ],
+            "live_candidate_audit": [
+                ("run_id", "TEXT"),
+                ("created_at_utc", "TEXT"),
+                ("updated_at_utc", "TEXT"),
+                ("candidate_time_utc", "TEXT"),
+                ("candidate_time_et", "TEXT"),
+                ("session_date", "TEXT"),
+                ("symbol", "TEXT"),
+                ("strategy_side", "TEXT"),
+                ("trigger_type", "TEXT"),
+                ("strategy_variant", "TEXT"),
+                ("strategy_preset", "TEXT"),
+                ("strategy_profile", "TEXT"),
+                ("quality_gate", "TEXT"),
+                ("pattern_mode", "TEXT"),
+                ("selection_mode", "TEXT"),
+                ("audit_stage", "TEXT"),
+                ("decision_status", "TEXT"),
+                ("reject_reason", "TEXT"),
+                ("rank_before_filter", "INTEGER"),
+                ("rank_after_filter", "INTEGER"),
+                ("candidate_score", "REAL"),
+                ("final_rank_score", "REAL"),
+                ("entry_reference_price", "REAL"),
+                ("stop_price", "REAL"),
+                ("target_price", "REAL"),
+                ("risk_budget", "REAL"),
+                ("rvol_time_of_day", "REAL"),
+                ("daily_atr14_percent", "REAL"),
+                ("gap_percent", "REAL"),
+                ("day_relative_strength", "REAL"),
+                ("open_relative_strength", "REAL"),
+                ("vwap_extension_atr", "REAL"),
+                ("qqq_change_from_open", "REAL"),
+                ("qqq_day_change_percent", "REAL"),
+                ("atr5m14", "REAL"),
+                ("entry_candle_pattern", "TEXT"),
+                ("candle_pattern_score", "REAL"),
+                ("payload_json", "TEXT"),
             ],
         }
         for table, cols in migrations.items():
@@ -553,6 +639,74 @@ class LiveStore:
         except Exception:
             return default
 
+    def upsert_candidate_audit(self, record: dict[str, Any]) -> None:
+        if not record:
+            return
+        audit_key = str(record.get("audit_key") or "").strip()
+        if not audit_key:
+            return
+        ph = self._ph()
+        now = utc_now_iso()
+        data = {
+            "audit_key": audit_key,
+            "run_id": record.get("run_id"),
+            "created_at_utc": record.get("created_at_utc") or now,
+            "updated_at_utc": now,
+            "candidate_time_utc": record.get("candidate_time_utc"),
+            "candidate_time_et": record.get("candidate_time_et"),
+            "session_date": record.get("session_date"),
+            "symbol": str(record.get("symbol") or "").upper(),
+            "strategy_side": record.get("strategy_side"),
+            "trigger_type": record.get("trigger_type"),
+            "strategy_variant": record.get("strategy_variant"),
+            "strategy_preset": record.get("strategy_preset"),
+            "strategy_profile": record.get("strategy_profile"),
+            "quality_gate": record.get("quality_gate"),
+            "pattern_mode": record.get("pattern_mode"),
+            "selection_mode": record.get("selection_mode"),
+            "audit_stage": record.get("audit_stage"),
+            "decision_status": record.get("decision_status"),
+            "reject_reason": record.get("reject_reason"),
+            "rank_before_filter": record.get("rank_before_filter"),
+            "rank_after_filter": record.get("rank_after_filter"),
+            "candidate_score": self._float_or_none(record.get("candidate_score")),
+            "final_rank_score": self._float_or_none(record.get("final_rank_score")),
+            "entry_reference_price": self._float_or_none(record.get("entry_reference_price")),
+            "stop_price": self._float_or_none(record.get("stop_price")),
+            "target_price": self._float_or_none(record.get("target_price")),
+            "risk_budget": self._float_or_none(record.get("risk_budget")),
+            "rvol_time_of_day": self._float_or_none(record.get("rvol_time_of_day")),
+            "daily_atr14_percent": self._float_or_none(record.get("daily_atr14_percent")),
+            "gap_percent": self._float_or_none(record.get("gap_percent")),
+            "day_relative_strength": self._float_or_none(record.get("day_relative_strength")),
+            "open_relative_strength": self._float_or_none(record.get("open_relative_strength")),
+            "vwap_extension_atr": self._float_or_none(record.get("vwap_extension_atr")),
+            "qqq_change_from_open": self._float_or_none(record.get("qqq_change_from_open")),
+            "qqq_day_change_percent": self._float_or_none(record.get("qqq_day_change_percent")),
+            "atr5m14": self._float_or_none(record.get("atr5m14")),
+            "entry_candle_pattern": record.get("entry_candle_pattern"),
+            "candle_pattern_score": self._float_or_none(record.get("candle_pattern_score")),
+            "payload_json": _json_dumps(record.get("payload", record)),
+        }
+        cols = list(data.keys())
+        placeholders = ",".join([ph] * len(cols))
+        update_cols = [c for c in cols if c not in {"audit_key", "created_at_utc"}]
+        sql = f"""
+            INSERT INTO live_candidate_audit ({','.join(cols)}) VALUES ({placeholders})
+            ON CONFLICT(audit_key) DO UPDATE SET {','.join([f'{c}=excluded.{c}' for c in update_cols])}
+        """
+        self._execute(sql, [data[c] for c in cols])
+
+    def upsert_candidate_audits(self, records: Iterable[dict[str, Any]]) -> None:
+        for rec in records or []:
+            try:
+                self.upsert_candidate_audit(rec)
+            except Exception:
+                pass
+
+    def recent_candidate_audit(self, limit: int = 10000) -> pd.DataFrame:
+        return pd.DataFrame(self._fetch(f"SELECT * FROM live_candidate_audit ORDER BY COALESCE(updated_at_utc, created_at_utc) DESC LIMIT {int(limit)}"))
+
     def recent_events(self, limit: int = 100) -> pd.DataFrame:
         rows = self._fetch(f"SELECT * FROM live_events ORDER BY id DESC LIMIT {int(limit)}")
         return pd.DataFrame(rows)
@@ -576,6 +730,7 @@ class LiveStore:
     def dashboard_snapshot(self) -> dict[str, pd.DataFrame | Any]:
         return {
             "events": self.recent_events(100),
+            "candidate_audit": self.recent_candidate_audit(5000),
             "open_positions": self.open_positions(),
             "closed_positions": self.closed_positions(100),
             "orders": self.recent_orders(100),

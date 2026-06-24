@@ -16,7 +16,7 @@ from src.live_store import LiveStore
 from src.live_engine import live_variant_from_dashboard
 from src.symbols import WATCHLISTS, parse_symbols
 
-app = Dash(__name__, suppress_callback_exceptions=True, title="Alpaca Momentum Dashboard V38.7")
+app = Dash(__name__, suppress_callback_exceptions=True, title="Alpaca Momentum Dashboard V38.8")
 server = app.server
 
 
@@ -617,6 +617,16 @@ def live_tab():
         dcc.Download(id="live-report-download"),
         pro_card("Live Worker Controls", "Apply selected dashboard settings to Render and export live reports", [
             html.Div(id="live-status", className="live-status", children="Live monitor loading..."),
+            html.Div(className="form-grid four", children=[
+                field("Live entries from ET", dcc.Input(id="live-entry-start-time", value="09:35", type="text")),
+                field("Live entries until ET", dcc.Input(id="live-entry-end-time", value="15:55", type="text")),
+                field("Require market open", dcc.Dropdown(id="live-require-market-open", options=[{"label": "Yes - Alpaca clock", "value": "true"}, {"label": "No - schedule only", "value": "false"}], value="true", clearable=False)),
+                field("Extended-hours entries", dcc.Dropdown(id="live-allow-extended-hours", options=[{"label": "No", "value": "false"}, {"label": "Yes", "value": "true"}], value="false", clearable=False)),
+            ]),
+            html.Div(className="form-grid two", children=[
+                field("Max-hold exits", dcc.Dropdown(id="live-enable-max-hold-exit", options=[{"label": "Enabled", "value": "true"}, {"label": "Disabled", "value": "false"}], value="true", clearable=False)),
+                html.Div(className="subtle-note", children="These live schedule controls apply globally to every strategy before strategy-specific filters."),
+            ]),
             html.Div(className="live-actions", children=[
                 html.Button("Apply current settings to live worker", id="apply-live-settings-btn", n_clicks=0, className="primary-btn action-btn"),
                 html.Button("Generate live report ZIP", id="generate-live-report-btn", n_clicks=0, className="secondary-btn action-btn"),
@@ -644,7 +654,7 @@ app.layout = html.Div(
     className="page clean-page",
     children=[
         html.Div(className="hero clean-hero", children=[
-            html.Div(children=[html.Div("ALPACA MOMENTUM LAB", className="eyebrow"), html.H1("Trading Research & Live Monitor V38.7"), html.P("Clean two-tab workspace for backtesting, live paper execution, strategy settings and analysis reports.")]),
+            html.Div(children=[html.Div("ALPACA MOMENTUM LAB", className="eyebrow"), html.H1("Trading Research & Live Monitor V38.8"), html.P("Clean two-tab workspace for backtesting, live paper execution, strategy settings and analysis reports.")]),
             html.Div(className=status_class, children=status_text),
         ]),
         html.Div(className="clean-shell", children=[
@@ -705,7 +715,7 @@ def _live_config_from_controls(strategy_profile, settings_preset, preset, custom
                                quality_min_dir_open_rs, quality_max_dir_open_rs, quality_min_dir_vwap, quality_max_dir_vwap, quality_max_abs_vwap,
                                account_value, risk_dollars, risk_mode, base_risk_pct, min_risk_dollars, max_risk_dollars, dd1_risk_pct, dd2_risk_pct, pause_dd_pct,
                                min_score, max_trades, slippage_bps, use_news, candle_mode, macro_filter, stress_filter, news_filter, qqq_stress_threshold,
-                               kill_switch, enable_mr, enable_or, direction_mode):
+                               kill_switch, enable_mr, enable_or, direction_mode, live_entry_start_time, live_entry_end_time, live_require_market_open, live_allow_extended_hours, live_enable_max_hold_exit):
     custom_symbols_active = bool(str(custom_symbols or "").strip())
     symbols = parse_symbols(custom_symbols or "", preset=preset or "v25_playbook")
     if not symbols:
@@ -760,6 +770,11 @@ def _live_config_from_controls(strategy_profile, settings_preset, preset, custom
         "enable_mr": _bool_from_dropdown(enable_mr),
         "enable_or": _bool_from_dropdown(enable_or),
         "direction_mode": direction_mode or "long_short",
+        "live_entry_start_time_et": live_entry_start_time or "09:35",
+        "live_entry_end_time_et": live_entry_end_time or "15:55",
+        "live_require_market_open": _bool_from_dropdown(live_require_market_open),
+        "live_allow_extended_hours_entries": _bool_from_dropdown(live_allow_extended_hours),
+        "live_enable_max_hold_exit": _bool_from_dropdown(live_enable_max_hold_exit),
         "selection_mode": "seen_so_far_top_n",
     }
 
@@ -777,9 +792,10 @@ def _live_config_from_controls(strategy_profile, settings_preset, preset, custom
     State("account-value", "value"), State("risk-dollars-v12", "value"), State("risk-mode", "value"), State("base-risk-pct", "value"), State("min-risk-dollars", "value"), State("max-risk-dollars", "value"), State("dd1-risk-pct", "value"), State("dd2-risk-pct", "value"), State("pause-dd-pct", "value"),
     State("min-score", "value"), State("max-trades", "value"), State("slippage-bps", "value"), State("use-news", "value"), State("candle-mode", "value"),
     State("macro-filter", "value"), State("stress-filter", "value"), State("news-filter", "value"), State("qqq-stress-threshold", "value"), State("kill-switch", "value"), State("enable-mr", "value"), State("enable-or", "value"), State("direction-mode", "value"),
+    State("live-entry-start-time", "value"), State("live-entry-end-time", "value"), State("live-require-market-open", "value"), State("live-allow-extended-hours", "value"), State("live-enable-max-hold-exit", "value"),
     prevent_initial_call=True,
 )
-def live_actions(apply_clicks, report_clicks, strategy_profile, settings_preset, preset, custom_symbols, feed, backtest_session_mode, live_quality_gate, quality_start_time, quality_end_time, quality_min_rvol, quality_min_daily_atr, quality_min_dir_rs, quality_max_dir_rs, quality_min_dir_open_rs, quality_max_dir_open_rs, quality_min_dir_vwap, quality_max_dir_vwap, quality_max_abs_vwap, account_value, risk_dollars, risk_mode, base_risk_pct, min_risk_dollars, max_risk_dollars, dd1_risk_pct, dd2_risk_pct, pause_dd_pct, min_score, max_trades, slippage_bps, use_news, candle_mode, macro_filter, stress_filter, news_filter, qqq_stress_threshold, kill_switch, enable_mr, enable_or, direction_mode):
+def live_actions(apply_clicks, report_clicks, strategy_profile, settings_preset, preset, custom_symbols, feed, backtest_session_mode, live_quality_gate, quality_start_time, quality_end_time, quality_min_rvol, quality_min_daily_atr, quality_min_dir_rs, quality_max_dir_rs, quality_min_dir_open_rs, quality_max_dir_open_rs, quality_min_dir_vwap, quality_max_dir_vwap, quality_max_abs_vwap, account_value, risk_dollars, risk_mode, base_risk_pct, min_risk_dollars, max_risk_dollars, dd1_risk_pct, dd2_risk_pct, pause_dd_pct, min_score, max_trades, slippage_bps, use_news, candle_mode, macro_filter, stress_filter, news_filter, qqq_stress_threshold, kill_switch, enable_mr, enable_or, direction_mode, live_entry_start_time, live_entry_end_time, live_require_market_open, live_allow_extended_hours, live_enable_max_hold_exit):
     trigger = ctx.triggered_id
     if trigger == "generate-live-report-btn":
         try:
@@ -788,10 +804,10 @@ def live_actions(apply_clicks, report_clicks, strategy_profile, settings_preset,
         except Exception as exc:
             return f"Live report generation failed: {exc}", no_update
     if trigger == "apply-live-settings-btn":
-        cfg = _live_config_from_controls(strategy_profile, settings_preset, preset, custom_symbols, feed, backtest_session_mode, live_quality_gate, quality_start_time, quality_end_time, quality_min_rvol, quality_min_daily_atr, quality_min_dir_rs, quality_max_dir_rs, quality_min_dir_open_rs, quality_max_dir_open_rs, quality_min_dir_vwap, quality_max_dir_vwap, quality_max_abs_vwap, account_value, risk_dollars, risk_mode, base_risk_pct, min_risk_dollars, max_risk_dollars, dd1_risk_pct, dd2_risk_pct, pause_dd_pct, min_score, max_trades, slippage_bps, use_news, candle_mode, macro_filter, stress_filter, news_filter, qqq_stress_threshold, kill_switch, enable_mr, enable_or, direction_mode)
+        cfg = _live_config_from_controls(strategy_profile, settings_preset, preset, custom_symbols, feed, backtest_session_mode, live_quality_gate, quality_start_time, quality_end_time, quality_min_rvol, quality_min_daily_atr, quality_min_dir_rs, quality_max_dir_rs, quality_min_dir_open_rs, quality_max_dir_open_rs, quality_min_dir_vwap, quality_max_dir_vwap, quality_max_abs_vwap, account_value, risk_dollars, risk_mode, base_risk_pct, min_risk_dollars, max_risk_dollars, dd1_risk_pct, dd2_risk_pct, pause_dd_pct, min_score, max_trades, slippage_bps, use_news, candle_mode, macro_filter, stress_filter, news_filter, qqq_stress_threshold, kill_switch, enable_mr, enable_or, direction_mode, live_entry_start_time, live_entry_end_time, live_require_market_open, live_allow_extended_hours, live_enable_max_hold_exit)
         try:
             LiveStore().set_state("live_config_override", cfg)
-            return f"Applied live worker settings: strategy_variant={cfg['strategy_variant']}, gate={cfg['live_quality_gate']}, symbols={len(cfg['symbols'])}, max daily trades={cfg['max_daily_trades']}. The Render worker will pick this up on its next scan if it shares DATABASE_URL.", no_update
+            return f"Applied live worker settings: strategy_variant={cfg['strategy_variant']}, gate={cfg['live_quality_gate']}, symbols={len(cfg['symbols'])}, max daily trades={cfg['max_daily_trades']}, live entries {cfg['live_entry_start_time_et']}-{cfg['live_entry_end_time_et']} ET. The Render worker will pick this up on its next scan if it shares DATABASE_URL.", no_update
         except Exception as exc:
             return f"Could not apply live worker settings: {exc}", no_update
     return no_update, no_update

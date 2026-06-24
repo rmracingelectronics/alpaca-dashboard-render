@@ -60,6 +60,9 @@ class LiveSettings:
     max_daily_loss_dollars: float = 500.0
     force_market_open: bool = True
     enable_max_hold_exit: bool = True
+    entry_start_time_et: str = "09:35"
+    entry_end_time_et: str = "15:55"
+    allow_extended_hours_entries: bool = False
     use_news_proxy: bool = True
     q_learning_filter_enabled: bool = False
     q_learning_policy_path: str = ""
@@ -118,6 +121,9 @@ def load_live_settings_from_env() -> tuple[LiveSettings, LiveRiskConfig]:
         max_daily_loss_dollars=max(0.0, _env_float("LIVE_MAX_DAILY_LOSS_DOLLARS", 500.0)),
         force_market_open=_env_bool("LIVE_REQUIRE_MARKET_OPEN", True),
         enable_max_hold_exit=_env_bool("LIVE_ENABLE_MAX_HOLD_EXIT", True),
+        entry_start_time_et=os.getenv("LIVE_ENTRY_START_TIME_ET", "09:35"),
+        entry_end_time_et=os.getenv("LIVE_ENTRY_END_TIME_ET", "15:55"),
+        allow_extended_hours_entries=_env_bool("LIVE_ALLOW_EXTENDED_HOURS_ENTRIES", False),
         use_news_proxy=_env_bool("LIVE_USE_NEWS_PROXY", True),
         q_learning_filter_enabled=_env_bool("LIVE_Q_POLICY_ENABLED", False),
         q_learning_policy_path=os.getenv("LIVE_Q_POLICY_PATH", ""),
@@ -359,6 +365,36 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
     return default
 
 
+def _parse_hhmm(value: Any, default: str) -> tuple[int, int]:
+    raw = str(value or default).strip()
+    try:
+        parts = raw.split(":")
+        h = int(parts[0])
+        m = int(parts[1]) if len(parts) > 1 else 0
+        if 0 <= h <= 23 and 0 <= m <= 59:
+            return h, m
+    except Exception:
+        pass
+    h, m = default.split(":")
+    return int(h), int(m)
+
+
+def _time_in_window(ts_et: pd.Timestamp | datetime, start_hhmm: Any, end_hhmm: Any) -> bool:
+    ts = pd.Timestamp(ts_et)
+    if ts.tzinfo is None:
+        ts = ts.tz_localize(NY)
+    else:
+        ts = ts.tz_convert(NY)
+    start_h, start_m = _parse_hhmm(start_hhmm, "09:35")
+    end_h, end_m = _parse_hhmm(end_hhmm, "15:55")
+    minutes = ts.hour * 60 + ts.minute
+    start = start_h * 60 + start_m
+    end = end_h * 60 + end_m
+    if start <= end:
+        return start <= minutes <= end
+    return minutes >= start or minutes <= end
+
+
 def _order_side(strategy_side: str) -> str:
     return "buy" if str(strategy_side).lower() == "long" else "sell"
 
@@ -478,6 +514,11 @@ class LivePaperTradingEngine:
         self.live.max_orders_per_symbol_per_day = max(1, int(_safe_float(cfg.get("max_orders_per_symbol_per_day"), self.live.max_orders_per_symbol_per_day)))
         self.live.use_news_proxy = str(cfg.get("use_news", self.live.use_news_proxy)).lower() in {"1", "true", "yes", "on"}
         self.live.selection_mode = str(cfg.get("selection_mode") or self.live.selection_mode or "seen_so_far_top_n")
+        self.live.entry_start_time_et = str(cfg.get("live_entry_start_time_et") or cfg.get("quality_start_time") or self.live.entry_start_time_et or "09:35")
+        self.live.entry_end_time_et = str(cfg.get("live_entry_end_time_et") or cfg.get("quality_end_time") or self.live.entry_end_time_et or "15:55")
+        self.live.allow_extended_hours_entries = str(cfg.get("live_allow_extended_hours_entries", self.live.allow_extended_hours_entries)).lower() in {"1", "true", "yes", "on"}
+        self.live.force_market_open = str(cfg.get("live_require_market_open", self.live.force_market_open)).lower() in {"1", "true", "yes", "on"}
+        self.live.enable_max_hold_exit = str(cfg.get("live_enable_max_hold_exit", self.live.enable_max_hold_exit)).lower() in {"1", "true", "yes", "on"}
 
         self.risk.account_value_fallback = _safe_float(cfg.get("account_value"), self.risk.account_value_fallback)
         self.risk.fixed_risk_dollars = _safe_float(cfg.get("risk_dollars"), self.risk.fixed_risk_dollars)
@@ -533,6 +574,10 @@ class LivePaperTradingEngine:
             "strategy_variant": getattr(self.params, "live_strategy_variant", getattr(self.live, "strategy_variant", "best_report_153601")),
             "quality_gate": getattr(self.params, "live_quality_gate", "env"),
             "config_source": getattr(self.live, "live_config_source", "env"),
+            "entry_start_time_et": getattr(self.live, "entry_start_time_et", "09:35"),
+            "entry_end_time_et": getattr(self.live, "entry_end_time_et", "15:55"),
+            "allow_extended_hours_entries": getattr(self.live, "allow_extended_hours_entries", False),
+            "force_market_open": getattr(self.live, "force_market_open", True),
         }
         if extra:
             payload.update(extra)
@@ -564,7 +609,11 @@ class LivePaperTradingEngine:
             return bool(clock.get("is_open"))
         except Exception:
             ny = datetime.now(NY)
-            return ny.weekday() < 5 and ((ny.hour, ny.minute) >= (9, 35)) and ((ny.hour, ny.minute) <= (15, 55))
+            if ny.weekday() >= 5:
+                return False
+            if bool(getattr(self.live, "allow_extended_hours_entries", False)):
+                return _time_in_window(pd.Timestamp(ny), getattr(self.live, "entry_start_time_et", "04:00"), getattr(self.live, "entry_end_time_et", "20:00"))
+            return _time_in_window(pd.Timestamp(ny), max(str(getattr(self.live, "entry_start_time_et", "09:35")), "09:30"), min(str(getattr(self.live, "entry_end_time_et", "15:55")), "16:00"))
 
     def _parse_strategy_client_order_id(self, client_order_id: str) -> dict[str, Any] | None:
         cid = str(client_order_id or "").strip()
@@ -757,8 +806,94 @@ class LivePaperTradingEngine:
         )
         return out
 
+    def _candidate_audit_key(self, row: pd.Series | dict[str, Any]) -> str:
+        get = row.get if isinstance(row, dict) else row.get
+        ts = pd.Timestamp(get("timestamp", get("candidate_time_utc", pd.Timestamp.now(tz="UTC"))))
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        else:
+            ts = ts.tz_convert("UTC")
+        return "|".join([
+            str(ts.isoformat()),
+            str(get("symbol", "")).upper(),
+            str(get("side", get("strategy_side", ""))).lower(),
+            str(get("trigger_type", "")),
+        ])
+
+    def _audit_record_from_signal(self, signal: pd.Series | dict[str, Any], run_id: str, status: str, reason: str = "", stage: str = "candidate", rank_before: int | None = None, rank_after: int | None = None, plan: dict[str, Any] | None = None) -> dict[str, Any]:
+        data = signal.to_dict() if hasattr(signal, "to_dict") else dict(signal or {})
+        ts = pd.Timestamp(data.get("timestamp", data.get("candidate_time_utc", pd.Timestamp.now(tz="UTC"))))
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        else:
+            ts = ts.tz_convert("UTC")
+        ts_et = ts.tz_convert(NY)
+        ctx_payload = self._signal_context_payload(pd.Series(data)) if not isinstance(signal, pd.Series) else self._signal_context_payload(signal)
+        record = {
+            "audit_key": self._candidate_audit_key(data),
+            "run_id": run_id,
+            "candidate_time_utc": ts.isoformat(),
+            "candidate_time_et": ts_et.strftime("%Y-%m-%d %H:%M"),
+            "session_date": ts_et.date().isoformat(),
+            "symbol": str(data.get("symbol", "")).upper(),
+            "strategy_side": str(data.get("side", data.get("strategy_side", ""))).lower(),
+            "trigger_type": str(data.get("trigger_type", "")),
+            "strategy_variant": getattr(self.params, "live_strategy_variant", getattr(self.live, "strategy_variant", "best_report_153601")),
+            "strategy_preset": getattr(self.params, "live_strategy_preset", "env"),
+            "strategy_profile": str(getattr(self.params, "strategy_profile", "symbol_playbook_v25")),
+            "quality_gate": getattr(self.params, "live_quality_gate", "env"),
+            "pattern_mode": str(getattr(self.params, "v379_pattern_mode", "")),
+            "selection_mode": str(getattr(self.live, "selection_mode", "seen_so_far_top_n")),
+            "audit_stage": stage,
+            "decision_status": status,
+            "reject_reason": reason,
+            "rank_before_filter": rank_before,
+            "rank_after_filter": rank_after,
+            "candidate_score": _safe_float(data.get("candidate_score", data.get("score", 0.0)), 0.0),
+            "final_rank_score": _safe_float(data.get("score", data.get("candidate_score", 0.0)), 0.0),
+            "entry_reference_price": (plan or {}).get("entry_reference_price"),
+            "stop_price": (plan or {}).get("stop_price"),
+            "target_price": (plan or {}).get("target_price"),
+            "risk_budget": (plan or {}).get("risk_budget"),
+            "rvol_time_of_day": _safe_float(data.get("rvol_time_of_day", data.get("rvol_tod", 0.0)), 0.0),
+            "daily_atr14_percent": _safe_float(data.get("daily_atr14_percent", 0.0), 0.0),
+            "gap_percent": _safe_float(data.get("gap_percent", data.get("gap_pct", 0.0)), 0.0),
+            "day_relative_strength": _safe_float(data.get("day_relative_strength", 0.0), 0.0),
+            "open_relative_strength": _safe_float(data.get("open_relative_strength", 0.0), 0.0),
+            "vwap_extension_atr": _safe_float(data.get("vwap_extension_atr", 0.0), 0.0),
+            "qqq_change_from_open": _safe_float(data.get("qqq_change_from_open", data.get("qqq_chg_open", 0.0)), 0.0),
+            "qqq_day_change_percent": _safe_float(data.get("qqq_day_change_percent", 0.0), 0.0),
+            "atr5m14": _safe_float(data.get("atr5m14", 0.0), 0.0),
+            "entry_candle_pattern": data.get("entry_candle_pattern") or data.get("candle_pattern_primary"),
+            "candle_pattern_score": _safe_float(data.get("candle_pattern_score", 0.0), 0.0),
+            "payload": {"signal_context": ctx_payload, "plan": plan or {}},
+        }
+        return record
+
+    def _audit_candidates(self, df: pd.DataFrame, run_id: str, status: str, reason: str = "", stage: str = "candidate", rank_col: str | None = None) -> None:
+        if df is None or df.empty:
+            return
+        records = []
+        ranked = df.copy()
+        if rank_col and rank_col in ranked.columns:
+            ranked = ranked.sort_values(rank_col, ascending=False).reset_index(drop=True)
+        for idx, row in ranked.iterrows():
+            records.append(self._audit_record_from_signal(row, run_id, status, reason=reason, stage=stage, rank_before=int(idx) + 1))
+        self.store.upsert_candidate_audits(records)
+
+    def _within_live_entry_window(self, ts: pd.Timestamp | datetime | None = None) -> bool:
+        ts = pd.Timestamp(ts or datetime.now(NY))
+        if ts.tzinfo is None:
+            ts = ts.tz_localize(NY)
+        else:
+            ts = ts.tz_convert(NY)
+        if ts.weekday() >= 5:
+            return False
+        return _time_in_window(ts, getattr(self.live, "entry_start_time_et", "09:35"), getattr(self.live, "entry_end_time_et", "15:55"))
+
     def fetch_recent_signals(self) -> pd.DataFrame:
         now = _now_utc()
+        run_id = pd.Timestamp(now).strftime("%Y%m%dT%H%M%SZ")
         closed_ts = latest_closed_5m_start(now)
         today_ny = closed_ts.tz_convert("America/New_York").date()
         symbols = list(dict.fromkeys([s.upper() for s in (self.live.symbols or []) if s]))
@@ -796,10 +931,43 @@ class LivePaperTradingEngine:
             return pd.DataFrame()
         alerts_all = pd.concat(frames, ignore_index=True)
         alerts_all = self._add_live_v25_filter_aliases(alerts_all)
+        self._audit_candidates(alerts_all, run_id, "seen", "raw_signal_seen", stage="raw_signal", rank_col="score")
+
+        # Global live-entry schedule applies to every strategy and every gate.
+        # Strategy-internal windows can still be stricter, but they cannot bypass this dashboard schedule.
+        ts_et = pd.to_datetime(alerts_all["timestamp"], utc=True, errors="coerce").dt.tz_convert("America/New_York")
+        in_window = ts_et.map(lambda x: _time_in_window(x, getattr(self.live, "entry_start_time_et", "09:35"), getattr(self.live, "entry_end_time_et", "15:55")))
+        if not bool(getattr(self.live, "allow_extended_hours_entries", False)):
+            regular = ts_et.map(lambda x: _time_in_window(x, "09:30", "16:00"))
+            in_window = in_window & regular
+        rejected_schedule = alerts_all[~in_window].copy()
+        self._audit_candidates(rejected_schedule, run_id, "rejected", "outside_dashboard_live_entry_window", stage="global_schedule", rank_col="score")
+        alerts_all = alerts_all[in_window].copy()
+        if alerts_all.empty:
+            return alerts_all
+
         min_score = float(getattr(self.params, "min_candidate_score", 2.0) or 2.0)
-        alerts_all = alerts_all[pd.to_numeric(alerts_all["score"], errors="coerce").fillna(-9999.0) >= min_score].copy()
+        score_ok = pd.to_numeric(alerts_all["score"], errors="coerce").fillna(-9999.0) >= min_score
+        self._audit_candidates(alerts_all[~score_ok].copy(), run_id, "rejected", f"score_below_min_{min_score:g}", stage="min_score", rank_col="score")
+        alerts_all = alerts_all[score_ok].copy()
+        if alerts_all.empty:
+            return alerts_all
+
+        before_candle = alerts_all.copy()
         alerts_all = _apply_v25_candlestick_filter(alerts_all, str(getattr(self.params, "candle_pattern_mode", "selective")))
+        removed_keys = set(before_candle.apply(lambda r: self._candidate_audit_key(r), axis=1)) - set(alerts_all.apply(lambda r: self._candidate_audit_key(r), axis=1)) if not before_candle.empty else set()
+        if removed_keys:
+            removed = before_candle[before_candle.apply(lambda r: self._candidate_audit_key(r) in removed_keys, axis=1)].copy()
+            self._audit_candidates(removed, run_id, "rejected", "candlestick_filter", stage="candlestick", rank_col="score")
+        if alerts_all.empty:
+            return alerts_all
+
+        before_pre = alerts_all.copy()
         alerts_all, stats = _v27_apply_preselection_filters(alerts_all, self.params, use_news=bool(self.live.use_news_proxy))
+        removed_keys = set(before_pre.apply(lambda r: self._candidate_audit_key(r), axis=1)) - set(alerts_all.apply(lambda r: self._candidate_audit_key(r), axis=1)) if not before_pre.empty else set()
+        if removed_keys:
+            removed = before_pre[before_pre.apply(lambda r: self._candidate_audit_key(r) in removed_keys, axis=1)].copy()
+            self._audit_candidates(removed, run_id, "rejected", "preselection_or_quality_gate_filter", stage="preselection", rank_col="score")
         if bool(getattr(self.live, "q_learning_filter_enabled", False)) and not alerts_all.empty:
             try:
                 policy_path = str(getattr(self.live, "q_learning_policy_path", "") or getattr(self.params, "q_learning_policy_path", "") or "").strip()
@@ -812,6 +980,7 @@ class LivePaperTradingEngine:
                         min_state_count=int(getattr(self.live, "q_learning_min_state_count", 8) or 8),
                     )
                     approved = q_reviewed["q_policy_approved"].fillna(False).astype(bool)
+                    self._audit_candidates(q_reviewed[~approved].copy(), run_id, "rejected", "q_policy_rejected", stage="q_policy", rank_col="score")
                     self.store.set_state("last_q_policy_stats", {
                         "enabled": True,
                         "policy_path": policy_path,
@@ -837,6 +1006,7 @@ class LivePaperTradingEngine:
                     approved = pd.to_numeric(ml_reviewed.get("ml_pred_r", -9999.0), errors="coerce").fillna(-9999.0) >= min_pred
                     if min_win > 0 and "ml_pred_win_prob" in ml_reviewed.columns:
                         approved = approved & (pd.to_numeric(ml_reviewed["ml_pred_win_prob"], errors="coerce").fillna(0.0) >= min_win)
+                    self._audit_candidates(ml_reviewed[~approved].copy(), run_id, "rejected", "ml_ranker_rejected", stage="ml_ranker", rank_col="score")
                     self.store.set_state("last_ml_ranker_stats", {
                         "enabled": True,
                         "model_path": ml_path,
@@ -859,16 +1029,26 @@ class LivePaperTradingEngine:
             return alerts_all
         selected_so_far = _v27_select_top_n_with_caps(alerts_all, int(getattr(self.params, "max_trades_per_day", 2) or 2), self.params)
         if selected_so_far.empty:
+            self._audit_candidates(alerts_all, run_id, "rejected", "topn_caps_selected_none", stage="topn", rank_col="score")
             return selected_so_far
         selected_so_far["timestamp"] = pd.to_datetime(selected_so_far["timestamp"], utc=True, errors="coerce")
         if str(self.live.selection_mode).lower() == "latest_bar_only":
             out = alerts_all[alerts_all["timestamp"] == closed_ts].copy()
+            selected_keys = set(out.apply(lambda r: self._candidate_audit_key(r), axis=1)) if not out.empty else set()
         else:
             out = selected_so_far[selected_so_far["timestamp"] == closed_ts].copy()
+            selected_keys = set(out.apply(lambda r: self._candidate_audit_key(r), axis=1)) if not out.empty else set()
+        not_selected = alerts_all[~alerts_all.apply(lambda r: self._candidate_audit_key(r) in selected_keys, axis=1)].copy()
+        self._audit_candidates(not_selected, run_id, "rejected", "not_latest_selected_candidate_or_topn_cap", stage="topn_latest", rank_col="score")
         if out.empty:
             return out
         out["session_date"] = out["timestamp"].dt.tz_convert("America/New_York").dt.date.astype(str)
-        return out.sort_values(["score", "timestamp"], ascending=[False, True]).reset_index(drop=True)
+        out = out.sort_values(["score", "timestamp"], ascending=[False, True]).reset_index(drop=True)
+        records = []
+        for idx, row in out.iterrows():
+            records.append(self._audit_record_from_signal(row, run_id, "accepted", "selected_for_order_planning", stage="selected", rank_after=int(idx) + 1))
+        self.store.upsert_candidate_audits(records)
+        return out
 
     def _latest_reference_prices(self, symbols: list[str]) -> dict[str, float]:
         out: dict[str, float] = {}
@@ -1037,6 +1217,20 @@ class LivePaperTradingEngine:
             self._heartbeat("idle", "Market is closed.", {"open_positions": len(positions)})
             self._save_engine_state()
             return rows
+        if not self._within_live_entry_window(pd.Timestamp.now(tz=NY)):
+            row = {
+                "timestamp": timestamp,
+                "event": "entry_window_closed",
+                "message": f"No new entries because dashboard live entry window is {self.live.entry_start_time_et}-{self.live.entry_end_time_et} ET.",
+                "entry_start_time_et": self.live.entry_start_time_et,
+                "entry_end_time_et": self.live.entry_end_time_et,
+            }
+            rows.append(row)
+            self.store.insert_event("entry_window_closed", row, status="idle")
+            _append_log(self.live.log_path, rows)
+            self._heartbeat("idle", "Entry window closed.", {"open_positions": len(positions)})
+            self._save_engine_state()
+            return rows
         rows.extend(self.enforce_max_hold_exits())
         existing = self._existing_symbols()
         equity, high_watermark, daily_pl = self._account_equity(account)
@@ -1076,14 +1270,19 @@ class LivePaperTradingEngine:
             sym = str(signal.get("symbol", "")).upper()
             plan = self.build_order_plan(signal, equity, high_watermark, reference_price=quote_lookup.get(sym))
             if not plan:
+                self.store.upsert_candidate_audit(self._audit_record_from_signal(signal, timestamp, "rejected", "sizing_or_invalid_order_plan", stage="order_plan"))
                 continue
             key = f"{plan['symbol']}|{plan['session_date']}|{plan['signal_time_et']}|{plan['strategy_side']}|{plan['trigger_type']}"
             if key in submitted:
+                self.store.upsert_candidate_audit(self._audit_record_from_signal(signal, timestamp, "rejected", "duplicate_signal_already_submitted", stage="submit_checks", plan=plan))
                 continue
             if plan["symbol"] in existing:
+                self.store.upsert_candidate_audit(self._audit_record_from_signal(signal, timestamp, "rejected", "position_already_open", stage="submit_checks", plan=plan))
                 continue
             if self._symbol_daily_count(plan["symbol"], plan["session_date"]) >= self.live.max_orders_per_symbol_per_day:
+                self.store.upsert_candidate_audit(self._audit_record_from_signal(signal, timestamp, "rejected", "symbol_daily_order_limit", stage="submit_checks", plan=plan))
                 continue
+            self.store.upsert_candidate_audit(self._audit_record_from_signal(signal, timestamp, "accepted", "order_plan_created", stage="order_plan", plan=plan))
             log_row = {"timestamp": timestamp, "event": "paper_order_plan", **plan, "dry_run": self.live.dry_run}
             if self.live.dry_run:
                 log_row["alpaca_status"] = "dry_run_not_submitted"

@@ -127,6 +127,15 @@ def build_live_trade_report(days: int = 3650) -> pd.DataFrame:
 
     open_by_symbol = {str(r.get("symbol", "")).upper(): r.to_dict() for _, r in open_positions.iterrows()} if not open_positions.empty else {}
     closed_by_client = {str(r.get("entry_client_order_id", "")): r.to_dict() for _, r in closed_positions.iterrows()} if not closed_positions.empty and "entry_client_order_id" in closed_positions.columns else {}
+    heartbeat = store.get_state("heartbeat", {}) or {}
+    live_cfg = store.get_state("live_config_override", {}) or {}
+    settings = store.get_state("settings", {}) or {}
+    live_settings = settings.get("live", {}) if isinstance(settings, dict) else {}
+    fallback_variant = heartbeat.get("strategy_variant") or live_cfg.get("strategy_variant") or live_settings.get("strategy_variant") or "unknown"
+    fallback_preset = heartbeat.get("strategy_preset") or live_cfg.get("settings_preset") or "unknown"
+    fallback_gate = heartbeat.get("quality_gate") or live_cfg.get("live_quality_gate") or "unknown"
+    fallback_profile = live_cfg.get("strategy_profile") or "symbol_playbook_v25"
+    fallback_pattern = live_cfg.get("live_quality_gate") or ""
 
     rows = []
     for _, p in plans.iterrows():
@@ -180,12 +189,12 @@ def build_live_trade_report(days: int = 3650) -> pd.DataFrame:
             "symbol": sym,
             "strategy_side": side,
             "trigger_type": plan.get("trigger_type"),
-            "strategy_variant": plan.get("strategy_variant") or payload.get("strategy_variant"),
-            "strategy_preset": plan.get("strategy_preset") or payload.get("strategy_preset"),
-            "strategy_profile": plan.get("strategy_profile") or payload.get("strategy_profile"),
-            "quality_gate": plan.get("quality_gate") or payload.get("quality_gate"),
-            "pattern_mode": plan.get("pattern_mode") or payload.get("pattern_mode"),
-            "selection_mode": plan.get("selection_mode") or payload.get("selection_mode"),
+            "strategy_variant": plan.get("strategy_variant") or payload.get("strategy_variant") or fallback_variant,
+            "strategy_preset": plan.get("strategy_preset") or payload.get("strategy_preset") or fallback_preset,
+            "strategy_profile": plan.get("strategy_profile") or payload.get("strategy_profile") or fallback_profile,
+            "quality_gate": plan.get("quality_gate") or payload.get("quality_gate") or fallback_gate,
+            "pattern_mode": plan.get("pattern_mode") or payload.get("pattern_mode") or fallback_pattern,
+            "selection_mode": plan.get("selection_mode") or payload.get("selection_mode") or live_cfg.get("selection_mode") or "seen_so_far_top_n",
             "status": status,
             "qty": qty,
             "entry_fill_or_reference": entry_fill,
@@ -202,6 +211,16 @@ def build_live_trade_report(days: int = 3650) -> pd.DataFrame:
             "exit_order_id": (exit_order or {}).get("order_id", ""),
             "exit_time": exit_time,
             "client_order_id": cid,
+            "entry_slippage_dollars": (entry_fill - _safe_float(plan.get("entry_reference_price"), entry_fill)) if entry_fill else "",
+            "entry_slippage_bps": ((entry_fill - _safe_float(plan.get("entry_reference_price"), entry_fill)) / _safe_float(plan.get("entry_reference_price"), entry_fill) * 10000.0) if entry_fill and _safe_float(plan.get("entry_reference_price"), 0.0) else "",
+            "bars_held": int(max(0, (pd.to_datetime(exit_time, utc=True, errors="coerce") - pd.to_datetime(plan.get("signal_time_utc"), utc=True, errors="coerce")).total_seconds() // 300)) if exit_time and not pd.isna(pd.to_datetime(exit_time, utc=True, errors="coerce")) and not pd.isna(pd.to_datetime(plan.get("signal_time_utc"), utc=True, errors="coerce")) else "",
+            "mfe_r": "",
+            "mae_r": "",
+            "max_favorable_price": "",
+            "max_adverse_price": "",
+            "hit_target": bool(exit_order and str((exit_order or {}).get("type", "")).lower() == "limit"),
+            "hit_stop": bool(exit_order and str((exit_order or {}).get("type", "")).lower() == "stop"),
+            "hit_max_hold": "max_hold" in str(status).lower(),
         }
         for k, v in ctx.items():
             row[f"signal_{k}"] = v
@@ -222,8 +241,29 @@ def generate_live_report_zip(days: int = 3650) -> Path:
     folder.mkdir(parents=True, exist_ok=True)
     store = LiveStore()
     trade_report = build_live_trade_report(days=days)
+    candidate_audit = store.recent_candidate_audit(20000)
+    summary_rows = []
+    if isinstance(trade_report, pd.DataFrame) and not trade_report.empty:
+        pl = pd.to_numeric(trade_report.get("trade_pl_live", 0), errors="coerce").fillna(0.0)
+        r = pd.to_numeric(trade_report.get("realized_r", 0), errors="coerce")
+        closed = trade_report[trade_report.get("status", "").astype(str).str.contains("closed|filled_exit|approx", case=False, na=False)] if "status" in trade_report.columns else trade_report
+        summary_rows.append({"metric": "trades_in_report", "value": len(trade_report)})
+        summary_rows.append({"metric": "closed_trades", "value": len(closed)})
+        summary_rows.append({"metric": "total_trade_pl_live", "value": float(pl.sum())})
+        summary_rows.append({"metric": "total_realized_r", "value": float(r.fillna(0.0).sum())})
+        if "strategy_variant" in trade_report.columns:
+            for variant, grp in trade_report.groupby("strategy_variant", dropna=False):
+                summary_rows.append({"metric": f"strategy_{variant}_trades", "value": len(grp)})
+                summary_rows.append({"metric": f"strategy_{variant}_pl", "value": float(pd.to_numeric(grp.get("trade_pl_live", 0), errors="coerce").fillna(0).sum())})
+    if isinstance(candidate_audit, pd.DataFrame) and not candidate_audit.empty:
+        summary_rows.append({"metric": "candidate_audit_rows", "value": len(candidate_audit)})
+        if "decision_status" in candidate_audit.columns:
+            for status, grp in candidate_audit.groupby("decision_status", dropna=False):
+                summary_rows.append({"metric": f"candidates_{status}", "value": len(grp)})
     tables = {
         "live_trade_report.csv": trade_report,
+        "live_candidate_audit.csv": candidate_audit,
+        "live_report_summary.csv": pd.DataFrame(summary_rows),
         "live_signal_plans.csv": store.recent_signal_plans(5000),
         "live_orders.csv": store.recent_orders(10000),
         "live_open_positions.csv": store.open_positions(),
@@ -243,7 +283,8 @@ def generate_live_report_zip(days: int = 3650) -> Path:
         "live_config_override": store.get_state("live_config_override", {}),
         "heartbeat": store.get_state("heartbeat", {}),
         "notes": [
-            "live_trade_report.csv includes each paper/live strategy trade with strategy_variant, strategy_preset, quality_gate, realized/unrealized P/L, and signal-time indicators where captured.",
+            "live_trade_report.csv includes each paper/live strategy trade with strategy_variant, strategy_preset, quality_gate, realized/unrealized P/L, execution diagnostics, and signal-time indicators where captured.",
+            "live_candidate_audit.csv includes accepted and rejected candidates with reject_reason and universal signal-time indicator fields for diagnosing any selected strategy.",
             "This report is generated from the shared DATABASE_URL live store, so it works on Render when the web and worker use the same database.",
         ],
     }
@@ -271,7 +312,7 @@ def format_live_trade_report(df: pd.DataFrame) -> pd.DataFrame:
         out["realized_r"] = out["realized_r"].map(lambda x: f"{_safe_float(x):.2f}R" if x not in (None, "") and pd.notna(x) else "")
     if "qty" in out.columns:
         out["qty"] = out["qty"].map(lambda x: _format_qty(x) if x not in (None, "") and pd.notna(x) else "")
-    return _ensure_columns(out, ["submitted_at_et", "symbol", "strategy_side", "strategy_variant", "quality_gate", "status", "trade_pl_live", "realized_r", "qty", "entry_fill_or_reference", "exit_fill", "trigger_type", "client_order_id"])
+    return _ensure_columns(out, ["submitted_at_et", "symbol", "strategy_side", "strategy_variant", "strategy_preset", "quality_gate", "pattern_mode", "status", "trade_pl_live", "realized_r", "qty", "entry_fill_or_reference", "exit_fill", "entry_slippage_bps", "bars_held", "trigger_type", "client_order_id"])
 
 def format_open_positions(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
