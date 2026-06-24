@@ -15,3 +15,6 @@ reports/backtest_*/
 data/local_bars/
 data/research_packs/
 data/live_trading/
+
+.venv/
+patch_*.py
