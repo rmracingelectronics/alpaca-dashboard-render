@@ -2,6 +2,7 @@ from __future__ import annotations
 
 # QQQ is always fetched internally for market regime and relative strength.
 MARKET_SYMBOLS = ["QQQ"]
+EXCLUDED_PRESET_SYMBOLS = {"PYPL", "V", "DIS", "WMT", "HD", "BRK.B", "BRK-B"}
 
 STARTER_WATCHLIST = [
     "NVDA", "TSLA", "AMD", "PLTR", "SOFI",
@@ -43,8 +44,8 @@ DAY_TRADING_50_WATCHLIST = [
 # Slower but very liquid names. Lower alert count but cleaner fills.
 MEGA_CAP_PLUS_WATCHLIST = [
     "NVDA", "AAPL", "MSFT", "META", "AMZN", "GOOGL", "NFLX", "AVGO", "AMD", "TSLA",
-    "COST", "JPM", "XOM", "LLY", "UNH", "BRK.B", "V", "MA", "HD", "WMT",
-    "PG", "JNJ", "ORCL", "CRM", "ADBE", "QCOM", "TXN", "AMAT", "MU", "INTC",
+    "COST", "JPM", "XOM", "LLY", "UNH", "MA", "PG", "JNJ",
+    "ORCL", "CRM", "ADBE", "QCOM", "TXN", "AMAT", "MU", "INTC",
 ]
 
 # V13 curated preset built from the uploaded V12 long-period reports.
@@ -85,6 +86,19 @@ V25_PLAYBOOK_WATCHLIST = [
     "V", "WMT", "XOM",
 ]
 
+def _filter_excluded(symbols: list[str]) -> list[str]:
+    return [s for s in symbols if str(s).upper() not in EXCLUDED_PRESET_SYMBOLS]
+
+STARTER_WATCHLIST = _filter_excluded(STARTER_WATCHLIST)
+DEFAULT_WATCHLIST = _filter_excluded(DEFAULT_WATCHLIST)
+HIGH_BETA_WATCHLIST = _filter_excluded(HIGH_BETA_WATCHLIST)
+LIQUID_LARGE_CAP_WATCHLIST = _filter_excluded(LIQUID_LARGE_CAP_WATCHLIST)
+DAY_TRADING_50_WATCHLIST = _filter_excluded(DAY_TRADING_50_WATCHLIST)
+MEGA_CAP_PLUS_WATCHLIST = _filter_excluded(MEGA_CAP_PLUS_WATCHLIST)
+EDGE_CORE_40_WATCHLIST = _filter_excluded(EDGE_CORE_40_WATCHLIST)
+OPPORTUNITY_CORE_35_WATCHLIST = _filter_excluded(OPPORTUNITY_CORE_35_WATCHLIST)
+V25_PLAYBOOK_WATCHLIST = _filter_excluded(V25_PLAYBOOK_WATCHLIST)
+
 WATCHLISTS = {
     "starter": STARTER_WATCHLIST,
     "balanced": DEFAULT_WATCHLIST,
@@ -99,15 +113,25 @@ WATCHLISTS = {
 
 
 def parse_symbols(raw: str | None, preset: str = "starter") -> list[str]:
-    if raw and raw.strip():
-        symbols = [s.strip().upper() for s in raw.replace("\n", ",").split(",") if s.strip()]
+    """Parse dashboard symbols.
+
+    Important behavior:
+    - If the custom-symbols box is populated, it is a true override and uses exactly
+      the user's symbols (deduped, QQQ removed because QQQ is fetched internally).
+    - EXCLUDED_PRESET_SYMBOLS only removes symbols from presets. It does not block
+      a manually typed custom symbol, because the user may intentionally test it.
+    """
+    custom_mode = bool(raw and raw.strip())
+    if custom_mode:
+        symbols = [s.strip().upper() for s in raw.replace("\n", ",").replace(";", ",").split(",") if s.strip()]
     else:
-        symbols = WATCHLISTS.get(preset, STARTER_WATCHLIST)
+        symbols = _filter_excluded(list(WATCHLISTS.get(preset, STARTER_WATCHLIST)))
     # Preserve order, remove duplicates and QQQ from tradable set.
     seen = set()
     cleaned = []
     for sym in symbols:
-        if sym == "QQQ":
+        sym = str(sym).strip().upper()
+        if not sym or sym == "QQQ":
             continue
         if sym not in seen:
             seen.add(sym)

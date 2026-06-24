@@ -6,14 +6,16 @@ from datetime import date, timedelta
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-from dash import Dash, Input, Output, State, dcc, html, dash_table, no_update
+from dash import Dash, Input, Output, State, dcc, html, dash_table, no_update, ctx
 
 from src.backtest import run_backtest
 from src.config import AlpacaSettings, StrategyParams
-from src.live_dashboard import load_live_paper_snapshot
+from src.live_dashboard import load_live_paper_snapshot, generate_live_report_zip
+from src.live_store import LiveStore
+from src.live_engine import live_variant_from_dashboard
 from src.symbols import WATCHLISTS, parse_symbols
 
-app = Dash(__name__, suppress_callback_exceptions=True, title="Alpaca Symbol Playbook V33")
+app = Dash(__name__, suppress_callback_exceptions=True, title="Alpaca Momentum Dashboard V38.6")
 server = app.server
 
 DEFAULT_END = date.today()
@@ -51,6 +53,41 @@ def fmt_pct(x: float | int | None) -> str:
     return f"{x:,.2f}%"
 
 
+
+
+def _collect_unavailable_symbols(result: dict) -> list[str]:
+    """Collect symbols that Alpaca/cache could not provide, without stopping the backtest."""
+    symbols: set[str] = set()
+    for status in result.get("diagnostics", {}).get("cache_status", []) or []:
+        for rec in (status or {}).get("unavailable_symbols", []) or []:
+            sym = str((rec or {}).get("symbol", "")).upper().strip()
+            if sym:
+                reason = str((rec or {}).get("reason", "unavailable")).strip()
+                symbols.add(f"{sym}: {reason[:140]}")
+    skipped_df = result.get("skipped_symbols", pd.DataFrame())
+    if skipped_df is not None and not skipped_df.empty:
+        for _, row in skipped_df.iterrows():
+            sym = str(row.get("symbol", "")).upper().strip()
+            reason = str(row.get("reason", "")).strip()
+            if sym and reason in {"missing_bars", "no_rows_in_requested_window"}:
+                symbols.add(f"{sym}: {reason}")
+            elif sym and reason.startswith("error:") and ("404" in reason or "symbol" in reason.lower() or "not found" in reason.lower()):
+                symbols.add(f"{sym}: {reason[:140]}")
+    return sorted(symbols)
+
+
+def _format_user_alerts(result: dict, custom_symbols_active: bool, max_items: int = 12) -> str:
+    unavailable = _collect_unavailable_symbols(result)
+    parts: list[str] = []
+    if unavailable:
+        shown = unavailable[:max_items]
+        more = len(unavailable) - len(shown)
+        parts.append("⚠️ Unavailable/no-data symbols skipped while continuing with the rest: " + "; ".join(shown) + (f"; +{more} more" if more > 0 else ""))
+    parts.append("Note: Symbol Summary is portfolio-selected P&L after Top trades/day ranking. A symbol can be positive inside a preset because only its best ranked trades were selected, but negative when tested alone because all eligible trades for that symbol can be taken.")
+    if custom_symbols_active:
+        parts.append("Custom symbols override the preset and use the raw Alpaca local bar cache/fetch path; unavailable symbols are skipped, not fatal.")
+    return " | ".join(parts)
+
 def table_card(title: str, subtitle: str, table_id: str, page_size: int = 10, filterable: bool = False) -> html.Div:
     return html.Div(
         className="card",
@@ -79,7 +116,7 @@ app.layout = html.Div(
         html.Div(
             className="hero",
             children=[
-                html.Div(children=[html.Div("ALPACA MOMENTUM LAB", className="eyebrow"), html.H1("Day-Trading Symbol Playbook V33"), html.P("Render-ready paper trading dashboard: backtests stay separate from risk sizing, while the live panel reads positions, signal plans, orders, and closed-position events from the shared paper-trading worker database.")]),
+                html.Div(children=[html.Div("ALPACA MOMENTUM LAB", className="eyebrow"), html.H1("Day-Trading Research Dashboard V38.2"), html.P("Backtest, tune, and monitor the symbol playbook with editable strategy settings, separate risk sizing, and trade context reports.")]),
                 html.Div(className=status_class, children=status_text),
             ],
         ),
@@ -106,16 +143,124 @@ app.layout = html.Div(
                             dcc.Dropdown(
                                 id="settings-preset",
                                 options=[
-                                    {"label": "Best Report 153601 - Top 2, L+S, selective candles, QQQ skip 4.2, news skip", "value": "best_qqq_news"},
+                                    {"label": "Manual / custom - keep current controls", "value": "manual"},
+                                    {"label": "Best Report 153601 baseline", "value": "best_qqq_news"},
+                                    {"label": "V35.8 Raw quality gate", "value": "live_raw_optimized_v358"},
+                                    {"label": "V35.9 Live Hunter", "value": "live_hunter_v359"},
+                                    {"label": "V36.2 Long-run robust", "value": "live_longrun_robust_v362"},
+                                    {"label": "V36.3 Grid-tested robust", "value": "live_grid_robust_v363"},
+                                    {"label": "V36.4 Pro momentum hybrid", "value": "live_professional_momentum_v364"},
+                                    {"label": "V37.8 Mined pattern matcher", "value": "live_positive_context_v377"},
+                                    {"label": "V37.9 Indicator pattern scorer", "value": "live_indicator_pattern_v379"},
+                                    {"label": "V38 Active pattern scorer", "value": "live_active_pattern_v38"},
+                                    {"label": "V38 Stable pattern scorer", "value": "live_stable_pattern_v38"},
+                                    {"label": "V38.2 Active Plus - more trades", "value": "live_active_plus_v382"},
+                                    {"label": "V38.3 Adaptive Composite - regime routed", "value": "live_adaptive_composite_v383"},
+                                    {"label": "V38.4 Failure-aware reversal router", "value": "live_failure_reversal_v384"},
+                                    {"label": "V38.5 Adaptive Plus - V38.3 with damage control", "value": "live_adaptive_plus_v385"},
+                                    {"label": "V38.2 More Trades Research", "value": "live_more_trades_v382"},
                                 ],
                                 value="best_qqq_news",
                                 clearable=False,
                             ),
                         ]),
                         html.Div(title="Selects the stock universe to test. Best Report 153601 uses the V25 playbook universe.", children=[html.Label("Watchlist preset"), dcc.Dropdown(id="preset", options=[{"label": k.replace("_", " ").title(), "value": k} for k in WATCHLISTS.keys()], value="v25_playbook", clearable=False)]),
-                        html.Div(title="Optional: enter a comma-separated custom symbol list. Leave blank to use the watchlist preset above.", children=[html.Label("Custom symbols, comma separated"), dcc.Textarea(id="custom-symbols", placeholder="Example: NVDA, TSLA, AMD, PLTR, SOFI", value="", className="textarea")]),
+                        html.Div(title="Optional: enter a comma-separated custom symbol list. When populated, this overrides the preset and uses the raw local Alpaca bar cache/fetch path for those symbols.", children=[html.Label("Custom symbols, comma separated - overrides preset"), dcc.Textarea(id="custom-symbols", placeholder="Example: ADTX, GDC, GPUS, SRXH, CDT", value="", className="textarea")]),
                         html.Div(className="two-col", children=[html.Div(title="Backtest start date.", children=[html.Label("Start"), dcc.DatePickerSingle(id="start-date", date=DEFAULT_START.isoformat())]), html.Div(title="Backtest end date.", children=[html.Label("End"), dcc.DatePickerSingle(id="end-date", date=DEFAULT_END.isoformat())])]),
                         html.Div(title="IEX is the free Alpaca feed. SIP is the paid/unlimited feed if your account has access.", children=[html.Label("Alpaca feed"), dcc.Dropdown(id="feed", options=[{"label": "IEX - free plan", "value": "iex"}, {"label": "SIP - paid/unlimited", "value": "sip"}], value=os.getenv("ALPACA_FEED", "iex"), clearable=False)]),
+                        html.Div(title="Regular hours preserves the original V33 backtest/replay/cache behavior. Extended hours uses the same local Alpaca bar store and fetches missing chunks only when they are not available locally.", children=[
+                            html.Label("Backtest data session"),
+                            dcc.Dropdown(
+                                id="backtest-session-mode",
+                                options=[
+                                    {"label": "Regular hours only - original baseline behavior", "value": "regular_only"},
+                                    {"label": "Extended hours - 04:00 to 20:00 ET research", "value": "extended_hours"},
+                                    {"label": "24/5 available bars - research only", "value": "twenty_four_five"},
+                                ],
+                                value="regular_only",
+                                clearable=False,
+                            ),
+                        ]),
+                        html.Div(className="hint", children="Regular hours uses the original V33 V25 replay/backtest path. Extended-hours modes use raw local bars from data/local_bars/<feed>/5Min/split and the same Alpaca cache/fetch mechanism as before."),
+                        html.Div(title="Controls trade selection timing. Classic preserves the original research result by ranking the full day after all candidates are known. Live simulation walks forward historically and only ranks candidates seen up to each timestamp, like live trading.", children=[
+                            html.Label("Backtest decision mode"),
+                            dcc.Dropdown(
+                                id="backtest-decision-mode",
+                                options=[
+                                    {"label": "Classic research replay - end-of-day Top N ranking", "value": "end_of_day_top_n"},
+                                    {"label": "Live simulation - walk-forward from historical candidates", "value": "live_simulated"},
+                                    {"label": "Full raw-bar replay - rebuild signals from stored 5Min bars", "value": "raw_bar_replay"},
+                                ],
+                                value="end_of_day_top_n",
+                                clearable=False,
+                            ),
+                        ]),
+                        html.Div(className="hint", children="Use Full raw-bar replay for the strongest live-style test: it rebuilds signals from stored 5-minute bars and walks forward candle by candle. Live simulation uses historical candidates but no future candidate ranking. Classic keeps the original baseline comparable."),
+                        html.Div(className="control-section", children=[
+                            html.Div(className="section-mini-head", children=[html.H4("Live raw replay quality gate"), html.Span("optional, live-safe")]),
+                            html.Div(title="Choose a live-safe quality gate. Presets load defaults here, but you can change every field before running.", children=[
+                                html.Label("Quality gate mode"),
+                                dcc.Dropdown(
+                                    id="live-quality-gate",
+                                    options=[
+                                        {"label": "Off - no extra live quality gate", "value": "off"},
+                                        {"label": "V35.8 strict morning gate", "value": "v358"},
+                                        {"label": "V35.9 live hunter gate", "value": "v359"},
+                                        {"label": "V36.4 professional momentum hybrid gate", "value": "v364"},
+                                        {"label": "V37.8 mined profitable-indicator pattern", "value": "v377"},
+                                                {"label": "V37.9 decision-time indicator pattern scorer", "value": "v379"},
+                                        {"label": "V38 active pattern scorer - more trades", "value": "v38_active"},
+                                        {"label": "V38 stable pattern scorer", "value": "v38_stable"},
+                                        {"label": "V38.2 active plus - more trades", "value": "v382_active_plus"},
+                                        {"label": "V38.3 adaptive composite - regime routed", "value": "v383_adaptive"},
+                                        {"label": "V38.4 failure-aware reversal router", "value": "v384_failure_reversal"},
+                                        {"label": "V38.5 adaptive plus - V38.3 damage control", "value": "v385_adaptive_plus"},
+                                        {"label": "V38.2 more trades research", "value": "v382_more_trades"},
+                                        {"label": "Custom gate - use the values below", "value": "custom"},
+                                    ],
+                                    value="off",
+                                    clearable=False,
+                                ),
+                            ]),
+                            html.Div(className="two-col", children=[
+                                html.Div(title="First eligible entry time for the quality gate, New York time HH:MM.", children=[html.Label("Gate start ET"), dcc.Input(id="quality-start-time", value="10:00", type="text")]),
+                                html.Div(title="Last eligible entry time for the quality gate, New York time HH:MM.", children=[html.Label("Gate end ET"), dcc.Input(id="quality-end-time", value="11:00", type="text")]),
+                            ]),
+                            html.Div(className="three-col", children=[
+                                html.Div(title="Minimum relative volume at this time of day.", children=[html.Label("Min RVOL"), dcc.Input(id="quality-min-rvol", value=1.0, type="number", min=0.0, max=20.0, step=0.05)]),
+                                html.Div(title="Minimum prior-day ATR percent. This avoids low-range days that were the largest long-run raw-replay loss source.", children=[html.Label("Min daily ATR %"), dcc.Input(id="quality-min-daily-atr", value=0.0, type="number", min=0.0, max=20.0, step=0.05)]),
+                                html.Div(title="Minimum directional relative strength. Long uses positive RS; short uses relative weakness converted to positive.", children=[html.Label("Min dir RS"), dcc.Input(id="quality-min-dir-rs", value=0.0, type="number", min=-20.0, max=20.0, step=0.05)]),
+                                html.Div(title="Maximum directional relative strength. Use this to avoid overextended moves.", children=[html.Label("Max dir RS"), dcc.Input(id="quality-max-dir-rs", value=999.0, type="number", min=-20.0, max=999.0, step=0.05)]),
+                            ]),
+                            html.Div(className="three-col", children=[
+                                html.Div(title="Minimum directional open-relative strength.", children=[html.Label("Min open RS"), dcc.Input(id="quality-min-dir-open-rs", value=-999.0, type="number", min=-999.0, max=999.0, step=0.05)]),
+                                html.Div(title="Maximum directional open-relative strength.", children=[html.Label("Max open RS"), dcc.Input(id="quality-max-dir-open-rs", value=999.0, type="number", min=-999.0, max=999.0, step=0.05)]),
+                                html.Div(title="Maximum absolute VWAP extension in ATR units.", children=[html.Label("Max abs VWAP ATR"), dcc.Input(id="quality-max-abs-vwap", value=1.5, type="number", min=0.0, max=20.0, step=0.05)]),
+                            ]),
+                            html.Div(className="two-col", children=[
+                                html.Div(title="Minimum directional VWAP extension in ATR units. For shorts, below-VWAP extension is converted to positive.", children=[html.Label("Min dir VWAP ATR"), dcc.Input(id="quality-min-dir-vwap", value=0.5, type="number", min=-20.0, max=20.0, step=0.05)]),
+                                html.Div(title="Maximum directional VWAP extension in ATR units.", children=[html.Label("Max dir VWAP ATR"), dcc.Input(id="quality-max-dir-vwap", value=2.0, type="number", min=-20.0, max=20.0, step=0.05)]),
+                            ]),
+                            html.Div(className="hint", children="These gate fields are independent from risk/compounding and can be used with any preset. They only use signal-bar data available at that timestamp."),
+                        ]),
+                        html.Div(title="Research-only filter. The algorithm creates candidates first, then sends the candidate list in batch prompts to the OpenAI API. Approved candidates continue into the normal simulator. Leave OFF for baseline tests.", children=[
+                            html.Label("OpenAI trade review filter"),
+                            dcc.Dropdown(
+                                id="openai-filter-mode",
+                                options=[
+                                    {"label": "Off - baseline algorithm only", "value": "off"},
+                                    {"label": "On - OpenAI reviews candidates before portfolio selection", "value": "on"},
+                                ],
+                                value="off",
+                                clearable=False,
+                            ),
+                        ]),
+                        html.Div(className="three-col", children=[
+                            html.Div(title="OpenAI model name. You can change this if your API account uses a different model.", children=[html.Label("OpenAI model"), dcc.Input(id="openai-model", value=os.getenv("OPENAI_TRADE_FILTER_MODEL", "gpt-5-mini"), type="text")]),
+                            html.Div(title="V35.7: OpenAI reviews all candidate decisions in one API call when they fit this limit. Raw-bar replay now calls OpenAI before walk-forward selection, not once per trade/timestamp. If candidates exceed this limit, only then it chunks.", children=[html.Label("AI max independent decisions per API call"), dcc.Input(id="openai-max-candidates", value=5000, type="number", min=1, max=20000, step=1)]),
+                            html.Div(title="Reject OpenAI-approved trades below this confidence. 0.0 accepts all approved trades.", children=[html.Label("AI min confidence"), dcc.Input(id="openai-min-confidence", value=0.0, type="number", min=0.0, max=1.0, step=0.05)]),
+                        ]),
+                        html.Div(className="hint", children="OpenAI trade review is for research only. V35.3 batches candidates for API efficiency, but every candidate is reviewed as an independent real-time decision at its own entry timestamp. It does not ask AI to choose the best of the day/batch and does not send future P&L or exit outcome. It requires OPENAI_API_KEY in .env."),
                         html.Div(className="two-col", children=[html.Div(title="Starting account size used for the equity curve and risk calculations.", children=[html.Label("Account value"), dcc.Input(id="account-value", value=10000, type="number", min=500, step=100)]), html.Div(title="Used only when Risk mode is Fixed dollar risk. This disables compounding and risks the same dollars on every trade.", children=[html.Label("Fixed risk $/trade"), dcc.RadioItems(id="risk-dollars-v12", options=[{"label": "$10", "value": 10}, {"label": "$25", "value": 25}, {"label": "$50", "value": 50}, {"label": "$100", "value": 100}, {"label": "$200", "value": 200}, {"label": "$500", "value": 500}], value=100, inline=True)])]),
                         html.Hr(),
                         html.H3("Risk sizing / compounding", className="section-title"),
@@ -143,7 +288,7 @@ app.layout = html.Div(
                             ]),
                         ]),
                         html.Div(className="hint", children="To reproduce the high-equity uploaded report, select Risk mode = Percent of equity - full compounding and Base risk = 1.0%. To disable compounding, select Fixed dollar risk. To use safer compounding for smaller accounts, select Controlled compounding.") ,
-                        html.Div(className="two-col", children=[html.Div(title="Minimum playbook score. 0 disables the score filter. The winning report used 2.", children=[html.Label("Min score (V25 raw score, 0=off)"), dcc.Input(id="min-score", value=2, type="number", min=0, max=60, step=1)]), html.Div(title="Limits how many selected trades can be taken per day. Winning report used Top 2.", children=[html.Label("Top trades/day"), dcc.RadioItems(id="max-trades", options=[{"label": "Top 1", "value": 1}, {"label": "Top 2", "value": 2}, {"label": "Top 3", "value": 3}], value=2, inline=True)])]),
+                        html.Div(className="two-col", children=[html.Div(title="Minimum playbook score. 0 disables the score filter. The winning report used 2.", children=[html.Label("Min score (V25 raw score, 0=off)"), dcc.Input(id="min-score", value=2, type="number", min=0, max=60, step=1)]), html.Div(title="Maximum selected trades per day.", children=[html.Label("Top trades/day"), dcc.Dropdown(id="max-trades", options=[{"label": "Top 1", "value": 1}, {"label": "Top 2", "value": 2}, {"label": "Top 3", "value": 3}, {"label": "Top 5", "value": 5}, {"label": "Top 7", "value": 7}, {"label": "Top 10", "value": 10}, {"label": "Top 15", "value": 15}], value=2, clearable=False)])]),
                         html.Div(className="two-col", children=[html.Div(title="Estimated execution slippage in basis points. 3 bps means about 0.03% per execution adjustment.", children=[html.Label("Slippage bps"), dcc.Input(id="slippage-bps", value=3, type="number", min=0, max=50, step=1)]), html.Div(title="Turns on the historical news/catalyst proxy used by the catalyst filter. Winning report used Yes.", children=[html.Label("Use news / catalyst proxy?"), dcc.Dropdown(id="use-news", options=[{"label": "No - ignore news proxy", "value": "false"}, {"label": "Yes - activate news/catalyst flags", "value": "true"}], value="true", clearable=False)])]),
                         html.Div(title="Optional macro calendar filter. Winning report left this Off.", children=[
                             html.Label("Macro/news risk filters - optional"),
@@ -190,21 +335,14 @@ app.layout = html.Div(
                         html.Button("Run Backtest", id="run-btn", className="primary-btn", n_clicks=0),
                         html.Div(id="run-status", className="run-status"),
                         html.Hr(),
-                        html.H4("Version 33 Notes"),
+                        html.H4("Notes"),
                         html.Ul(
-                            className="rule-list",
+                            className="rule-list compact-notes",
                             children=[
-                                html.Li("V33 uses the V25/V27 symbol-event playbook, keeps one winning strategy preset, and separates strategy settings from risk sizing/compounding."),
-                                html.Li("Entry uses the next 5-minute bar open, with conservative first-touch sequencing: stop before target if both touch in the same bar."),
-                                html.Li("V27 uses the full approved candidate universe, then applies symbol, date, direction, min-score, candlestick, macro/news, QQQ stress, and kill-switch filters before selecting Top 1/2/3 per day."),
-                                html.Li("V25 uses 0.75R target, 1.0R stop, and 12-bar maximum hold to match the raw-data test assumptions."),
-                                html.Li("The single baseline preset is Best Report 153601; live trading uses the V25 playbook watchlist and the same score/candle/news/QQQ-stress filter stack."),
-                                html.Li("Candlestick options now affect V25/V27 entries: Off and Exit-only reproduce baseline; Selective/Confirm/Score apply entry candle filters."),
-                                html.Li("Short-side trading is enabled by default because the expanded raw-data tests showed short-only was more stable than long-only."),
-                                html.Li("Live paper orders use market bracket orders for the 0.75R target and 1.0R stop, while the worker separately enforces the 12-bar max-hold exit."),
-                                html.Li("Risk can now be fixed-dollar, full percent-equity compounding, or controlled compounding with drawdown brakes."),
-                                html.Li("Risk sizing is independent: Fixed dollar risk disables compounding; Controlled compounding uses 1% risk, $10 minimum, $300 cap, 0.75% risk after 5% drawdown, 0.50% after 10%, and pause after 15% drawdown."),
-                                html.Li("Reports are saved to reports/latest_backtest_report.zip after every run; live paper signal plans, opened positions, closed positions, orders, and worker events are read from the shared Render database."),
+                                html.Li("Strategy settings and risk sizing are separate."),
+                                html.Li("Entries use the next 5-minute bar open with conservative stop-before-target sequencing."),
+                                html.Li("Top trades/day now supports 1, 2, 3, 5, 7, 10, and 15."),
+                                html.Li("Backtest reports include selected_trade_market_conditions.csv for trade context."),
                             ],
                         ),
                     ],
@@ -214,8 +352,14 @@ app.layout = html.Div(
                     children=[
                         dcc.Interval(id="live-refresh-interval", interval=30_000, n_intervals=0),
                         html.Div(className="card", children=[
-                            html.Div(className="section-head", children=[html.H3("Live Alpaca Paper Monitor"), html.Span("Auto-refreshes every 30 seconds from the shared worker database")]),
+                            html.Div(className="section-head", children=[html.H3("Live Alpaca Paper Monitor"), html.Span("Auto-refreshes every 30 seconds")]),
                             html.Div(id="live-status", className="run-status"),
+                            html.Div(className="two-col", children=[
+                                html.Button("Apply current settings to live worker", id="apply-live-settings-btn", className="primary-btn", n_clicks=0),
+                                html.Button("Generate live report ZIP", id="generate-live-report-btn", className="secondary-btn", n_clicks=0),
+                            ]),
+                            dcc.Download(id="live-report-download"),
+                            html.Div(id="live-action-status", className="run-status"),
                             html.Div(id="live-metrics-row", className="metrics-grid"),
                         ]),
                         html.Div(className="grid-2", children=[
@@ -226,18 +370,19 @@ app.layout = html.Div(
                             table_card("Recent Alpaca Paper Orders", "Parent bracket orders and exit legs synced from Alpaca", "live-orders-table", page_size=12, filterable=True),
                             table_card("Closed / Recently Closed Positions", "Positions that the worker saw open and later missing from Alpaca /positions", "live-closed-positions-table", page_size=12, filterable=True),
                         ]),
+                        table_card("Live/Paper Trade P&L", "Every strategy trade with realized/unrealized profit and the strategy/gate used", "live-trade-report-table", page_size=15, filterable=True),
                         table_card("Worker Events", "Scans, blocked entries, submitted paper orders, sync errors, and max-hold exits", "live-events-table", page_size=12, filterable=True),
-                        html.Div(className="section-head", children=[html.H3("Historical Backtest Lab"), html.Span("Same baseline strategy preset; risk sizing remains separate")]),
+                        html.Div(className="section-head", children=[html.H3("Historical Backtest Lab"), html.Span("Backtest results and trade context")]),
                         html.Div(id="metrics-row", className="metrics-grid"),
                         html.Div(className="grid-2", children=[html.Div(className="card", children=[dcc.Graph(id="equity-fig", figure=empty_figure("Equity Curve"))]), html.Div(className="card", children=[dcc.Graph(id="drawdown-fig", figure=empty_figure("Drawdown"))])]),
-                        html.Div(className="grid-2", children=[html.Div(className="card", children=[dcc.Graph(id="symbol-fig", figure=empty_figure("P&L by Symbol"))]), html.Div(className="card", children=[dcc.Graph(id="r-fig", figure=empty_figure("R-Multiple Distribution"))])]),
+                        html.Div(className="grid-2", children=[html.Div(className="card", children=[dcc.Graph(id="symbol-fig", figure=empty_figure("P&L by Symbol (Portfolio-Selected Trades)"))]), html.Div(className="card", children=[dcc.Graph(id="r-fig", figure=empty_figure("R-Multiple Distribution"))])]),
                         html.Div(className="grid-2", children=[html.Div(className="card", children=[dcc.Graph(id="setup-fig", figure=empty_figure("P&L by Setup Type"))]), html.Div(className="card", children=[dcc.Graph(id="daily-fig", figure=empty_figure("Trades by Day"))])]),
-                        table_card("Symbol Summary", "Which symbols fit this strategy best?", "symbol-table", page_size=12),
+                        table_card("Symbol Summary", "Portfolio-selected contribution after Top trades/day. This is not the same as a standalone one-symbol backtest.", "symbol-table", page_size=12),
                         html.Div(className="grid-2", children=[table_card("Setup Summary", "Which trigger type works?", "setup-table", page_size=10), table_card("Daily Summary", "Frequency and daily consistency", "daily-table", page_size=10)]),
                         html.Div(className="grid-2", children=[table_card("Exit Reason Summary", "Are exits helping or hurting?", "exit-table", page_size=10), table_card("MFE / MAE Diagnosis", "Entry vs exit failure clues", "mfe-table", page_size=10)]),
                         html.Div(className="grid-2", children=[table_card("Candlestick Pattern Summary", "Do candle patterns improve entries/exits?", "candle-table", page_size=10), table_card("Score Band Summary", "Is score predictive?", "score-table", page_size=10)]),
                         table_card("Time Bucket Summary", "Best time of day", "time-table", page_size=10),
-                        table_card("Trades", "Selected trades after portfolio/risk/adaptive rules", "trades-table", page_size=15, filterable=True),
+                        table_card("Trades", "Selected trades. Full context is saved in selected_trade_market_conditions.csv", "trades-table", page_size=15, filterable=True),
                     ],
                 ),
             ],
@@ -253,6 +398,7 @@ app.layout = html.Div(
     Output("live-plans-table", "data"), Output("live-plans-table", "columns"),
     Output("live-orders-table", "data"), Output("live-orders-table", "columns"),
     Output("live-closed-positions-table", "data"), Output("live-closed-positions-table", "columns"),
+    Output("live-trade-report-table", "data"), Output("live-trade-report-table", "columns"),
     Output("live-events-table", "data"), Output("live-events-table", "columns"),
     Output("live-status", "children"),
     Input("live-refresh-interval", "n_intervals"),
@@ -272,12 +418,114 @@ def refresh_live_paper_monitor(n_intervals):
         plan_data, plan_cols = table_payload(snapshot.get("plans", pd.DataFrame()))
         order_data, order_cols = table_payload(snapshot.get("orders", pd.DataFrame()))
         closed_data, closed_cols = table_payload(snapshot.get("closed_positions", pd.DataFrame()))
+        live_trade_data, live_trade_cols = table_payload(snapshot.get("trade_report", pd.DataFrame()))
         event_data, event_cols = table_payload(snapshot.get("events", pd.DataFrame()))
-        return metrics, pos_data, pos_cols, plan_data, plan_cols, order_data, order_cols, closed_data, closed_cols, event_data, event_cols, snapshot.get("status", "Live paper monitor refreshed.")
+        return metrics, pos_data, pos_cols, plan_data, plan_cols, order_data, order_cols, closed_data, closed_cols, live_trade_data, live_trade_cols, event_data, event_cols, snapshot.get("status", "Live paper monitor refreshed.")
     except Exception as exc:
         metrics = [metric_card("Live Monitor", "Error", str(exc)[:80]), metric_card("Open Positions", "--"), metric_card("Signal Plans", "--"), metric_card("Worker", "--")]
         blank = ([], [])
-        return metrics, *blank, *blank, *blank, *blank, *blank, f"Live paper monitor error: {exc}"
+        return metrics, *blank, *blank, *blank, *blank, *blank, *blank, f"Live paper monitor error: {exc}"
+
+
+def _bool_from_dropdown(value) -> bool:
+    return str(value).lower() in {"1", "true", "yes", "on"}
+
+
+def _live_config_from_controls(strategy_profile, settings_preset, preset, custom_symbols, feed, backtest_session_mode, live_quality_gate,
+                               quality_start_time, quality_end_time, quality_min_rvol, quality_min_daily_atr, quality_min_dir_rs, quality_max_dir_rs,
+                               quality_min_dir_open_rs, quality_max_dir_open_rs, quality_min_dir_vwap, quality_max_dir_vwap, quality_max_abs_vwap,
+                               account_value, risk_dollars, risk_mode, base_risk_pct, min_risk_dollars, max_risk_dollars, dd1_risk_pct, dd2_risk_pct, pause_dd_pct,
+                               min_score, max_trades, slippage_bps, use_news, candle_mode, macro_filter, stress_filter, news_filter, qqq_stress_threshold,
+                               kill_switch, enable_mr, enable_or, direction_mode):
+    custom_symbols_active = bool(str(custom_symbols or "").strip())
+    symbols = parse_symbols(custom_symbols or "", preset=preset or "v25_playbook")
+    if not symbols:
+        symbols = WATCHLISTS.get("v25_playbook", [])
+    variant = live_variant_from_dashboard(settings_preset, live_quality_gate)
+    return {
+        "enabled": True,
+        "applied_at_utc": pd.Timestamp.now(tz="UTC").isoformat(),
+        "strategy_profile": strategy_profile or "symbol_playbook_v25",
+        "settings_preset": settings_preset or "manual",
+        "strategy_variant": variant,
+        "watchlist_preset": preset or "v25_playbook",
+        "custom_symbols": custom_symbols or "",
+        "custom_symbols_active": custom_symbols_active,
+        "symbols": symbols,
+        "feed": feed or os.getenv("ALPACA_FEED", "iex"),
+        "backtest_session_mode": backtest_session_mode or "regular_only",
+        "live_quality_gate": live_quality_gate or "off",
+        "quality_start_time": quality_start_time,
+        "quality_end_time": quality_end_time,
+        "quality_min_rvol": quality_min_rvol,
+        "quality_min_daily_atr": quality_min_daily_atr,
+        "quality_min_dir_rs": quality_min_dir_rs,
+        "quality_max_dir_rs": quality_max_dir_rs,
+        "quality_min_dir_open_rs": quality_min_dir_open_rs,
+        "quality_max_dir_open_rs": quality_max_dir_open_rs,
+        "quality_min_dir_vwap": quality_min_dir_vwap,
+        "quality_max_dir_vwap": quality_max_dir_vwap,
+        "quality_max_abs_vwap": quality_max_abs_vwap,
+        "account_value": account_value,
+        "risk_dollars": risk_dollars,
+        "risk_mode": risk_mode,
+        "base_risk_pct": base_risk_pct,
+        "min_risk_dollars": min_risk_dollars,
+        "max_risk_dollars": max_risk_dollars,
+        "dd1_risk_pct": dd1_risk_pct,
+        "dd2_risk_pct": dd2_risk_pct,
+        "pause_dd_pct": pause_dd_pct,
+        "min_score": min_score,
+        "max_trades": max_trades,
+        "max_daily_trades": max_trades,
+        "max_open_positions": max_trades,
+        "max_orders_per_symbol_per_day": 1,
+        "slippage_bps": slippage_bps,
+        "use_news": _bool_from_dropdown(use_news),
+        "candle_mode": candle_mode,
+        "macro_filter": macro_filter,
+        "stress_filter": stress_filter,
+        "news_filter": news_filter,
+        "qqq_stress_threshold": qqq_stress_threshold,
+        "kill_switch": kill_switch,
+        "enable_mr": _bool_from_dropdown(enable_mr),
+        "enable_or": _bool_from_dropdown(enable_or),
+        "direction_mode": direction_mode or "long_short",
+        "selection_mode": "seen_so_far_top_n",
+    }
+
+
+@app.callback(
+    Output("live-action-status", "children"),
+    Output("live-report-download", "data"),
+    Input("apply-live-settings-btn", "n_clicks"),
+    Input("generate-live-report-btn", "n_clicks"),
+    State("strategy-profile", "value"), State("settings-preset", "value"), State("preset", "value"), State("custom-symbols", "value"), State("feed", "value"), State("backtest-session-mode", "value"),
+    State("live-quality-gate", "value"), State("quality-start-time", "value"), State("quality-end-time", "value"),
+    State("quality-min-rvol", "value"), State("quality-min-daily-atr", "value"), State("quality-min-dir-rs", "value"), State("quality-max-dir-rs", "value"),
+    State("quality-min-dir-open-rs", "value"), State("quality-max-dir-open-rs", "value"),
+    State("quality-min-dir-vwap", "value"), State("quality-max-dir-vwap", "value"), State("quality-max-abs-vwap", "value"),
+    State("account-value", "value"), State("risk-dollars", "value"), State("risk-mode", "value"), State("base-risk-pct", "value"), State("min-risk-dollars", "value"), State("max-risk-dollars", "value"), State("dd1-risk-pct", "value"), State("dd2-risk-pct", "value"), State("pause-dd-pct", "value"),
+    State("min-score", "value"), State("max-trades", "value"), State("slippage-bps", "value"), State("use-news", "value"), State("candle-mode", "value"),
+    State("macro-filter", "value"), State("stress-filter", "value"), State("news-filter", "value"), State("qqq-stress-threshold", "value"), State("kill-switch", "value"), State("enable-mr", "value"), State("enable-or", "value"), State("direction-mode", "value"),
+    prevent_initial_call=True,
+)
+def live_actions(apply_clicks, report_clicks, strategy_profile, settings_preset, preset, custom_symbols, feed, backtest_session_mode, live_quality_gate, quality_start_time, quality_end_time, quality_min_rvol, quality_min_daily_atr, quality_min_dir_rs, quality_max_dir_rs, quality_min_dir_open_rs, quality_max_dir_open_rs, quality_min_dir_vwap, quality_max_dir_vwap, quality_max_abs_vwap, account_value, risk_dollars, risk_mode, base_risk_pct, min_risk_dollars, max_risk_dollars, dd1_risk_pct, dd2_risk_pct, pause_dd_pct, min_score, max_trades, slippage_bps, use_news, candle_mode, macro_filter, stress_filter, news_filter, qqq_stress_threshold, kill_switch, enable_mr, enable_or, direction_mode):
+    trigger = ctx.triggered_id
+    if trigger == "generate-live-report-btn":
+        try:
+            zip_path = generate_live_report_zip(days=3650)
+            return f"Live report generated: {zip_path}", dcc.send_file(str(zip_path))
+        except Exception as exc:
+            return f"Live report generation failed: {exc}", no_update
+    if trigger == "apply-live-settings-btn":
+        cfg = _live_config_from_controls(strategy_profile, settings_preset, preset, custom_symbols, feed, backtest_session_mode, live_quality_gate, quality_start_time, quality_end_time, quality_min_rvol, quality_min_daily_atr, quality_min_dir_rs, quality_max_dir_rs, quality_min_dir_open_rs, quality_max_dir_open_rs, quality_min_dir_vwap, quality_max_dir_vwap, quality_max_abs_vwap, account_value, risk_dollars, risk_mode, base_risk_pct, min_risk_dollars, max_risk_dollars, dd1_risk_pct, dd2_risk_pct, pause_dd_pct, min_score, max_trades, slippage_bps, use_news, candle_mode, macro_filter, stress_filter, news_filter, qqq_stress_threshold, kill_switch, enable_mr, enable_or, direction_mode)
+        try:
+            LiveStore().set_state("live_config_override", cfg)
+            return f"Applied live worker settings: strategy_variant={cfg['strategy_variant']}, gate={cfg['live_quality_gate']}, symbols={len(cfg['symbols'])}, max daily trades={cfg['max_daily_trades']}. The Render worker will pick this up on its next scan if it shares DATABASE_URL.", no_update
+        except Exception as exc:
+            return f"Could not apply live worker settings: {exc}", no_update
+    return no_update, no_update
 
 
 @app.callback(
@@ -308,14 +556,88 @@ def update_risk_mode_visibility(risk_mode):
     Output("qqq-stress-threshold", "value"),
     Output("macro-filter", "value"),
     Output("kill-switch", "value"),
+    Output("enable-mr", "value"),
+    Output("enable-or", "value"),
+    Output("backtest-decision-mode", "value"),
+    Output("live-quality-gate", "value"),
+    Output("quality-start-time", "value"),
+    Output("quality-end-time", "value"),
+    Output("quality-min-rvol", "value"),
+    Output("quality-min-daily-atr", "value"),
+    Output("quality-min-dir-rs", "value"),
+    Output("quality-max-dir-rs", "value"),
+    Output("quality-min-dir-open-rs", "value"),
+    Output("quality-max-dir-open-rs", "value"),
+    Output("quality-min-dir-vwap", "value"),
+    Output("quality-max-dir-vwap", "value"),
+    Output("quality-max-abs-vwap", "value"),
     Input("settings-preset", "value"),
 )
 def apply_settings_preset(preset_name):
     if preset_name == "manual":
-        return tuple([no_update] * 10)
+        return tuple([no_update] * 25)
+    if preset_name == "live_raw_optimized_v358":
+        # Load defaults only. Users can still modify every control before running.
+        # Risk sizing stays separate and is never changed here.
+        return (2, "long_short", 2, "off", "false", "off", "off", 4.2, "off", "off", "false", "true", "raw_bar_replay", "v358", "10:00", "11:00", 1.50, 0.0, 0.00, 2.00, 0.00, 2.00, -999.0, 999.0, 999.0)
+    if preset_name == "live_hunter_v359":
+        # Load defaults only. Users can still modify every control before running.
+        # Risk sizing stays separate and is never changed here.
+        return (1, "long_short", 2, "off", "false", "off", "off", 4.2, "off", "off", "false", "true", "raw_bar_replay", "v359", "10:00", "11:00", 1.00, 0.0, 0.00, 999.00, -999.00, 999.00, 0.50, 2.00, 1.50)
+    if preset_name == "live_longrun_robust_v362":
+        # Long-period raw-replay findings from 2021-2026: low-ATR days and weak
+        # directional confirmation were the main loss sources.  Defaults remain
+        # editable through the UI and risk sizing stays separate.
+        return (1, "long_short", 2, "off", "false", "off", "off", 4.2, "off", "off", "false", "true", "raw_bar_replay", "custom", "10:00", "11:00", 1.20, 4.00, 0.00, 3.00, 0.00, 999.00, 0.50, 2.00, 1.50)
+    if preset_name == "live_grid_robust_v363":
+        # V36.3: chosen from raw-bar/live-style grid testing on the uploaded raw
+        # IEX bars.  Conservative because broader/high-frequency combinations
+        # failed long-run validation. Defaults only; all controls remain editable.
+        return (1, "long_short", 0, "off", "false", "off", "off", 4.2, "off", "off", "false", "true", "raw_bar_replay", "custom", "10:00", "11:00", 1.20, 4.00, 0.00, 3.00, 0.00, 5.00, 0.50, 2.00, 1.50)
+    if preset_name == "live_professional_momentum_v364":
+        # V36.4: GitHub-inspired live-safe professional momentum hybrid.
+        # Defaults only; risk sizing and every visible filter remain editable.
+        # Uses Top 1, no mean-reversion, OR/retest enabled, and a 10:00-12:00
+        # momentum/VWAP/relative-strength gate tested on raw-bar live replay.
+        return (1, "long_short", 10, "off", "false", "off", "off", 4.2, "off", "off", "false", "true", "raw_bar_replay", "v364", "10:00", "12:00", 1.00, 4.00, -1.00, 3.00, -999.00, 999.00, 0.50, 2.00, 2.00)
+    if preset_name == "live_positive_context_v377":
+        # V37.8: Uses mined multi-indicator profitable-pattern matcher. This runs in
+        # full raw-bar/live replay mode by default and only accepts candidates
+        # whose live indicators match historically profitable contexts.
+        return (2, "long_short", 2, "off", "false", "off", "off", 4.2, "off", "off", "false", "true", "raw_bar_replay", "v377", "10:00", "12:00", 0.00, 0.00, -999.00, 999.00, -999.00, 999.00, -999.00, 999.00, 999.00)
+    if preset_name == "live_indicator_pattern_v379":
+        # V37.9: decision-time indicator pattern scorer. It uses causal signal-bar
+        # values only and ranks by pattern score before the regular Top-N selector.
+        return (2, "long_short", 0, "off", "false", "off", "off", 4.2, "off", "off", "false", "true", "raw_bar_replay", "v379", "09:35", "12:00", 0.00, 0.00, -999.00, 999.00, -999.00, 999.00, -999.00, 999.00, 999.00)
     # Exact strategy filters from the user's strongest uploaded report 153601.
+    if preset_name == "live_active_pattern_v38":
+        # V38 active mode: higher-frequency research preset. Uses live-safe
+        # signal-time fields only and leaves risk/compounding separate.
+        return (5, "long_short", 5, "off", "false", "off", "off", 4.2, "off", "off", "false", "true", "raw_bar_replay", "v38_active", "09:35", "11:00", 0.00, 0.00, -999.00, 999.00, -999.00, 999.00, -999.00, 999.00, 999.00)
+    if preset_name == "live_stable_pattern_v38":
+        # V38 stable mode: lower frequency than active but more stable across
+        # yearly slices in the raw-live candidate test.
+        return (15, "long_short", 5, "off", "false", "off", "off", 4.2, "off", "off", "false", "true", "raw_bar_replay", "v38_stable", "09:35", "11:00", 0.00, 0.00, -999.00, 999.00, -999.00, 999.00, -999.00, 999.00, 999.00)
+    if preset_name == "live_active_plus_v382":
+        # V38.2 Active Plus - more trades: more trades than stable with a stricter 10:00-11:00
+        # non-engulfing indicator-state gate. Defaults only; all controls remain editable.
+        return (15, "long_short", 0, "off", "false", "off", "off", 4.2, "off", "off", "false", "true", "raw_bar_replay", "v382_active_plus", "10:00", "11:00", 0.00, 0.00, -999.00, 999.00, -999.00, 999.00, -999.00, 999.00, 999.00)
+    if preset_name == "live_adaptive_composite_v383":
+        # V38.3 Adaptive Composite: combines the strongest regimes found across the
+        # uploaded live/raw reports: stable long ORB/VWAP, high-RVOL directional
+        # VWAP/RS, and short late-morning weakness.  Defaults are live-safe and
+        # use only signal-time fields; risk sizing remains separate.
+        return (3, "long_short", 5, "off", "false", "off", "off", 4.2, "off", "off", "false", "true", "raw_bar_replay", "v383_adaptive", "09:35", "12:00", 0.00, 0.00, -999.00, 999.00, -999.00, 999.00, -999.00, 999.00, 999.00)
+    if preset_name == "live_failure_reversal_v384":
+        return (5, "long_short", 0, "off", "false", "off", "off", 4.2, "off", "off", "false", "true", "raw_bar_replay", "v384_failure_reversal", "09:35", "12:00", 0.00, 0.00, -999.00, 999.00, -999.00, 999.00, -999.00, 999.00, 999.00)
+    if preset_name == "live_adaptive_plus_v385":
+        return (10, "long_short", 0, "off", "false", "off", "off", 4.2, "off", "off", "false", "true", "raw_bar_replay", "v385_adaptive_plus", "09:35", "11:55", 0.00, 0.00, -999.00, 999.00, -999.00, 999.00, -999.00, 999.00, 999.00)
+    if preset_name == "live_more_trades_v382":
+        # Research-only higher-activity version. More opportunities, weaker robustness.
+        return (3, "long_short", 0, "off", "false", "off", "off", 4.2, "off", "off", "false", "true", "raw_bar_replay", "v382_more_trades", "09:45", "11:00", 0.00, 0.00, -999.00, 999.00, -999.00, 999.00, -999.00, 999.00, 999.00)
+
     # This deliberately does NOT touch risk sizing or compounding controls.
-    return (2, "long_short", 2, "selective", "true", "skip", "skip", 4.2, "off", "off")
+    return (2, "long_short", 2, "selective", "true", "skip", "skip", 4.2, "off", "off", "false", "false", "end_of_day_top_n", "off", "10:00", "11:00", 1.00, 0.0, 0.00, 999.00, -999.00, 999.00, 0.50, 2.00, 1.50)
 
 
 @app.callback(
@@ -337,9 +659,14 @@ def apply_settings_preset(preset_name):
     Output("trades-table", "data"), Output("trades-table", "columns"),
     Output("run-status", "children"),
     Input("run-btn", "n_clicks"),
-    State("strategy-profile", "value"), State("preset", "value"), State("custom-symbols", "value"),
+    State("strategy-profile", "value"), State("settings-preset", "value"), State("preset", "value"), State("custom-symbols", "value"),
     State("start-date", "date"), State("end-date", "date"), State("feed", "value"),
-    State("account-value", "value"), State("risk-dollars-v12", "value"),
+    State("backtest-session-mode", "value"), State("backtest-decision-mode", "value"),
+    State("live-quality-gate", "value"), State("quality-start-time", "value"), State("quality-end-time", "value"),
+    State("quality-min-rvol", "value"), State("quality-min-daily-atr", "value"), State("quality-min-dir-rs", "value"), State("quality-max-dir-rs", "value"),
+    State("quality-min-dir-open-rs", "value"), State("quality-max-dir-open-rs", "value"),
+    State("quality-min-dir-vwap", "value"), State("quality-max-dir-vwap", "value"), State("quality-max-abs-vwap", "value"),
+    State("openai-filter-mode", "value"), State("openai-model", "value"), State("openai-max-candidates", "value"), State("openai-min-confidence", "value"), State("account-value", "value"), State("risk-dollars-v12", "value"),
     State("risk-mode", "value"), State("base-risk-pct", "value"), State("min-risk-dollars", "value"), State("max-risk-dollars", "value"),
     State("dd1-risk-pct", "value"), State("dd2-risk-pct", "value"), State("pause-dd-pct", "value"),
     State("min-score", "value"), State("max-trades", "value"), State("slippage-bps", "value"), State("use-news", "value"), State("candle-mode", "value"),
@@ -347,14 +674,15 @@ def apply_settings_preset(preset_name):
     State("enable-mr", "value"), State("enable-or", "value"), State("direction-mode", "value"),
     prevent_initial_call=True,
 )
-def run_backtest_callback(n_clicks, strategy_profile, preset, custom_symbols, start_date, end_date, feed, account_value, risk_dollars, risk_mode, base_risk_pct, min_risk_dollars, max_risk_dollars, dd1_risk_pct, dd2_risk_pct, pause_dd_pct, min_score, max_trades, slippage_bps, use_news, candle_mode, macro_filter, stress_filter, news_filter, qqq_stress_threshold, kill_switch, enable_mr, enable_or, direction_mode):
+def run_backtest_callback(n_clicks, strategy_profile, settings_preset, preset, custom_symbols, start_date, end_date, feed, backtest_session_mode, backtest_decision_mode, live_quality_gate, quality_start_time, quality_end_time, quality_min_rvol, quality_min_daily_atr, quality_min_dir_rs, quality_max_dir_rs, quality_min_dir_open_rs, quality_max_dir_open_rs, quality_min_dir_vwap, quality_max_dir_vwap, quality_max_abs_vwap, openai_filter_mode, openai_model, openai_max_candidates, openai_min_confidence, account_value, risk_dollars, risk_mode, base_risk_pct, min_risk_dollars, max_risk_dollars, dd1_risk_pct, dd2_risk_pct, pause_dd_pct, min_score, max_trades, slippage_bps, use_news, candle_mode, macro_filter, stress_filter, news_filter, qqq_stress_threshold, kill_switch, enable_mr, enable_or, direction_mode):
     blank_tables = ([], []) * 9
     if not n_clicks:
         metrics = [metric_card("Win Rate", "--", "target: 62-75% after validation"), metric_card("Total P&L", "--"), metric_card("Profit Factor", "--"), metric_card("Trades", "--"), metric_card("Avg MFE", "--"), metric_card("Expectancy", "--")]
         empty = empty_figure
-        return (metrics, empty("Equity Curve"), empty("Drawdown"), empty("P&L by Symbol"), empty("R-Multiple Distribution"), empty("P&L by Setup Type"), empty("Trades by Day"), *blank_tables, "Ready. Add Alpaca keys to .env, choose symbols, then run a backtest.")
+        return (metrics, empty("Equity Curve"), empty("Drawdown"), empty("P&L by Symbol"), empty("R-Multiple Distribution"), empty("P&L by Setup Type"), empty("Trades by Day"), *blank_tables, "Ready. Add Alpaca keys to .env, choose symbols, then run a backtest. Note: per-symbol results are portfolio-selected after Top trades/day, not standalone one-symbol results.")
 
     try:
+        custom_symbols_active = bool(str(custom_symbols or "").strip())
         symbols = parse_symbols(custom_symbols, preset=preset)
         risk_value = float(risk_dollars)
         account_value_f = float(account_value or 10000)
@@ -367,6 +695,14 @@ def run_backtest_callback(n_clicks, strategy_profile, preset, custom_symbols, st
         params = StrategyParams(
             strategy_profile=strategy_profile or "symbol_playbook_v25",
             direction_mode=str(direction_mode or "long_only"),
+            backtest_session_mode=str(backtest_session_mode or "regular_only"),
+            backtest_decision_mode=str(backtest_decision_mode or "end_of_day_top_n"),
+            v25_allow_generic_symbols=custom_symbols_active,
+            openai_trade_filter_enabled=(str(openai_filter_mode or "off").lower() == "on"),
+            openai_trade_filter_model=str(openai_model or os.getenv("OPENAI_TRADE_FILTER_MODEL", "gpt-5-mini")),
+            openai_trade_filter_max_candidates_per_day=int(openai_max_candidates or 5000),
+            openai_trade_filter_batch_mode="full_run",
+            openai_trade_filter_min_confidence=float(openai_min_confidence or 0.0),
             initial_account_value=account_value_f,
             risk_per_trade_dollars=risk_value,
             requested_risk_percent=base_risk_pct_f,
@@ -390,17 +726,108 @@ def run_backtest_callback(n_clicks, strategy_profile, preset, custom_symbols, st
             v27_news_filter_mode=str(news_filter or "off"),
             v27_symbol_kill_switch_mode=str(kill_switch or "off"),
             v27_qqq_stress_abs_change_pct=float(qqq_stress_threshold or 1.25),
+            enable_v358_live_quality_filter=False,
+            enable_v359_live_hunter_filter=False,
+            enable_v364_professional_momentum_filter=False,
+            enable_v377_positive_context_filter=False,
         )
+        # Live raw quality gate is now a user-editable control, not a hidden preset override.
+        # It can be combined with any other visible filter and any risk/compounding mode.
+        gate_mode = str(live_quality_gate or "off").lower()
+        if gate_mode == "v358":
+            params.enable_v358_live_quality_filter = True
+            params.v358_quality_start_time = str(quality_start_time or "10:00")
+            params.v358_quality_end_time = str(quality_end_time or "11:00")
+            params.v358_min_rvol = float(quality_min_rvol or 0.0)
+            params.v358_min_daily_atr_pct = float(quality_min_daily_atr or 0.0)
+            params.v358_min_directional_rs = float(quality_min_dir_rs or -999.0)
+            params.v358_max_directional_rs = float(quality_max_dir_rs or 999.0)
+            params.v358_min_directional_open_rs = float(quality_min_dir_open_rs or -999.0)
+            params.v358_max_directional_open_rs = float(quality_max_dir_open_rs or 999.0)
+            params.v358_min_directional_vwap_extension_atr = float(quality_min_dir_vwap or -999.0)
+            params.v358_max_directional_vwap_extension_atr = float(quality_max_dir_vwap or 999.0)
+            params.v358_max_abs_vwap_extension_atr = float(quality_max_abs_vwap or 999.0)
+        elif gate_mode == "v364":
+            params.enable_v364_professional_momentum_filter = True
+            params.v364_quality_start_time = str(quality_start_time or "10:00")
+            params.v364_quality_end_time = str(quality_end_time or "12:00")
+            params.v364_min_rvol = float(quality_min_rvol or 0.0)
+            params.v364_min_daily_atr_pct = float(quality_min_daily_atr or 0.0)
+            params.v364_min_directional_rs = float(quality_min_dir_rs or -999.0)
+            params.v364_max_directional_rs = float(quality_max_dir_rs or 999.0)
+            params.v364_min_directional_open_rs = float(quality_min_dir_open_rs or -999.0)
+            params.v364_max_directional_open_rs = float(quality_max_dir_open_rs or 999.0)
+            params.v364_min_directional_vwap_extension_atr = float(quality_min_dir_vwap or -999.0)
+            params.v364_max_directional_vwap_extension_atr = float(quality_max_dir_vwap or 999.0)
+            params.v364_max_abs_vwap_extension_atr = float(quality_max_abs_vwap or 999.0)
+        elif gate_mode == "v377":
+            params.enable_v377_positive_context_filter = True
+        elif gate_mode == "v379":
+            params.enable_v379_decision_pattern_filter = True
+            params.v379_pattern_mode = "balanced_vwap_prevhigh"
+        elif gate_mode == "v38_active":
+            params.enable_v379_decision_pattern_filter = True
+            params.v379_pattern_mode = "v38_active"
+        elif gate_mode == "v38_stable":
+            params.enable_v379_decision_pattern_filter = True
+            params.v379_pattern_mode = "v38_stable"
+        elif gate_mode == "v382_active_plus":
+            params.enable_v379_decision_pattern_filter = True
+            params.v379_pattern_mode = "v382_active_plus"
+        elif gate_mode == "v383_adaptive":
+            params.enable_v379_decision_pattern_filter = True
+            params.v379_pattern_mode = "v383_adaptive"
+        elif gate_mode == "v384_failure_reversal":
+            params.enable_v379_decision_pattern_filter = True
+            params.v379_pattern_mode = "v384_failure_reversal"
+        elif gate_mode == "v385_adaptive_plus":
+            params.enable_v379_decision_pattern_filter = True
+            params.v379_pattern_mode = "v385_adaptive_plus"
+        elif gate_mode == "v382_more_trades":
+            params.enable_v379_decision_pattern_filter = True
+            params.v379_pattern_mode = "v382_more_trades"
+        elif gate_mode in {"v359", "custom"}:
+            params.enable_v359_live_hunter_filter = True
+            params.v359_quality_start_time = str(quality_start_time or "10:00")
+            params.v359_quality_end_time = str(quality_end_time or "11:00")
+            params.v359_min_rvol = float(quality_min_rvol or 0.0)
+            params.v359_min_daily_atr_pct = float(quality_min_daily_atr or 0.0)
+            params.v359_min_directional_rs = float(quality_min_dir_rs or -999.0)
+            params.v359_max_directional_rs = float(quality_max_dir_rs or 999.0)
+            params.v359_min_directional_open_rs = float(quality_min_dir_open_rs or -999.0)
+            params.v359_max_directional_open_rs = float(quality_max_dir_open_rs or 999.0)
+            params.v359_min_directional_vwap_extension_atr = float(quality_min_dir_vwap or -999.0)
+            params.v359_max_directional_vwap_extension_atr = float(quality_max_dir_vwap or 999.0)
+            params.v359_max_abs_vwap_extension_atr = float(quality_max_abs_vwap or 999.0)
+
         if str(strategy_profile or "") == "symbol_playbook_v25":
             params.max_open_positions = int(max_trades or 2)
             params.daily_loss_limit_pct = 100.0
             params.max_consecutive_losses = 99
             params.v25_target_r = 0.75
             params.v25_max_hold_bars = 12
-        result = run_backtest(symbols=symbols, start_date=start_date, end_date=end_date, params=params, feed=feed, use_cache=True, use_news=(str(use_news).lower() == "true"), export_report=True)
+            # Presets load defaults through the GUI callback only. Do not override
+            # user-edited controls here; every visible field must remain active.
+
+        if custom_symbols_active:
+            # Custom-symbol mode must genuinely run the user's watchlist, not the
+            # packaged V25 replay universe.  The original V25 liquidity limits were
+            # tuned for large/liquid names and would silently eliminate most penny
+            # or micro-cap symbols before signals are created.  For custom research
+            # we relax tradability gates while preserving the same V25 event/VP
+            # structure, target, stop, hold, sizing and portfolio rules.
+            params.v25_allow_generic_symbols = True
+            params.min_price = 0.01
+            params.min_avg_20d_dollar_volume = 0.0
+            params.min_current_5m_dollar_volume = 0.0
+            params.min_daily_atr_pct = 0.0
+            params.max_daily_atr_pct = 999.0
+            params.v25_min_rvol = 0.0
+
+        result = run_backtest(symbols=symbols, start_date=start_date, end_date=end_date, params=params, feed=feed, use_cache=True, use_news=(str(use_news).lower() == "true"), export_report=True, session_mode=str(backtest_session_mode or "regular_only"))
         metrics = result["metrics"]
-        selected = result["selected_trades"]
-        candidates = result["candidates"]
+        selected = result.get("selected_trades", pd.DataFrame())
+        candidates = result.get("candidates", pd.DataFrame())
         report_paths = result.get("report_paths", {})
 
         metrics_cards = [
@@ -430,7 +857,7 @@ def run_backtest_callback(n_clicks, strategy_profile, preset, custom_symbols, st
         score_data, score_cols = table_payload(result.get("score_band_summary", pd.DataFrame()), money_cols=["total_pnl"], pct_cols=["win_rate"], round_cols=["avg_r", "avg_score", "profit_factor"])
         time_data, time_cols = table_payload(result.get("time_bucket_summary", pd.DataFrame()), money_cols=["total_pnl"], pct_cols=["win_rate"], round_cols=["avg_r", "avg_score", "profit_factor"])
 
-        trade_cols = ["symbol", "entry_time_et", "exit_time_et", "trigger_type", "quality", "candidate_score", "entry_candle_pattern", "entry_price", "stop_price", "shares", "notional", "risk_budget", "actual_dollars_at_risk", "pnl_dollars", "pnl_dollars_from_shares", "risk_application_delta", "r_multiple", "mfe_r", "mae_r", "position_sizing_mode", "low_followthrough_mode", "target1_hit", "target2_hit", "exit_reason"]
+        trade_cols = ["symbol", "entry_time_et", "exit_time_et", "trigger_type", "quality", "candidate_score", "openai_confidence", "openai_reason", "entry_candle_pattern", "entry_price", "stop_price", "shares", "notional", "risk_budget", "actual_dollars_at_risk", "pnl_dollars", "pnl_dollars_from_shares", "risk_application_delta", "r_multiple", "mfe_r", "mae_r", "position_sizing_mode", "low_followthrough_mode", "target1_hit", "target2_hit", "exit_reason"]
         if not selected.empty:
             for col in trade_cols:
                 if col not in selected.columns:
@@ -439,7 +866,61 @@ def run_backtest_callback(n_clicks, strategy_profile, preset, custom_symbols, st
         else:
             trade_data = pd.DataFrame(columns=trade_cols)
         trade_data, trade_columns = table_payload(trade_data, money_cols=["entry_price", "stop_price", "pnl_dollars"], round_cols=["candidate_score", "candle_pattern_score", "r_multiple", "mfe_r", "mae_r"])
-        status = f"Backtest complete: {len(symbols)} symbols, {start_date} to {end_date}, feed={feed}, execution={result.get('execution_timeframe')}, UI risk=${float(risk_dollars):.2f}, engine risk=${metrics.get('risk_per_trade_dollars', metrics.get('avg_risk_budget', 0)):.2f}, sizing={risk_mode_s}, fixed risk input=${risk_dollars}, base risk={base_risk_pct_f:.2f}%, max risk=${float(max_risk_dollars or 0):.2f}, min score={min_score}, candle mode={candle_mode}, macro={macro_filter}, qqq stress={stress_filter}, news filter={news_filter}, kill switch={kill_switch}, news/catalyst proxy={use_news}, mean reversion={enable_mr}, OR/retest={enable_or}, direction={direction_mode}. Report: {report_paths.get('latest_zip', report_paths.get('zip_path', 'not saved'))}"
+        custom_note = " custom_symbols_override=ON(raw local Alpaca bars + missing-data fetch, relaxed custom liquidity gates)" if custom_symbols_active else " custom_symbols_override=OFF(preset/replay baseline when regular)"
+        live_quality_notes = []
+        if bool(getattr(params, "enable_v358_live_quality_filter", False)):
+            live_quality_notes.append(
+                f"quality_gate=v358({params.v358_quality_start_time}-{params.v358_quality_end_time}, "
+                f"rvol>={params.v358_min_rvol}, dailyATR>={getattr(params, 'v358_min_daily_atr_pct', 0.0)}, dirRS={params.v358_min_directional_rs}..{params.v358_max_directional_rs}, "
+                f"openRS={params.v358_min_directional_open_rs}..{params.v358_max_directional_open_rs}, "
+                f"dirVWAP={params.v358_min_directional_vwap_extension_atr}..{params.v358_max_directional_vwap_extension_atr}, "
+                f"absVWAP<={params.v358_max_abs_vwap_extension_atr})"
+            )
+        if bool(getattr(params, "enable_v359_live_hunter_filter", False)):
+            live_quality_notes.append(
+                f"quality_gate={gate_mode}({params.v359_quality_start_time}-{params.v359_quality_end_time}, "
+                f"rvol>={params.v359_min_rvol}, dailyATR>={getattr(params, 'v359_min_daily_atr_pct', 0.0)}, dirRS={params.v359_min_directional_rs}..{params.v359_max_directional_rs}, "
+                f"openRS={params.v359_min_directional_open_rs}..{params.v359_max_directional_open_rs}, "
+                f"dirVWAP={params.v359_min_directional_vwap_extension_atr}..{params.v359_max_directional_vwap_extension_atr}, "
+                f"absVWAP<={params.v359_max_abs_vwap_extension_atr})"
+            )
+        if bool(getattr(params, "enable_v377_positive_context_filter", False)):
+            live_quality_notes.append("quality_gate=v378_mined_profitable_indicator_pattern(live-safe)")
+        if bool(getattr(params, "enable_v379_decision_pattern_filter", False)):
+            live_quality_notes.append(f"quality_gate=decision_time_pattern({getattr(params, 'v379_pattern_mode', '')})")
+        live_quality_note = " " + "; ".join(live_quality_notes) if live_quality_notes else " quality_gate=OFF"
+        diag = result.get("diagnostics", {}) or {}
+        skipped_df = result.get("skipped_symbols", pd.DataFrame())
+        skipped_preview = ""
+        if skipped_df is not None and not skipped_df.empty:
+            try:
+                skipped_preview = " skipped=" + "; ".join((skipped_df.head(8)["symbol"].astype(str) + ":" + skipped_df.head(8)["reason"].astype(str)).tolist())
+            except Exception:
+                skipped_preview = f" skipped_symbols={len(skipped_df)}"
+        cache_note = ""
+        try:
+            cs = diag.get("cache_status", [])
+            if cs:
+                downloaded = sum(int(x.get("downloaded_rows", 0) or 0) for x in cs if isinstance(x, dict))
+                cache_note = f" cache_downloaded_rows={downloaded}"
+        except Exception:
+            cache_note = ""
+        prefilter_stats = diag.get("prefilter_stats", {}) if isinstance(diag, dict) else {}
+        prefilter_note = ""
+        if isinstance(prefilter_stats, dict):
+            prefilter_note = (
+                f" filters_removed=macro:{prefilter_stats.get('macro_filtered', 0)},"
+                f" qqq:{prefilter_stats.get('stress_filtered', 0)},"
+                f" catalyst:{prefilter_stats.get('news_filtered', 0)},"
+                f" kill:{diag.get('v27_kill_switch_skipped_selected_trades', 0)}"
+            )
+        user_alerts = _format_user_alerts(result, custom_symbols_active)
+        ai_diag = (diag.get("openai_filter") or {}) if isinstance(diag, dict) else {}
+        ai_note = ""
+        if ai_diag.get("enabled"):
+            ai_note = f" OpenAI filter: model={ai_diag.get('model')}, review_mode={ai_diag.get('review_mode')}, batch_mode={ai_diag.get('batch_mode')}, api_calls={ai_diag.get('api_calls')}, prompt_sizes={ai_diag.get('prompt_candidate_counts')}, reviewed={ai_diag.get('reviewed')}, approved={ai_diag.get('approved')}, after_filter={diag.get('openai_candidates_after_filter')}."
+        top_note = f" top_requested={max_trades}, top_effective={diag.get('effective_top_trades_per_day', diag.get('top_trades_per_day', max_trades))}, max_selected_per_day={diag.get('actual_max_selected_trades_in_single_day', 'n/a')}, days_hit_requested_top={diag.get('days_at_or_above_requested_top', 'n/a')}, full_candidate_universe={diag.get('full_candidate_universe_available', 'n/a')}, source={diag.get('dynamic_candidate_source_kind', 'n/a')}, fallback_top_limit={diag.get('fallback_top_file_limit', 'n/a')}."
+        status = f"Backtest complete: {len(symbols)} symbols ({', '.join(symbols[:12])}{'...' if len(symbols) > 12 else ''}), {start_date} to {end_date}, feed={feed}, session={backtest_session_mode}, decision_mode={diag.get('backtest_decision_mode', backtest_decision_mode)},{custom_note}, execution={result.get('execution_timeframe')}, raw_alerts={diag.get('raw_alerts', 'n/a')}, raw_candidates={diag.get('raw_candidates', len(candidates) if candidates is not None else 'n/a')}, selected_trades={metrics.get('total_trades', 0)},{top_note}{live_quality_note},{prefilter_note},{cache_note}{skipped_preview},{ai_note} UI risk=${float(risk_dollars):.2f}, engine risk=${metrics.get('risk_per_trade_dollars', metrics.get('avg_risk_budget', 0)):.2f}, sizing={risk_mode_s}, fixed risk input=${risk_dollars}, base risk={base_risk_pct_f:.2f}%, max risk=${float(max_risk_dollars or 0):.2f}, min score={min_score}, candle mode={candle_mode}, macro={macro_filter}, qqq stress={stress_filter}, news filter={news_filter}, kill switch={kill_switch}, news/catalyst proxy={use_news}, mean reversion={enable_mr}, OR/retest={enable_or}, direction={direction_mode}. {user_alerts} Report: {report_paths.get('latest_zip', report_paths.get('zip_path', 'not saved'))}"
         return metrics_cards, equity_fig, drawdown_fig, symbol_fig, r_fig, setup_fig, daily_fig, sym_data, sym_cols, setup_data, setup_cols, daily_data, daily_cols, exit_data, exit_cols, mfe_data, mfe_cols, candle_data, candle_cols, score_data, score_cols, time_data, time_cols, trade_data, trade_columns, status
     except Exception as exc:
         metrics_cards = [metric_card("Error", "Backtest failed"), metric_card("Fix", "Check keys/date/feed"), metric_card("Details", str(exc)[:60])]
@@ -465,7 +946,7 @@ def make_drawdown_fig(df: pd.DataFrame) -> go.Figure:
 def make_symbol_fig(df: pd.DataFrame) -> go.Figure:
     if df.empty:
         return empty_figure("P&L by Symbol")
-    fig = px.bar(df.sort_values("total_pnl"), x="symbol", y="total_pnl", title="P&L by Symbol", hover_data=["trades", "win_rate", "avg_r"])
+    fig = px.bar(df.sort_values("total_pnl"), x="symbol", y="total_pnl", title="P&L by Symbol (Portfolio-Selected Trades)", hover_data=["trades", "win_rate", "avg_r"])
     return polish_fig(fig, y_title="P&L ($)")
 
 

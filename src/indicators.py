@@ -15,10 +15,27 @@ def ensure_ny_timestamp(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def regular_session_only(df: pd.DataFrame) -> pd.DataFrame:
+def session_bars_only(df: pd.DataFrame, session_mode: str = "regular_only") -> pd.DataFrame:
+    """Return bars for the requested research session.
+
+    The original dashboard/backtest used regular_session_only(), which keeps
+    09:30-16:00 ET.  Extended-hours research keeps Alpaca bars from
+    04:00-20:00 ET.  The 24/5 research option keeps every cached bar so it can
+    evaluate whatever the selected feed provides.
+    """
     out = ensure_ny_timestamp(df)
-    mask = (out["time_str"] >= "09:30") & (out["time_str"] <= "16:00")
+    mode = str(session_mode or "regular_only").lower()
+    if mode in {"extended_hours", "extended", "prepost"}:
+        mask = (out["time_str"] >= "04:00") & (out["time_str"] <= "20:00")
+    elif mode in {"twenty_four_five", "24_5", "all", "all_available"}:
+        mask = pd.Series(True, index=out.index)
+    else:
+        mask = (out["time_str"] >= "09:30") & (out["time_str"] <= "16:00")
     return out.loc[mask].copy()
+
+
+def regular_session_only(df: pd.DataFrame) -> pd.DataFrame:
+    return session_bars_only(df, "regular_only")
 
 
 def ema(series: pd.Series, span: int) -> pd.Series:
@@ -121,8 +138,8 @@ def add_daily_features(intraday: pd.DataFrame, daily: pd.DataFrame) -> pd.DataFr
     return intraday.merge(daily_clean[merge_cols], on=["symbol", "session_date"], how="left")
 
 
-def add_intraday_features(df: pd.DataFrame) -> pd.DataFrame:
-    out = regular_session_only(df).sort_values(["symbol", "timestamp"]).copy()
+def add_intraday_features(df: pd.DataFrame, session_mode: str = "regular_only") -> pd.DataFrame:
+    out = session_bars_only(df, session_mode=session_mode).sort_values(["symbol", "timestamp"]).copy()
     for col in ["open", "high", "low", "close", "volume"]:
         out[col] = pd.to_numeric(out[col], errors="coerce")
     frames = []
@@ -289,8 +306,8 @@ def add_intraday_features(df: pd.DataFrame) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
-def build_qqq_context(qqq_5m: pd.DataFrame, qqq_daily: pd.DataFrame) -> pd.DataFrame:
-    q = add_intraday_features(qqq_5m)
+def build_qqq_context(qqq_5m: pd.DataFrame, qqq_daily: pd.DataFrame, session_mode: str = "regular_only") -> pd.DataFrame:
+    q = add_intraday_features(qqq_5m, session_mode=session_mode)
     q = add_daily_features(q, qqq_daily)
     qdaily = qqq_daily.copy()
     qdaily["timestamp"] = pd.to_datetime(qdaily["timestamp"], utc=True)

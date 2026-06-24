@@ -7,6 +7,8 @@ import numpy as np
 import pandas as pd
 
 from .config import StrategyParams
+from .positive_context_profiles import apply_positive_context_profile_filter
+from .decision_pattern_scorer import apply_decision_time_pattern_scorer
 
 
 
@@ -46,6 +48,105 @@ _FALLBACK_V25_PLAYBOOK_COMBOS = [
 ]
 
 
+def _float_series(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Series:
+    """Return a numeric Series for a column, or a full default Series.
+
+    Raw-bar replay can omit optional feature columns for some symbols/timeframes.
+    Returning a scalar default causes .astype/.fillna crashes later, so all live
+    quality gates use Series defaults.
+    """
+    if col in df.columns:
+        return pd.to_numeric(df[col], errors="coerce").fillna(default).astype(float)
+    return pd.Series(float(default), index=df.index, dtype="float64")
+
+
+def _apply_realtime_quality_gate(df: pd.DataFrame, params: StrategyParams, prefix: str, output_col: str) -> pd.DataFrame:
+    """Apply a live-safe quality gate using only signal-bar values.
+
+    prefix maps to params such as v358_min_rvol or v359_min_rvol. Directional
+    values normalize long/short logic: for shorts, relative weakness and below-
+    VWAP extension are converted into positive trade-direction values.
+    """
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    if "timestamp_ny" in out.columns:
+        try:
+            time_str = pd.to_datetime(out["timestamp_ny"], errors="coerce").dt.strftime("%H:%M")
+        except Exception:
+            time_str = out["timestamp_ny"].astype(str).str.slice(11, 16)
+    elif "timestamp" in out.columns:
+        ts = pd.to_datetime(out["timestamp"], utc=True, errors="coerce").dt.tz_convert("America/New_York")
+        time_str = ts.dt.strftime("%H:%M")
+    else:
+        time_str = pd.Series("", index=out.index)
+
+    start_time = str(getattr(params, f"{prefix}_quality_start_time", "10:00") or "10:00")
+    end_time = str(getattr(params, f"{prefix}_quality_end_time", "11:00") or "11:00")
+    side_short = out["side"].astype(str).str.lower().eq("short") if "side" in out.columns else pd.Series(False, index=out.index)
+
+    rs = _float_series(out, "day_relative_strength", 0.0)
+    ors = _float_series(out, "open_relative_strength", 0.0)
+    vwap = _float_series(out, "vwap_extension_atr", 0.0)
+    rvol = _float_series(out, "rvol_time_of_day", 0.0)
+    daily_atr = _float_series(out, "daily_atr14_percent", 0.0)
+    atr5 = _float_series(out, "atr5m14", 0.0)
+    close = _float_series(out, "close", 0.0).replace(0, np.nan)
+
+    dir_rs = pd.Series(np.where(side_short, -rs, rs), index=out.index, dtype="float64")
+    dir_ors = pd.Series(np.where(side_short, -ors, ors), index=out.index, dtype="float64")
+    dir_vwap = pd.Series(np.where(side_short, -vwap, vwap), index=out.index, dtype="float64")
+    abs_vwap = vwap.abs()
+
+    # Approximate V25 stop size at the signal bar.  The exact live entry is the
+    # next bar, but this approximation is causal and catches unrealistic oversized
+    # ATR-risk setups before ranking.  Defaults are wide for older gates.
+    min_stop_pct_default = float(getattr(params, "v25_min_stop_pct", 0.0015) or 0.0015) * 100.0
+    stop_atr_mult = float(getattr(params, "v25_stop_atr_mult", 0.60) or 0.60)
+    approx_signal_risk_pct = pd.Series(np.maximum(min_stop_pct_default, (stop_atr_mult * atr5 / close * 100.0)), index=out.index).replace([np.inf, -np.inf], np.nan).fillna(999.0)
+    min_signal_risk_pct = float(getattr(params, f"{prefix}_min_signal_risk_pct", 0.0) or 0.0)
+    max_signal_risk_pct = float(getattr(params, f"{prefix}_max_signal_risk_pct", 999.0) or 999.0)
+
+    qmask = (
+        (time_str >= start_time)
+        & (time_str <= end_time)
+        & (rvol >= float(getattr(params, f"{prefix}_min_rvol", 1.0) or 1.0))
+        & (daily_atr >= float(getattr(params, f"{prefix}_min_daily_atr_pct", 0.0) or 0.0))
+        & (dir_rs >= float(getattr(params, f"{prefix}_min_directional_rs", -999.0)))
+        & (dir_rs <= float(getattr(params, f"{prefix}_max_directional_rs", 999.0)))
+        & (dir_ors >= float(getattr(params, f"{prefix}_min_directional_open_rs", -999.0)))
+        & (dir_ors <= float(getattr(params, f"{prefix}_max_directional_open_rs", 999.0)))
+        & (dir_vwap >= float(getattr(params, f"{prefix}_min_directional_vwap_extension_atr", -999.0)))
+        & (dir_vwap <= float(getattr(params, f"{prefix}_max_directional_vwap_extension_atr", 999.0)))
+        & (abs_vwap <= float(getattr(params, f"{prefix}_max_abs_vwap_extension_atr", 999.0) or 999.0))
+        & (approx_signal_risk_pct >= min_signal_risk_pct)
+        & (approx_signal_risk_pct <= max_signal_risk_pct)
+    )
+    qmask = pd.Series(qmask, index=out.index).fillna(False).astype(bool)
+    out[output_col] = qmask
+    out[f"{prefix}_directional_rs"] = dir_rs
+    out[f"{prefix}_directional_open_rs"] = dir_ors
+    out[f"{prefix}_directional_vwap_atr"] = dir_vwap
+    out[f"{prefix}_approx_signal_risk_pct"] = approx_signal_risk_pct
+
+    # Optional live-safe score shaping.  This is not a future-looking optimizer;
+    # it simply ranks current candidates by live quality fields so the walk-forward
+    # selector has a better priority order when several candidates are seen.
+    wr = float(getattr(params, f"{prefix}_score_weight_rvol", 0.0) or 0.0)
+    wdrs = float(getattr(params, f"{prefix}_score_weight_directional_rs", 0.0) or 0.0)
+    wdv = float(getattr(params, f"{prefix}_score_weight_directional_vwap", 0.0) or 0.0)
+    wav = float(getattr(params, f"{prefix}_score_penalty_abs_vwap", 0.0) or 0.0)
+    if "candidate_score" in out.columns and any(abs(x) > 1e-12 for x in [wr, wdrs, wdv, wav]):
+        base_score = pd.to_numeric(out["candidate_score"], errors="coerce").fillna(0.0)
+        quality_adjustment = wr * np.log1p(rvol.clip(lower=0.0)) + wdrs * dir_rs + wdv * dir_vwap - wav * abs_vwap
+        out[f"{prefix}_base_candidate_score"] = base_score
+        out[f"{prefix}_quality_score_adjustment"] = quality_adjustment
+        out["candidate_score"] = base_score + quality_adjustment
+    if "buy_alert" in out.columns:
+        out["buy_alert"] = out["buy_alert"].fillna(False).astype(bool) & qmask
+    return out
+
+
 def _load_v25_playbook_combos() -> list[tuple[str, str, str, float, float]]:
     path = Path(__file__).resolve().parents[1] / "data" / "v25_research" / "v25_candidates_all.csv.gz"
     if not path.exists():
@@ -76,7 +177,8 @@ def _load_v25_playbook_combos() -> list[tuple[str, str, str, float, float]]:
         return _FALLBACK_V25_PLAYBOOK_COMBOS
 
 
-V25_PLAYBOOK_COMBOS = _load_v25_playbook_combos()
+EXCLUDED_PRESET_SYMBOLS = {"PYPL", "V", "DIS", "WMT", "HD"}
+V25_PLAYBOOK_COMBOS = [c for c in _load_v25_playbook_combos() if c[0] not in EXCLUDED_PRESET_SYMBOLS]
 V25_COMBO_SCORE = {(sym, event, side): (score, gross_r) for sym, event, side, score, gross_r in V25_PLAYBOOK_COMBOS}
 V25_ALLOWED = set(V25_COMBO_SCORE.keys())
 V25_SYMBOLS = {sym for sym, _, _, _, _ in V25_PLAYBOOK_COMBOS}
@@ -140,35 +242,49 @@ def _v25_live_bar_quality_score(g: pd.DataFrame, event_side: str) -> pd.Series:
     """Approximate the V25 replay fallback_score from live 5-minute bars.
 
     The historical replay file uses a combo-level robust score plus a bar-quality
-    fallback score. In live mode we do not have the precomputed replay row, so
-    we recreate a deterministic quality score from the same available concepts:
-    time-of-day RVOL, side-aligned close location, relative strength, controlled
-    VWAP extension, and candlestick support. The output is clipped to the same
-    rough 0-7 range used by the replay file.
+    fallback score. In live/raw-bar replay mode some optional candle/context
+    columns may be absent depending on the selected session/feed.  Always coerce
+    missing columns to full-length Series so pandas scalar defaults never trigger
+    errors such as: ``float object has no attribute fillna``.
     """
-    rvol = pd.to_numeric(g.get("rvol_time_of_day", 0.0), errors="coerce").fillna(0.0).clip(lower=0, upper=6)
-    close_pos_raw = pd.to_numeric(g.get("candle_close_position", 0.5), errors="coerce").fillna(0.5).clip(0, 1)
+
+    def _num_series(col: str, default: float = 0.0) -> pd.Series:
+        if col in g.columns:
+            src = g[col]
+        else:
+            src = pd.Series(default, index=g.index)
+        return pd.to_numeric(src, errors="coerce").fillna(default)
+
+    def _bool_series(col: str, default: bool = False) -> pd.Series:
+        if col in g.columns:
+            src = g[col]
+        else:
+            src = pd.Series(default, index=g.index)
+        return src.fillna(default).astype(bool)
+
+    rvol = _num_series("rvol_time_of_day", 0.0).clip(lower=0, upper=6)
+    close_pos_raw = _num_series("candle_close_position", 0.5).clip(0, 1)
     side_close = close_pos_raw if event_side == "long" else (1.0 - close_pos_raw)
-    rs = pd.to_numeric(g.get("open_relative_strength", 0.0), errors="coerce").fillna(0.0)
-    chg = pd.to_numeric(g.get("stock_change_from_open", 0.0), errors="coerce").fillna(0.0)
-    vwap_ext = pd.to_numeric(g.get("vwap_extension_atr", 0.0), errors="coerce").fillna(0.0)
+    rs = _num_series("open_relative_strength", 0.0)
+    chg = _num_series("stock_change_from_open", 0.0)
+    vwap_ext = _num_series("vwap_extension_atr", 0.0)
     side_rs = rs if event_side == "long" else -rs
     side_chg = chg if event_side == "long" else -chg
     side_vwap = vwap_ext if event_side == "long" else -vwap_ext
-    candle_bonus = pd.Series(0.0, index=g.index)
+
     if event_side == "long":
         candle_bonus = (
-            g.get("bullish_continuation_candle", False).fillna(False).astype(float) * 0.35
-            + g.get("bullish_rejection_candle", False).fillna(False).astype(float) * 0.45
-            + g.get("bullish_engulfing_candle", False).fillna(False).astype(float) * 0.55
-            - g.get("bearish_continuation_candle", False).fillna(False).astype(float) * 0.60
+            _bool_series("bullish_continuation_candle").astype(float) * 0.35
+            + _bool_series("bullish_rejection_candle").astype(float) * 0.45
+            + _bool_series("bullish_engulfing_candle").astype(float) * 0.55
+            - _bool_series("bearish_continuation_candle").astype(float) * 0.60
         )
     else:
         candle_bonus = (
-            g.get("bearish_continuation_candle", False).fillna(False).astype(float) * 0.35
-            + g.get("bearish_rejection_candle", False).fillna(False).astype(float) * 0.45
-            + g.get("bearish_engulfing_candle", False).fillna(False).astype(float) * 0.55
-            - g.get("bullish_continuation_candle", False).fillna(False).astype(float) * 0.60
+            _bool_series("bearish_continuation_candle").astype(float) * 0.35
+            + _bool_series("bearish_rejection_candle").astype(float) * 0.45
+            + _bool_series("bearish_engulfing_candle").astype(float) * 0.55
+            - _bool_series("bullish_continuation_candle").astype(float) * 0.60
         )
     quality = (
         0.25
@@ -193,9 +309,25 @@ def _compute_v25_playbook_signals(out: pd.DataFrame, params: StrategyParams) -> 
             & (out["atr5m14"] > 0)
         )
     frames = []
+    generic_symbols_enabled = bool(getattr(params, "v25_allow_generic_symbols", False))
+    generic_event_base_scores = {
+        "L_vwap_pullback_trend": 22.0,
+        "S_vwap_pullback_trend": 22.0,
+        "L_10_ORB_confirmed": 26.0,
+        "S_10_ORB_confirmed": 26.0,
+        "L_prev_low_sweep_reclaim": 24.0,
+        "S_prev_high_sweep_reject": 24.0,
+        "L_late_trend_follow": 20.0,
+        "S_late_trend_follow": 20.0,
+        "L_RS_accel_breakout": 18.0,
+        "S_RS_accel_breakdown": 18.0,
+        "L_gap_cont_controlled": 24.0,
+        "S_gap_cont_controlled": 24.0,
+        "L_early_lowATR_RS_nearVWAP": 20.0,
+    }
     for symbol, g0 in out.groupby("symbol", sort=False):
         g = g0.copy().sort_values("timestamp").reset_index(drop=True)
-        if symbol not in V25_SYMBOLS:
+        if symbol not in V25_SYMBOLS and not generic_symbols_enabled:
             g["buy_alert"] = False
             frames.append(g); continue
         g = _add_v25_developing_profile(g, bins=int(getattr(params, "v25_profile_bins", 48)))
@@ -236,6 +368,17 @@ def _compute_v25_playbook_signals(out: pd.DataFrame, params: StrategyParams) -> 
         events["S_gap_cont_controlled"] = (g["gap_percent"] <= -1.50) & (g["stock_change_from_open"] <= -1.0) & trend_short & bear & (g["vwap_extension_atr"].between(-4.0, 0))
         events["L_early_lowATR_RS_nearVWAP"] = (g["time_str"].between("09:40", "09:55")) & (g["daily_atr14_percent"] < 2.5) & (g["day_relative_strength"] >= 0.30) & (g["vwap_extension_atr"].between(-1.0, 0.85)) & bull
 
+        # Make the dashboard setup toggles active for the V25 raw-bar path.
+        # The old raw replay path ignored these controls because V25 returned early
+        # from compute_signals().  These switches are intentionally live-safe and
+        # operate only on event families visible at the signal candle.
+        if not bool(getattr(params, "enable_mean_reversion", False)):
+            events["L_prev_low_sweep_reclaim"] = pd.Series(False, index=g.index)
+            events["S_prev_high_sweep_reject"] = pd.Series(False, index=g.index)
+        if not bool(getattr(params, "enable_or_retest", False)):
+            events["L_10_ORB_confirmed"] = pd.Series(False, index=g.index)
+            events["S_10_ORB_confirmed"] = pd.Series(False, index=g.index)
+
         g["buy_alert"] = False
         g["side"] = ""
         g["trigger_type"] = ""
@@ -263,12 +406,22 @@ def _compute_v25_playbook_signals(out: pd.DataFrame, params: StrategyParams) -> 
             if event_side == "short" and not allow_short:
                 continue
             key = (symbol, event, event_side)
-            if key not in V25_ALLOWED:
+            combo_allowed = key in V25_ALLOWED
+            if not combo_allowed and not generic_symbols_enabled:
                 continue
             vp_mask = vp_long if event_side == "long" else vp_short
             m = mask.fillna(False) & vp_mask.fillna(False) & g["liquidity_filter"].fillna(False)
             # If two events hit on the same bar, keep the higher live score.
-            base_score, gross_r = V25_COMBO_SCORE[key]
+            if combo_allowed:
+                base_score, gross_r = V25_COMBO_SCORE[key]
+            else:
+                # Custom-symbol exploratory mode. These symbols do not have a
+                # researched V25 symbol+event pocket, so use the same event
+                # structure and live bar-quality score but mark the historical
+                # edge as unknown. This makes custom watchlists backtest/fetch
+                # correctly without changing the Best Report 153601 preset path.
+                base_score = float(generic_event_base_scores.get(event, 18.0))
+                gross_r = np.nan
             fallback_score = _v25_live_bar_quality_score(g, event_side)
             live_score = base_score + fallback_score
             better = m & ((~g["buy_alert"]) | (g["candidate_score"].fillna(-999) < live_score))
@@ -277,15 +430,36 @@ def _compute_v25_playbook_signals(out: pd.DataFrame, params: StrategyParams) -> 
             g.loc[better, "trigger_type"] = "v25_" + event
             g.loc[better, "candidate_score"] = live_score[better]
             g.loc[better, "fallback_score"] = fallback_score[better]
-            g.loc[better, "quality"] = "v25_profile_reaction"
+            g.loc[better, "quality"] = "v25_profile_reaction" if combo_allowed else "v25_generic_custom_symbol_research"
             g.loc[better, "v25_base_score"] = base_score
             g.loc[better, "v25_live_bar_quality_score"] = fallback_score[better]
             g.loc[better, "v25_historical_gross_r"] = gross_r
             g.loc[better, "v25_profile_filter"] = True
-            g.loc[better, "entry_candle_ok"] = True
             g.loc[better, "supporting_score"] = 1
+
+        # Side-aware candle columns used by the dashboard Candlestick mode.
+        # V36.2 fix: previous V25 raw replay marked every V25 alert as
+        # entry_candle_ok=True, so changing the Candlestick dropdown did not change
+        # results.  These fields are now derived from the actual signal candle.
+        side_short_final = g["side"].astype(str).str.lower().eq("short")
+        g["side_continuation_candle"] = np.where(side_short_final, g.get("bearish_continuation_candle", False), g.get("bullish_continuation_candle", False))
+        g["side_rejection_candle"] = np.where(side_short_final, g.get("bearish_rejection_candle", False), g.get("bullish_rejection_candle", False))
+        g["side_engulfing_candle"] = np.where(side_short_final, g.get("bearish_engulfing_candle", False), g.get("bullish_engulfing_candle", False))
+        g["entry_candle_ok"] = np.where(side_short_final, g.get("short_entry_candle_ok", False), g.get("long_entry_candle_ok", False))
+        g["opposing_candle_warning"] = np.where(side_short_final, g.get("short_exit_warning_candle", False), g.get("long_exit_warning_candle", False))
         frames.append(g)
     result = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    # V35.8/V35.9 live/raw-bar quality gates for the V25 playbook path.
+    if not result.empty and bool(getattr(params, "enable_v358_live_quality_filter", False)):
+        result = _apply_realtime_quality_gate(result, params, "v358", "v358_live_quality_ok")
+    if not result.empty and bool(getattr(params, "enable_v359_live_hunter_filter", False)):
+        result = _apply_realtime_quality_gate(result, params, "v359", "v359_live_hunter_ok")
+    if not result.empty and bool(getattr(params, "enable_v364_professional_momentum_filter", False)):
+        result = _apply_realtime_quality_gate(result, params, "v364", "v364_professional_momentum_ok")
+    if not result.empty and bool(getattr(params, "enable_v377_positive_context_filter", False)):
+        result = apply_positive_context_profile_filter(result, params)
+    if not result.empty and bool(getattr(params, "enable_v379_decision_pattern_filter", False)):
+        result = apply_decision_time_pattern_scorer(result, params)
     return result
 
 def _to_bool_int(series: pd.Series) -> pd.Series:
@@ -1288,6 +1462,20 @@ def _compute_adaptive_v4_signals(out: pd.DataFrame, params: StrategyParams) -> p
             & (out["candidate_score"] >= params.min_candidate_score)
             & (out["support_volume"] | out["support_relative_strength"] | out["support_candle_pattern"] | is_mean_reversion)
         )
+
+    # V35.8/V35.9 live/raw-bar quality gates.
+    # These intentionally use only signal-bar values that are known at decision time.
+    if bool(getattr(params, "enable_v358_live_quality_filter", False)):
+        out = _apply_realtime_quality_gate(out, params, "v358", "v358_live_quality_ok")
+    if bool(getattr(params, "enable_v359_live_hunter_filter", False)):
+        out = _apply_realtime_quality_gate(out, params, "v359", "v359_live_hunter_ok")
+    if bool(getattr(params, "enable_v364_professional_momentum_filter", False)):
+        out = _apply_realtime_quality_gate(out, params, "v364", "v364_professional_momentum_ok")
+    if bool(getattr(params, "enable_v377_positive_context_filter", False)):
+        out = apply_positive_context_profile_filter(out, params)
+    if bool(getattr(params, "enable_v379_decision_pattern_filter", False)):
+        out = apply_decision_time_pattern_scorer(out, params)
+
     return out.sort_values(["symbol", "timestamp"]).reset_index(drop=True)
 
 
@@ -1454,6 +1642,30 @@ def _simulate_v25_trade(g: pd.DataFrame, signal_i: int, params: StrategyParams) 
         "v8_candle_quality_ok": True,
         "v25_profile_filter": bool(signal.get("v25_profile_filter", False)),
         "v25_historical_gross_r": signal.get("v25_historical_gross_r", np.nan),
+        "positive_context_profile_match": bool(signal.get("positive_context_profile_match", False)),
+        "positive_context_profile_name": signal.get("positive_context_profile_name", ""),
+        "positive_context_profile_reason": signal.get("positive_context_profile_reason", ""),
+        "positive_context_dir_rs": signal.get("positive_context_dir_rs", np.nan),
+        "positive_context_dir_open_rs": signal.get("positive_context_dir_open_rs", np.nan),
+        "positive_context_dir_vwap": signal.get("positive_context_dir_vwap", np.nan),
+        "positive_context_rvol_time_of_day": signal.get("positive_context_rvol_time_of_day", np.nan),
+        "positive_context_daily_atr14_percent": signal.get("positive_context_daily_atr14_percent", np.nan),
+        "positive_context_abs_gap": signal.get("positive_context_abs_gap", np.nan),
+        "positive_context_abs_qqq": signal.get("positive_context_abs_qqq", np.nan),
+        "positive_context_active_profile_count": signal.get("positive_context_active_profile_count", np.nan),
+        "v379_pattern_mode": signal.get("v379_pattern_mode", ""),
+        "v379_pattern_match": bool(signal.get("v379_pattern_match", False)),
+        "v379_reason": signal.get("v379_reason", ""),
+        "v379_pattern_score": signal.get("v379_pattern_score", np.nan),
+        "v379_rank_score": signal.get("v379_rank_score", np.nan),
+        "v379_original_score": signal.get("v379_original_score", np.nan),
+        "v379_candle_component": signal.get("v379_candle_component", np.nan),
+        "v379_rvol_component": signal.get("v379_rvol_component", np.nan),
+        "v379_rs_component": signal.get("v379_rs_component", np.nan),
+        "v379_vwap_component": signal.get("v379_vwap_component", np.nan),
+        "v379_directional_rs": signal.get("v379_directional_rs", np.nan),
+        "v379_directional_open_rs": signal.get("v379_directional_open_rs", np.nan),
+        "v379_directional_vwap_atr": signal.get("v379_directional_vwap_atr", np.nan),
     }
 
 def _simulate_trade(g: pd.DataFrame, signal_i: int, params: StrategyParams) -> Optional[dict[str, Any]]:
@@ -1836,15 +2048,121 @@ def _simulate_trade(g: pd.DataFrame, signal_i: int, params: StrategyParams) -> O
         "v8_trade_context": signal.get("v8_trade_context", ""),
         "v8_regime_ok": bool(signal.get("v8_regime_ok", True)),
         "v8_candle_quality_ok": bool(signal.get("v8_candle_quality_ok", True)),
+        "positive_context_profile_match": bool(signal.get("positive_context_profile_match", False)),
+        "positive_context_profile_name": signal.get("positive_context_profile_name", ""),
+        "positive_context_profile_reason": signal.get("positive_context_profile_reason", ""),
+        "positive_context_dir_rs": signal.get("positive_context_dir_rs", np.nan),
+        "positive_context_dir_open_rs": signal.get("positive_context_dir_open_rs", np.nan),
+        "positive_context_dir_vwap": signal.get("positive_context_dir_vwap", np.nan),
+        "positive_context_rvol_time_of_day": signal.get("positive_context_rvol_time_of_day", np.nan),
+        "positive_context_daily_atr14_percent": signal.get("positive_context_daily_atr14_percent", np.nan),
+        "positive_context_abs_gap": signal.get("positive_context_abs_gap", np.nan),
+        "positive_context_abs_qqq": signal.get("positive_context_abs_qqq", np.nan),
+        "positive_context_active_profile_count": signal.get("positive_context_active_profile_count", np.nan),
+        "v379_pattern_mode": signal.get("v379_pattern_mode", ""),
+        "v379_pattern_match": bool(signal.get("v379_pattern_match", False)),
+        "v379_reason": signal.get("v379_reason", ""),
+        "v379_pattern_score": signal.get("v379_pattern_score", np.nan),
+        "v379_rank_score": signal.get("v379_rank_score", np.nan),
+        "v379_original_score": signal.get("v379_original_score", np.nan),
+        "v379_candle_component": signal.get("v379_candle_component", np.nan),
+        "v379_rvol_component": signal.get("v379_rvol_component", np.nan),
+        "v379_rs_component": signal.get("v379_rs_component", np.nan),
+        "v379_vwap_component": signal.get("v379_vwap_component", np.nan),
+        "v379_directional_rs": signal.get("v379_directional_rs", np.nan),
+        "v379_directional_open_rs": signal.get("v379_directional_open_rs", np.nan),
+        "v379_directional_vwap_atr": signal.get("v379_directional_vwap_atr", np.nan),
     }
 
+
+
+def _strategy_calculate_risk_budget(equity: float, high_watermark: float, params: StrategyParams) -> tuple[float, float, float, bool, str]:
+    """Universal position sizing for every strategy/backtest path.
+
+    Returns (risk_budget, effective_risk_pct, drawdown_pct, paused, sizing_mode).
+    This intentionally mirrors the dashboard sizing modes so presets never hide
+    risk/compounding behavior.
+    """
+    equity = float(equity or 0.0)
+    high_watermark = max(float(high_watermark or equity or 0.0), equity)
+    mode = str(getattr(params, "position_sizing_mode", "fixed_dollar_risk") or "fixed_dollar_risk").lower()
+    if equity <= 0:
+        return 0.0, 0.0, 100.0, True, mode
+
+    drawdown_pct = max(0.0, (high_watermark - equity) / high_watermark * 100.0) if high_watermark > 0 else 0.0
+
+    if mode in {"fixed", "fixed_dollar", "fixed_dollar_risk", "fixed_dollar_risk_exact"}:
+        risk = float(getattr(params, "risk_per_trade_dollars", 100.0) or 100.0)
+        risk = max(0.0, risk)
+        pct = risk / equity * 100.0 if equity > 0 else 0.0
+        return risk, pct, drawdown_pct, False, "fixed_dollar_risk"
+
+    if mode in {"percent", "percent_equity", "full_compounding", "percent_equity_full_compounding"}:
+        # The dashboard passes Base risk % into both requested_risk_percent and
+        # risk_per_trade_pct. Prefer the decimal field but fall back safely.
+        pct_decimal = float(getattr(params, "risk_per_trade_pct", 0.01) or 0.01)
+        if pct_decimal > 1.0:
+            pct_decimal = pct_decimal / 100.0
+        risk = max(0.0, equity * pct_decimal)
+        pct = risk / equity * 100.0 if equity > 0 else 0.0
+        return risk, pct, drawdown_pct, False, "percent_equity"
+
+    # Controlled compounding: current equity * base risk %, then optional drawdown
+    # brakes, dollar min/max caps, and maximum % of equity cap.
+    pause_dd = float(getattr(params, "compounding_pause_dd_pct", 15.0) or 15.0)
+    if drawdown_pct >= pause_dd:
+        return 0.0, 0.0, drawdown_pct, True, "controlled_compounding"
+
+    pct = float(getattr(params, "compounding_base_risk_pct", 1.0) or 1.0)
+    dd1 = float(getattr(params, "compounding_dd1_pct", 5.0) or 5.0)
+    dd2 = float(getattr(params, "compounding_dd2_pct", 10.0) or 10.0)
+    if drawdown_pct >= dd2:
+        pct = float(getattr(params, "compounding_dd2_risk_pct", 0.50) or 0.50)
+    elif drawdown_pct >= dd1:
+        pct = float(getattr(params, "compounding_dd1_risk_pct", 0.75) or 0.75)
+
+    risk = equity * pct / 100.0
+    min_risk = float(getattr(params, "compounding_min_risk_dollars", 10.0) or 0.0)
+    max_risk = float(getattr(params, "compounding_max_risk_dollars", 300.0) or 0.0)
+    max_pct = float(getattr(params, "compounding_max_risk_pct_of_equity", 1.25) or 0.0)
+    if min_risk > 0:
+        risk = max(risk, min_risk)
+    if max_risk > 0:
+        risk = min(risk, max_risk)
+    if max_pct > 0:
+        risk = min(risk, equity * max_pct / 100.0)
+    risk = max(0.0, risk)
+    effective_pct = risk / equity * 100.0 if equity > 0 else 0.0
+    return risk, effective_pct, drawdown_pct, False, "controlled_compounding"
+
+
+def _strategy_high_watermark_before_trade(selected: list[dict[str, Any]], initial_equity: float, entry_time: pd.Timestamp) -> float:
+    """Return the maximum closed-equity value known before this entry."""
+    high = float(initial_equity or 0.0)
+    closed = []
+    for t in selected:
+        try:
+            if pd.Timestamp(t.get("exit_time")) <= entry_time:
+                closed.append(t)
+        except Exception:
+            continue
+    if not closed:
+        return high
+    closed = sorted(closed, key=lambda x: pd.Timestamp(x.get("exit_time")))
+    equity = float(initial_equity or 0.0)
+    for t in closed:
+        equity += float(t.get("pnl_dollars", 0.0) or 0.0)
+        high = max(high, equity)
+    return high
 
 def apply_portfolio_rules(candidates: pd.DataFrame, params: StrategyParams) -> pd.DataFrame:
     if candidates.empty:
         return candidates
 
-    if str(getattr(params, "strategy_profile", "")).lower() == "symbol_playbook_v25":
+    decision_mode = str(getattr(params, "backtest_decision_mode", "end_of_day_top_n") or "end_of_day_top_n").lower()
+    if str(getattr(params, "strategy_profile", "")).lower() == "symbol_playbook_v25" and decision_mode not in {"live_simulated", "live", "walk_forward", "seen_so_far_top_n", "raw_bar_replay", "full_raw_bar_replay", "historical_raw_replay", "raw_replay"}:
         # V25 research ranking selected top N candidates by score per session, not the earliest chronological candidates.
+        # Live-simulation mode preselects chronologically in backtest.py before this function.
         candidates = (
             candidates.sort_values(["session_date", "candidate_score", "entry_time"], ascending=[True, False, True])
             .groupby("session_date", group_keys=False)
@@ -1897,18 +2215,39 @@ def apply_portfolio_rules(candidates: pd.DataFrame, params: StrategyParams) -> p
             skipped_rows.append(row)
             continue
 
-        base_risk_budget = float(getattr(params, "risk_per_trade_dollars", equity_at_entry * params.risk_per_trade_pct))
+        high_watermark_before_trade = _strategy_high_watermark_before_trade(selected, float(params.initial_account_value), entry_time)
+        base_risk_budget, effective_risk_pct, drawdown_before_trade_pct, sizing_paused, sizing_mode = _strategy_calculate_risk_budget(
+            equity_at_entry, high_watermark_before_trade, params
+        )
         module_risk_multiplier = float(cand.get("module_risk_multiplier", 1.0) if hasattr(cand, "get") else 1.0)
         risk_budget = base_risk_budget * module_risk_multiplier
         entry_price = float(cand["entry_price"])
         risk_per_share = float(cand["risk_per_share"])
 
-        # V12: risk is applied to the trade itself, not only to reporting.
-        # We use fractional shares in the backtest so changing Risk $/trade
-        # scales P&L exactly according to the trade's R multiple.
+        if sizing_paused or risk_budget <= 0:
+            row = cand.to_dict()
+            row["selected"] = False
+            row["skip_reason"] = "sizing_paused_or_zero_risk"
+            row["equity_at_entry"] = equity_at_entry
+            row["risk_budget"] = risk_budget
+            row["base_risk_per_trade_dollars"] = base_risk_budget
+            row["module_risk_multiplier"] = module_risk_multiplier
+            row["risk_per_trade_dollars"] = risk_budget
+            row["requested_risk_percent"] = float(getattr(params, "requested_risk_percent", effective_risk_pct) or effective_risk_pct)
+            row["engine_risk_per_trade_pct"] = effective_risk_pct / 100.0
+            row["risk_per_trade_percent"] = effective_risk_pct
+            row["effective_risk_pct"] = effective_risk_pct
+            row["drawdown_before_trade_pct"] = drawdown_before_trade_pct
+            row["compounding_high_watermark_before_trade"] = high_watermark_before_trade
+            row["position_sizing_mode"] = sizing_mode
+            skipped_rows.append(row)
+            continue
+
+        # Risk is applied to the trade itself, not only to reporting.
+        # Fractional shares are used in the backtest so all sizing modes scale
+        # P&L exactly according to the trade's R multiple.
         requested_risk_shares = (risk_budget / risk_per_share) if risk_per_share > 0 else 0.0
         cash_shares = 0.0
-        sizing_mode = "fixed_dollar_risk_exact"
         shares = requested_risk_shares
         sizing_cap_applied = False
 
@@ -1921,8 +2260,12 @@ def apply_portfolio_rules(candidates: pd.DataFrame, params: StrategyParams) -> p
             row["base_risk_per_trade_dollars"] = base_risk_budget
             row["module_risk_multiplier"] = module_risk_multiplier
             row["risk_per_trade_dollars"] = risk_budget
-            row["requested_risk_percent"] = (risk_budget / equity_at_entry * 100) if equity_at_entry > 0 else 0.0
-            row["engine_risk_per_trade_pct"] = (risk_budget / equity_at_entry) if equity_at_entry > 0 else 0.0
+            row["requested_risk_percent"] = float(getattr(params, "requested_risk_percent", effective_risk_pct) or effective_risk_pct)
+            row["engine_risk_per_trade_pct"] = effective_risk_pct / 100.0
+            row["risk_per_trade_percent"] = effective_risk_pct
+            row["effective_risk_pct"] = effective_risk_pct
+            row["drawdown_before_trade_pct"] = drawdown_before_trade_pct
+            row["compounding_high_watermark_before_trade"] = high_watermark_before_trade
             row["position_sizing_mode"] = sizing_mode
             row["max_position_notional_pct"] = float(getattr(params, "max_position_notional_pct", 999.0))
             row["requested_risk_shares"] = requested_risk_shares
@@ -1939,9 +2282,12 @@ def apply_portfolio_rules(candidates: pd.DataFrame, params: StrategyParams) -> p
         row["base_risk_per_trade_dollars"] = base_risk_budget
         row["module_risk_multiplier"] = module_risk_multiplier
         row["risk_per_trade_dollars"] = risk_budget
-        row["requested_risk_percent"] = (risk_budget / equity_at_entry * 100) if equity_at_entry > 0 else 0.0
-        row["engine_risk_per_trade_pct"] = (risk_budget / equity_at_entry) if equity_at_entry > 0 else 0.0
-        row["risk_per_trade_percent"] = (risk_budget / equity_at_entry * 100) if equity_at_entry > 0 else 0.0
+        row["requested_risk_percent"] = float(getattr(params, "requested_risk_percent", effective_risk_pct) or effective_risk_pct)
+        row["engine_risk_per_trade_pct"] = effective_risk_pct / 100.0
+        row["risk_per_trade_percent"] = effective_risk_pct
+        row["effective_risk_pct"] = effective_risk_pct
+        row["drawdown_before_trade_pct"] = drawdown_before_trade_pct
+        row["compounding_high_watermark_before_trade"] = high_watermark_before_trade
         row["position_sizing_mode"] = sizing_mode
         row["max_position_notional_pct"] = float(getattr(params, "max_position_notional_pct", 999.0))
         row["requested_risk_shares"] = requested_risk_shares
@@ -2072,7 +2418,10 @@ def summarize_results(trades: pd.DataFrame, params: StrategyParams) -> dict[str,
         "trade_days": int(trading_days_with_trades),
         "trades_per_trade_day": float(trades_per_trade_day),
         "avg_candidate_score": float(selected["candidate_score"].mean()) if "candidate_score" in selected.columns else 0.0,
-        "risk_per_trade_dollars": float(getattr(params, "risk_per_trade_dollars", params.initial_account_value * params.risk_per_trade_pct)),
+        # Average applied risk is the real engine risk for the selected trades.
+        # In compounding modes this changes trade-by-trade, so do not report the
+        # fixed-dollar UI input as the active engine risk.
+        "risk_per_trade_dollars": float(selected["risk_budget"].mean()) if "risk_budget" in selected.columns else float(getattr(params, "risk_per_trade_dollars", params.initial_account_value * params.risk_per_trade_pct)),
         "requested_risk_dollars": float(getattr(params, "risk_per_trade_dollars", 0.0)),
         "requested_risk_percent": float(getattr(params, "requested_risk_percent", params.risk_per_trade_pct * 100)),
         "risk_per_trade_pct": float(params.risk_per_trade_pct),
@@ -2190,7 +2539,10 @@ def _empty_metrics(params: StrategyParams) -> dict[str, Any]:
         "trade_days": 0,
         "trades_per_trade_day": 0.0,
         "avg_candidate_score": 0.0,
-        "risk_per_trade_dollars": float(getattr(params, "risk_per_trade_dollars", params.initial_account_value * params.risk_per_trade_pct)),
+        # Average applied risk is the real engine risk for the selected trades.
+        # In compounding modes this changes trade-by-trade, so do not report the
+        # fixed-dollar UI input as the active engine risk.
+        "risk_per_trade_dollars": float(selected["risk_budget"].mean()) if "risk_budget" in selected.columns else float(getattr(params, "risk_per_trade_dollars", params.initial_account_value * params.risk_per_trade_pct)),
         "requested_risk_dollars": float(getattr(params, "risk_per_trade_dollars", 0.0)),
         "requested_risk_percent": float(getattr(params, "requested_risk_percent", params.risk_per_trade_pct * 100)),
         "risk_per_trade_pct": float(params.risk_per_trade_pct),

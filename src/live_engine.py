@@ -19,6 +19,8 @@ from .config import PROJECT_ROOT, AlpacaSettings, StrategyParams
 from .indicators import add_daily_features, add_intraday_features, build_qqq_context, merge_market_context
 from .live_store import LiveStore, utc_now_iso
 from .strategy import compute_signals
+from .q_learning_policy import apply_q_policy, load_q_model
+from .ml_ranker_policy import load_ranker_model, score_candidates as score_ml_ranker_candidates
 from .symbols import WATCHLISTS, parse_symbols
 
 NY = ZoneInfo("America/New_York")
@@ -59,7 +61,17 @@ class LiveSettings:
     force_market_open: bool = True
     enable_max_hold_exit: bool = True
     use_news_proxy: bool = True
+    q_learning_filter_enabled: bool = False
+    q_learning_policy_path: str = ""
+    q_learning_min_edge: float = 0.0
+    q_learning_min_state_count: int = 8
+    ml_ranker_filter_enabled: bool = False
+    ml_ranker_model_path: str = ""
+    ml_ranker_min_pred_r: float = 0.05
+    ml_ranker_min_win_prob: float = 0.0
     selection_mode: str = "seen_so_far_top_n"
+    strategy_variant: str = "best_report_153601"
+    live_config_source: str = "env"
     log_path: Path = LIVE_DIR / "paper_trading_log.csv"
     state_path: Path = LIVE_DIR / "paper_trading_state.json"
 
@@ -107,7 +119,17 @@ def load_live_settings_from_env() -> tuple[LiveSettings, LiveRiskConfig]:
         force_market_open=_env_bool("LIVE_REQUIRE_MARKET_OPEN", True),
         enable_max_hold_exit=_env_bool("LIVE_ENABLE_MAX_HOLD_EXIT", True),
         use_news_proxy=_env_bool("LIVE_USE_NEWS_PROXY", True),
+        q_learning_filter_enabled=_env_bool("LIVE_Q_POLICY_ENABLED", False),
+        q_learning_policy_path=os.getenv("LIVE_Q_POLICY_PATH", ""),
+        q_learning_min_edge=_env_float("LIVE_Q_POLICY_MIN_EDGE", 0.0),
+        q_learning_min_state_count=max(1, _env_int("LIVE_Q_POLICY_MIN_STATE_COUNT", 8)),
+        ml_ranker_filter_enabled=_env_bool("LIVE_ML_RANKER_ENABLED", False),
+        ml_ranker_model_path=os.getenv("LIVE_ML_RANKER_MODEL_PATH", ""),
+        ml_ranker_min_pred_r=_env_float("LIVE_ML_RANKER_MIN_PRED_R", 0.05),
+        ml_ranker_min_win_prob=_env_float("LIVE_ML_RANKER_MIN_WIN_PROB", 0.0),
         selection_mode=os.getenv("LIVE_SELECTION_MODE", "seen_so_far_top_n"),
+        strategy_variant=os.getenv("LIVE_STRATEGY_VARIANT", "best_report_153601").strip().lower(),
+        live_config_source="env",
     )
     risk = LiveRiskConfig(
         account_value_fallback=_env_float("LIVE_ACCOUNT_VALUE_FALLBACK", 10000.0),
@@ -124,8 +146,27 @@ def load_live_settings_from_env() -> tuple[LiveSettings, LiveRiskConfig]:
     return live, risk
 
 
-def make_best_report_153601_params(risk: LiveRiskConfig) -> StrategyParams:
-    """One paper-trading strategy preset; risk sizing remains separate."""
+def make_best_report_153601_params(risk: LiveRiskConfig, variant: str | None = None) -> StrategyParams:
+    """One paper-trading strategy preset; risk sizing remains separate.
+
+    Set LIVE_STRATEGY_VARIANT=v358_live_raw_optimized or v359_live_hunter to use
+    live-safe raw-bar quality gates in paper trading.
+    """
+    variant = (variant or os.getenv("LIVE_STRATEGY_VARIANT", "best_report_153601")).strip().lower()
+    use_v358 = variant in {"v358_live_raw_optimized", "raw_live_optimized", "live_raw_optimized_v358"}
+    use_v359 = variant in {"v359_live_hunter", "v359_professional_live_hunter", "live_hunter_v359", "pro_live_hunter"}
+    use_v363 = variant in {"v363_grid_robust", "live_grid_robust_v363", "v363_robust_raw_live"}
+    use_v364 = variant in {"v364_professional_momentum", "live_professional_momentum_v364", "professional_momentum_hybrid", "v364_momentum_hybrid"}
+    use_v377 = variant in {"v377_positive_context", "positive_context_v377", "live_positive_context_v377", "report_positive_context"}
+    use_v379 = variant in {"v379_indicator_pattern", "v379_decision_pattern", "live_indicator_pattern_v379", "decision_time_pattern_v379", "v38_active_pattern", "v38_stable_pattern", "v382_active_plus", "v382_more_trades", "v38_active_plus", "v383_adaptive", "v383_regime_adaptive", "v38_3_adaptive", "v385_adaptive_plus", "v38_5_adaptive_plus", "adaptive_plus_v385", "v384_failure_reversal", "v38_4_failure_aware"}
+    use_v38_active = variant in {"v38_active_pattern", "v38_active"}
+    use_v38_stable = variant in {"v38_stable_pattern", "v38_stable"}
+    use_v382_active_plus = variant in {"v382_active_plus", "v38_active_plus", "active_plus_v382"}
+    use_v382_more_trades = variant in {"v382_more_trades", "more_trades_v382", "v382_high_activity"}
+    use_v383_regime_adaptive = variant in {"v383_regime_adaptive", "v38_3_regime_adaptive", "regime_adaptive_v383", "live_regime_adaptive_v383"}
+    use_v383_adaptive = variant in {"v383_adaptive", "v383_regime_adaptive", "v38_3_adaptive", "adaptive_composite_v383"}
+    use_v385_adaptive_plus = variant in {"v385_adaptive_plus", "v38_5_adaptive_plus", "live_adaptive_plus_v385", "adaptive_composite_plus_v385", "adaptive_plus_v385"}
+    use_v384_failure_reversal = variant in {"v384_failure_reversal", "v38_4_failure_aware", "live_failure_reversal_v384", "failure_aware_reversal"}
     return StrategyParams(
         strategy_profile="symbol_playbook_v25",
         direction_mode="long_short",
@@ -141,25 +182,158 @@ def make_best_report_153601_params(risk: LiveRiskConfig) -> StrategyParams:
         compounding_dd2_risk_pct=float(risk.dd2_risk_pct),
         compounding_pause_dd_pct=float(risk.pause_dd_pct),
         max_position_notional_pct=9999.0,
-        min_candidate_score=2.0,
-        max_trades_per_day=2,
-        max_open_positions=2,
+        min_candidate_score=10.0 if use_v364 else (0.0 if (use_v363 or use_v377 or use_v379) else 2.0),
+        max_trades_per_day=(10 if use_v385_adaptive_plus else (5 if use_v384_failure_reversal else (3 if use_v383_adaptive else (15 if use_v382_active_plus else (3 if use_v382_more_trades else (2 if (use_v377 or use_v379) else (1 if (use_v359 or use_v363 or use_v364) else 2))))))),
+        max_open_positions=(10 if use_v385_adaptive_plus else (5 if use_v384_failure_reversal else (3 if use_v383_adaptive else (15 if use_v382_active_plus else (3 if use_v382_more_trades else (2 if (use_v377 or use_v379) else (1 if (use_v359 or use_v363 or use_v364) else 2))))))),
         max_alerts_per_symbol_per_day=1,
         daily_loss_limit_pct=100.0,
         max_consecutive_losses=99,
         slippage_bps=3.0,
-        candle_pattern_mode="selective",
+        candle_pattern_mode="off" if (use_v358 or use_v359 or use_v363 or use_v364 or use_v377 or use_v379) else "selective",
         enable_mean_reversion=False,
-        enable_or_retest=False,
+        enable_or_retest=True if use_v364 else False,
         v27_macro_filter_mode="off",
-        v27_market_stress_mode="skip",
-        v27_news_filter_mode="skip",
+        v27_market_stress_mode="off" if (use_v358 or use_v359 or use_v363 or use_v364 or use_v377 or use_v379) else "skip",
+        v27_news_filter_mode="off" if (use_v358 or use_v359 or use_v363 or use_v364 or use_v377 or use_v379) else "skip",
         v27_symbol_kill_switch_mode="off",
         v27_qqq_stress_abs_change_pct=4.2,
         v25_target_r=0.75,
         v25_max_hold_bars=12,
+        enable_v358_live_quality_filter=use_v358,
+        enable_v359_live_hunter_filter=(use_v359 or use_v363),
+        enable_v364_professional_momentum_filter=use_v364,
+        enable_v377_positive_context_filter=use_v377,
+        enable_v379_decision_pattern_filter=use_v379,
+        v379_pattern_mode=("v385_adaptive_plus" if use_v385_adaptive_plus else ("v384_failure_reversal" if use_v384_failure_reversal else ("v383_adaptive" if use_v383_adaptive else ("v382_active_plus" if use_v382_active_plus else ("v382_more_trades" if use_v382_more_trades else ("v38_active" if use_v38_active else ("v38_stable" if use_v38_stable else "balanced_vwap_prevhigh"))))))),
+        q_learning_filter_enabled=_env_bool("LIVE_Q_POLICY_ENABLED", False),
+        q_learning_policy_path=os.getenv("LIVE_Q_POLICY_PATH", ""),
+        q_learning_min_edge=_env_float("LIVE_Q_POLICY_MIN_EDGE", 0.0),
+        q_learning_min_state_count=max(1, _env_int("LIVE_Q_POLICY_MIN_STATE_COUNT", 8)),
+        ml_ranker_filter_enabled=_env_bool("LIVE_ML_RANKER_ENABLED", False),
+        ml_ranker_model_path=os.getenv("LIVE_ML_RANKER_MODEL_PATH", ""),
+        ml_ranker_min_pred_r=_env_float("LIVE_ML_RANKER_MIN_PRED_R", 0.05),
+        ml_ranker_min_win_prob=_env_float("LIVE_ML_RANKER_MIN_WIN_PROB", 0.0),
+        v359_quality_start_time="10:00" if use_v363 else "10:00",
+        v359_quality_end_time="11:00" if use_v363 else "11:00",
+        v359_min_rvol=1.20 if use_v363 else 1.00,
+        v359_min_daily_atr_pct=4.00 if use_v363 else 0.0,
+        v359_min_directional_rs=0.00 if use_v363 else 0.00,
+        v359_max_directional_rs=3.00 if use_v363 else 999.00,
+        v359_min_directional_open_rs=0.00 if use_v363 else -999.00,
+        v359_max_directional_open_rs=5.00 if use_v363 else 999.00,
+        v359_min_directional_vwap_extension_atr=0.50 if use_v363 else 0.50,
+        v359_max_directional_vwap_extension_atr=2.00 if use_v363 else 2.00,
+        v359_max_abs_vwap_extension_atr=1.50 if use_v363 else 1.50,
+        v364_quality_start_time="10:00",
+        v364_quality_end_time="12:00",
+        v364_min_rvol=1.00,
+        v364_min_daily_atr_pct=4.00,
+        v364_min_directional_rs=-1.00,
+        v364_max_directional_rs=3.00,
+        v364_min_directional_open_rs=-999.00,
+        v364_max_directional_open_rs=999.00,
+        v364_min_directional_vwap_extension_atr=0.50,
+        v364_max_directional_vwap_extension_atr=2.00,
+        v364_max_abs_vwap_extension_atr=2.00,
+        v364_min_signal_risk_pct=0.15,
+        v364_max_signal_risk_pct=1.50,
     )
 
+
+
+PRESET_TO_LIVE_VARIANT = {
+    "manual": "manual",
+    "best_qqq_news": "best_report_153601",
+    "live_raw_optimized_v358": "live_raw_optimized_v358",
+    "live_hunter_v359": "live_hunter_v359",
+    "live_longrun_robust_v362": "v363_grid_robust",
+    "live_grid_robust_v363": "v363_grid_robust",
+    "live_professional_momentum_v364": "live_professional_momentum_v364",
+    "live_positive_context_v377": "live_positive_context_v377",
+    "live_indicator_pattern_v379": "live_indicator_pattern_v379",
+    "live_active_pattern_v38": "v38_active_pattern",
+    "live_stable_pattern_v38": "v38_stable_pattern",
+    "live_active_plus_v382": "v382_active_plus",
+    "live_more_trades_v382": "v382_more_trades",
+    "live_adaptive_composite_v383": "v383_adaptive",
+    "live_failure_reversal_v384": "v384_failure_reversal",
+    "live_adaptive_plus_v385": "v385_adaptive_plus",
+}
+
+GATE_TO_LIVE_VARIANT = {
+    "off": "best_report_153601",
+    "v358": "live_raw_optimized_v358",
+    "v359": "live_hunter_v359",
+    "v364": "live_professional_momentum_v364",
+    "v377": "live_positive_context_v377",
+    "v379": "live_indicator_pattern_v379",
+    "v38_active": "v38_active_pattern",
+    "v38_stable": "v38_stable_pattern",
+    "v382_active_plus": "v382_active_plus",
+    "v382_more_trades": "v382_more_trades",
+    "v383_adaptive": "v383_adaptive",
+    "v384_failure_reversal": "v384_failure_reversal",
+    "v385_adaptive_plus": "v385_adaptive_plus",
+}
+
+
+def live_variant_from_dashboard(settings_preset: str | None, quality_gate: str | None) -> str:
+    preset = str(settings_preset or "manual").strip().lower()
+    gate = str(quality_gate or "off").strip().lower()
+    variant = PRESET_TO_LIVE_VARIANT.get(preset, preset)
+    if variant == "manual":
+        variant = GATE_TO_LIVE_VARIANT.get(gate, "best_report_153601")
+    return str(variant or "best_report_153601").strip().lower()
+
+
+def _apply_quality_gate_to_params(params: StrategyParams, cfg: dict[str, Any]) -> None:
+    gate_mode = str(cfg.get("live_quality_gate") or cfg.get("quality_gate") or "off").lower()
+    # Reset all mutually-exclusive live quality gates first. This makes the live worker follow the dashboard exactly.
+    params.enable_v358_live_quality_filter = False
+    params.enable_v359_live_hunter_filter = False
+    params.enable_v364_professional_momentum_filter = False
+    params.enable_v377_positive_context_filter = False
+    params.enable_v379_decision_pattern_filter = False
+    if gate_mode == "v358":
+        params.enable_v358_live_quality_filter = True
+        prefix = "v358"
+    elif gate_mode == "v364":
+        params.enable_v364_professional_momentum_filter = True
+        prefix = "v364"
+    elif gate_mode == "v377":
+        params.enable_v377_positive_context_filter = True
+        return
+    elif gate_mode in {"v379", "v38_active", "v38_stable", "v382_active_plus", "v383_adaptive", "v384_failure_reversal", "v385_adaptive_plus", "v382_more_trades"}:
+        params.enable_v379_decision_pattern_filter = True
+        mode_map = {
+            "v379": "balanced_vwap_prevhigh",
+            "v38_active": "v38_active",
+            "v38_stable": "v38_stable",
+            "v382_active_plus": "v382_active_plus",
+            "v382_more_trades": "v382_more_trades",
+            "v383_adaptive": "v383_adaptive",
+            "v384_failure_reversal": "v384_failure_reversal",
+            "v385_adaptive_plus": "v385_adaptive_plus",
+        }
+        params.v379_pattern_mode = mode_map.get(gate_mode, "balanced_vwap_prevhigh")
+        return
+    elif gate_mode in {"v359", "custom"}:
+        params.enable_v359_live_hunter_filter = True
+        prefix = "v359"
+    else:
+        return
+    # For the scalar quality-gate settings, use the dashboard values for live too.
+    setattr(params, f"{prefix}_quality_start_time", str(cfg.get("quality_start_time") or "10:00"))
+    setattr(params, f"{prefix}_quality_end_time", str(cfg.get("quality_end_time") or "11:00"))
+    setattr(params, f"{prefix}_min_rvol", _safe_float(cfg.get("quality_min_rvol"), 0.0))
+    setattr(params, f"{prefix}_min_daily_atr_pct", _safe_float(cfg.get("quality_min_daily_atr"), 0.0))
+    setattr(params, f"{prefix}_min_directional_rs", _safe_float(cfg.get("quality_min_dir_rs"), -999.0))
+    setattr(params, f"{prefix}_max_directional_rs", _safe_float(cfg.get("quality_max_dir_rs"), 999.0))
+    setattr(params, f"{prefix}_min_directional_open_rs", _safe_float(cfg.get("quality_min_dir_open_rs"), -999.0))
+    setattr(params, f"{prefix}_max_directional_open_rs", _safe_float(cfg.get("quality_max_dir_open_rs"), 999.0))
+    setattr(params, f"{prefix}_min_directional_vwap_extension_atr", _safe_float(cfg.get("quality_min_dir_vwap"), -999.0))
+    setattr(params, f"{prefix}_max_directional_vwap_extension_atr", _safe_float(cfg.get("quality_max_dir_vwap"), 999.0))
+    setattr(params, f"{prefix}_max_abs_vwap_extension_atr", _safe_float(cfg.get("quality_max_abs_vwap"), 999.0))
 
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
@@ -236,7 +410,7 @@ class LivePaperTradingEngine:
     def __init__(self, live: LiveSettings, risk: LiveRiskConfig):
         self.live = live
         self.risk = risk
-        self.params = make_best_report_153601_params(risk)
+        self.params = make_best_report_153601_params(risk, variant=getattr(live, "strategy_variant", None))
         self.settings = AlpacaSettings()
         self.data_client = AlpacaDataClient(self.settings)
         self.trading_client = AlpacaTradingClient(self.settings)
@@ -245,6 +419,7 @@ class LivePaperTradingEngine:
         db_state = self.store.get_state("engine_state", {})
         if isinstance(db_state, dict):
             self.state.update({k: v for k, v in db_state.items() if k not in self.state})
+        self._apply_runtime_config_override()
         self._bars_5m_cache: pd.DataFrame = pd.DataFrame()
         self._daily_cache: pd.DataFrame = pd.DataFrame()
 
@@ -269,6 +444,82 @@ class LivePaperTradingEngine:
         data["state_path"] = str(self.live.state_path)
         return data
 
+
+
+    def _apply_runtime_config_override(self) -> None:
+        """Apply dashboard-persisted live settings from the shared DB.
+
+        On Render, the Dash web service and the worker share DATABASE_URL.  This
+        lets the selected dashboard strategy/preset and visible settings control
+        the already-running paper/live worker without changing environment vars
+        or redeploying the worker.
+        """
+        try:
+            cfg = self.store.get_state("live_config_override", {})
+        except Exception:
+            cfg = {}
+        if not isinstance(cfg, dict) or not bool(cfg.get("enabled", False)):
+            self.live.live_config_source = "env"
+            self.live.strategy_variant = os.getenv("LIVE_STRATEGY_VARIANT", self.live.strategy_variant or "best_report_153601").strip().lower()
+            self.params = make_best_report_153601_params(self.risk, variant=self.live.strategy_variant)
+            setattr(self.params, "live_config_source", "env")
+            setattr(self.params, "live_strategy_variant", self.live.strategy_variant)
+            setattr(self.params, "live_strategy_preset", "env")
+            setattr(self.params, "live_quality_gate", "env")
+            return
+
+        self.live.live_config_source = "dashboard_db"
+        self.live.strategy_variant = str(cfg.get("strategy_variant") or live_variant_from_dashboard(cfg.get("settings_preset"), cfg.get("live_quality_gate"))).strip().lower()
+        self.live.feed = str(cfg.get("feed") or self.live.feed or "iex")
+        if isinstance(cfg.get("symbols"), list) and cfg.get("symbols"):
+            self.live.symbols = [str(s).upper() for s in cfg.get("symbols") if str(s).strip()]
+        self.live.max_daily_trades = max(1, int(_safe_float(cfg.get("max_daily_trades"), self.live.max_daily_trades)))
+        self.live.max_open_positions = max(1, int(_safe_float(cfg.get("max_open_positions"), self.live.max_open_positions)))
+        self.live.max_orders_per_symbol_per_day = max(1, int(_safe_float(cfg.get("max_orders_per_symbol_per_day"), self.live.max_orders_per_symbol_per_day)))
+        self.live.use_news_proxy = str(cfg.get("use_news", self.live.use_news_proxy)).lower() in {"1", "true", "yes", "on"}
+        self.live.selection_mode = str(cfg.get("selection_mode") or self.live.selection_mode or "seen_so_far_top_n")
+
+        self.risk.account_value_fallback = _safe_float(cfg.get("account_value"), self.risk.account_value_fallback)
+        self.risk.fixed_risk_dollars = _safe_float(cfg.get("risk_dollars"), self.risk.fixed_risk_dollars)
+        self.risk.position_sizing_mode = str(cfg.get("risk_mode") or self.risk.position_sizing_mode)
+        self.risk.base_risk_pct = _safe_float(cfg.get("base_risk_pct"), self.risk.base_risk_pct)
+        self.risk.min_risk_dollars = _safe_float(cfg.get("min_risk_dollars"), self.risk.min_risk_dollars)
+        self.risk.max_risk_dollars = _safe_float(cfg.get("max_risk_dollars"), self.risk.max_risk_dollars)
+        self.risk.dd1_risk_pct = _safe_float(cfg.get("dd1_risk_pct"), self.risk.dd1_risk_pct)
+        self.risk.dd2_risk_pct = _safe_float(cfg.get("dd2_risk_pct"), self.risk.dd2_risk_pct)
+        self.risk.pause_dd_pct = _safe_float(cfg.get("pause_dd_pct"), self.risk.pause_dd_pct)
+
+        self.params = make_best_report_153601_params(self.risk, variant=self.live.strategy_variant)
+        self.params.direction_mode = str(cfg.get("direction_mode") or self.params.direction_mode)
+        self.params.backtest_session_mode = str(cfg.get("backtest_session_mode") or self.params.backtest_session_mode)
+        self.params.min_candidate_score = _safe_float(cfg.get("min_score"), self.params.min_candidate_score)
+        self.params.max_trades_per_day = max(1, int(_safe_float(cfg.get("max_trades"), self.params.max_trades_per_day)))
+        self.params.max_open_positions = max(1, int(_safe_float(cfg.get("max_open_positions"), self.live.max_open_positions)))
+        self.params.slippage_bps = _safe_float(cfg.get("slippage_bps"), self.params.slippage_bps)
+        self.params.candle_pattern_mode = str(cfg.get("candle_mode") or self.params.candle_pattern_mode)
+        self.params.enable_mean_reversion = str(cfg.get("enable_mr", self.params.enable_mean_reversion)).lower() in {"1", "true", "yes", "on"}
+        self.params.enable_or_retest = str(cfg.get("enable_or", self.params.enable_or_retest)).lower() in {"1", "true", "yes", "on"}
+        self.params.v27_macro_filter_mode = str(cfg.get("macro_filter") or self.params.v27_macro_filter_mode)
+        self.params.v27_market_stress_mode = str(cfg.get("stress_filter") or self.params.v27_market_stress_mode)
+        self.params.v27_news_filter_mode = str(cfg.get("news_filter") or self.params.v27_news_filter_mode)
+        self.params.v27_symbol_kill_switch_mode = str(cfg.get("kill_switch") or self.params.v27_symbol_kill_switch_mode)
+        self.params.v27_qqq_stress_abs_change_pct = _safe_float(cfg.get("qqq_stress_threshold"), self.params.v27_qqq_stress_abs_change_pct)
+        _apply_quality_gate_to_params(self.params, cfg)
+
+        if bool(cfg.get("custom_symbols_active", False)):
+            self.params.v25_allow_generic_symbols = True
+            self.params.min_price = 0.01
+            self.params.min_avg_20d_dollar_volume = 0.0
+            self.params.min_current_5m_dollar_volume = 0.0
+            self.params.min_daily_atr_pct = 0.0
+            self.params.max_daily_atr_pct = 999.0
+            self.params.v25_min_rvol = 0.0
+
+        setattr(self.params, "live_config_source", "dashboard_db")
+        setattr(self.params, "live_strategy_variant", self.live.strategy_variant)
+        setattr(self.params, "live_strategy_preset", str(cfg.get("settings_preset") or "manual"))
+        setattr(self.params, "live_quality_gate", str(cfg.get("live_quality_gate") or "off"))
+
     def _heartbeat(self, status: str, message: str = "", extra: dict[str, Any] | None = None) -> None:
         payload = {
             "updated_at_utc": utc_now_iso(),
@@ -278,7 +529,10 @@ class LivePaperTradingEngine:
             "enabled": self.live.enabled,
             "symbols": len(self.live.symbols or []),
             "feed": self.live.feed,
-            "strategy_preset": "Best Report 153601",
+            "strategy_preset": getattr(self.params, "live_strategy_preset", getattr(self.live, "strategy_variant", "best_report_153601")),
+            "strategy_variant": getattr(self.params, "live_strategy_variant", getattr(self.live, "strategy_variant", "best_report_153601")),
+            "quality_gate": getattr(self.params, "live_quality_gate", "env"),
+            "config_source": getattr(self.live, "live_config_source", "env"),
         }
         if extra:
             payload.update(extra)
@@ -546,6 +800,60 @@ class LivePaperTradingEngine:
         alerts_all = alerts_all[pd.to_numeric(alerts_all["score"], errors="coerce").fillna(-9999.0) >= min_score].copy()
         alerts_all = _apply_v25_candlestick_filter(alerts_all, str(getattr(self.params, "candle_pattern_mode", "selective")))
         alerts_all, stats = _v27_apply_preselection_filters(alerts_all, self.params, use_news=bool(self.live.use_news_proxy))
+        if bool(getattr(self.live, "q_learning_filter_enabled", False)) and not alerts_all.empty:
+            try:
+                policy_path = str(getattr(self.live, "q_learning_policy_path", "") or getattr(self.params, "q_learning_policy_path", "") or "").strip()
+                if policy_path:
+                    q_model = load_q_model(policy_path)
+                    q_reviewed = apply_q_policy(
+                        alerts_all,
+                        q_model,
+                        min_edge=float(getattr(self.live, "q_learning_min_edge", 0.0) or 0.0),
+                        min_state_count=int(getattr(self.live, "q_learning_min_state_count", 8) or 8),
+                    )
+                    approved = q_reviewed["q_policy_approved"].fillna(False).astype(bool)
+                    self.store.set_state("last_q_policy_stats", {
+                        "enabled": True,
+                        "policy_path": policy_path,
+                        "reviewed": int(len(q_reviewed)),
+                        "approved": int(approved.sum()),
+                        "rejected": int(len(q_reviewed) - int(approved.sum())),
+                    })
+                    alerts_all = q_reviewed[approved].copy()
+                else:
+                    self.store.set_state("last_q_policy_stats", {"enabled": True, "error": "LIVE_Q_POLICY_PATH is blank"})
+                    return pd.DataFrame()
+            except Exception as exc:
+                self.store.insert_event("q_policy_filter_error", {"message": str(exc)}, status="error")
+                return pd.DataFrame()
+        if bool(getattr(self.live, "ml_ranker_filter_enabled", False)) and not alerts_all.empty:
+            try:
+                ml_path = str(getattr(self.live, "ml_ranker_model_path", "") or getattr(self.params, "ml_ranker_model_path", "") or "").strip()
+                if ml_path:
+                    ml_model = load_ranker_model(ml_path)
+                    ml_reviewed = score_ml_ranker_candidates(alerts_all, ml_model)
+                    min_pred = float(getattr(self.live, "ml_ranker_min_pred_r", getattr(self.params, "ml_ranker_min_pred_r", 0.05)) or 0.05)
+                    min_win = float(getattr(self.live, "ml_ranker_min_win_prob", getattr(self.params, "ml_ranker_min_win_prob", 0.0)) or 0.0)
+                    approved = pd.to_numeric(ml_reviewed.get("ml_pred_r", -9999.0), errors="coerce").fillna(-9999.0) >= min_pred
+                    if min_win > 0 and "ml_pred_win_prob" in ml_reviewed.columns:
+                        approved = approved & (pd.to_numeric(ml_reviewed["ml_pred_win_prob"], errors="coerce").fillna(0.0) >= min_win)
+                    self.store.set_state("last_ml_ranker_stats", {
+                        "enabled": True,
+                        "model_path": ml_path,
+                        "reviewed": int(len(ml_reviewed)),
+                        "approved": int(approved.sum()),
+                        "rejected": int(len(ml_reviewed) - int(approved.sum())),
+                        "min_pred_r": min_pred,
+                        "min_win_prob": min_win,
+                    })
+                    alerts_all = ml_reviewed[approved].copy()
+                else:
+                    self.store.set_state("last_ml_ranker_stats", {"enabled": True, "error": "LIVE_ML_RANKER_MODEL_PATH is blank"})
+                    return pd.DataFrame()
+            except Exception as exc:
+                self.store.insert_event("ml_ranker_filter_error", {"message": str(exc)}, status="error")
+                return pd.DataFrame()
+
         self.store.set_state("last_filter_stats", stats)
         if alerts_all.empty:
             return alerts_all
@@ -574,6 +882,34 @@ class LivePaperTradingEngine:
                         out[sym] = mid
         except Exception as exc:
             self.store.insert_event("quote_sync_warning", {"message": str(exc)}, status="warning")
+        return out
+
+
+
+    def _signal_context_payload(self, signal: pd.Series) -> dict[str, Any]:
+        keep_prefixes = ("v379_", "v383_", "v384_", "v385_", "positive_context_", "q_", "ml_")
+        keep_names = {
+            "symbol", "timestamp", "side", "trigger_type", "candidate_score", "score", "quality",
+            "rvol_time_of_day", "daily_atr14_percent", "gap_percent", "day_relative_strength",
+            "open_relative_strength", "vwap_extension_atr", "qqq_change_from_open",
+            "qqq_day_change_percent", "atr5m14", "close", "open", "high", "low", "volume",
+            "entry_candle_pattern", "candle_pattern_primary", "candle_pattern_score",
+            "bullish_continuation_candle", "bearish_continuation_candle",
+            "bullish_rejection_candle", "bearish_rejection_candle",
+            "bullish_engulfing_candle", "bearish_engulfing_candle",
+        }
+        out: dict[str, Any] = {}
+        for key, value in signal.to_dict().items():
+            if key in keep_names or str(key).startswith(keep_prefixes):
+                if isinstance(value, (pd.Timestamp, datetime)):
+                    out[str(key)] = value.isoformat()
+                else:
+                    try:
+                        if hasattr(value, "item"):
+                            value = value.item()
+                    except Exception:
+                        pass
+                    out[str(key)] = value
         return out
 
     def build_order_plan(self, signal: pd.Series, equity: float, high_watermark: float, reference_price: float | None = None) -> dict[str, Any] | None:
@@ -628,6 +964,13 @@ class LivePaperTradingEngine:
             "max_hold_until_utc": max_hold_until.isoformat(),
             "client_order_id": client_order_id,
             "submitted_at_utc": utc_now_iso(),
+            "strategy_variant": getattr(self.params, "live_strategy_variant", getattr(self.live, "strategy_variant", "best_report_153601")),
+            "strategy_preset": getattr(self.params, "live_strategy_preset", "env"),
+            "strategy_profile": str(getattr(self.params, "strategy_profile", "symbol_playbook_v25")),
+            "quality_gate": getattr(self.params, "live_quality_gate", "env"),
+            "pattern_mode": str(getattr(self.params, "v379_pattern_mode", "")),
+            "selection_mode": str(getattr(self.live, "selection_mode", "seen_so_far_top_n")),
+            "signal_context": self._signal_context_payload(signal),
         }
 
     def _daily_loss_reached(self, daily_pl: float) -> bool:
@@ -680,6 +1023,7 @@ class LivePaperTradingEngine:
         return rows
 
     def run_once(self) -> list[dict[str, Any]]:
+        self._apply_runtime_config_override()
         rows: list[dict[str, Any]] = []
         timestamp = utc_now_iso()
         self._heartbeat("running", "Worker scan started.")
@@ -706,7 +1050,7 @@ class LivePaperTradingEngine:
             return rows
         signals = self.fetch_recent_signals()
         if signals.empty:
-            row = {"timestamp": timestamp, "event": "no_signal", "message": "No Best Report 153601 signal on latest eligible closed 5-minute bar."}
+            row = {"timestamp": timestamp, "event": "no_signal", "message": f"No signal on latest eligible closed 5-minute bar for strategy {getattr(self.params, 'live_strategy_variant', getattr(self.live, 'strategy_variant', 'best_report_153601'))}."}
             rows.append(row)
             self.store.insert_event("no_signal", row, status="idle")
             _append_log(self.live.log_path, rows)

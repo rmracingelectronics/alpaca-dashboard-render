@@ -92,7 +92,7 @@ class AlpacaDataClient:
         if not rows:
             return pd.DataFrame(columns=["symbol", "timestamp", "open", "high", "low", "close", "volume", "trade_count", "vwap"])
         df = pd.DataFrame(rows)
-        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce", format="ISO8601")
         return AlpacaDataClient._normalize_bars_df(df)
 
     @staticmethod
@@ -101,7 +101,7 @@ class AlpacaDataClient:
             return pd.DataFrame(columns=["symbol", "timestamp", "open", "high", "low", "close", "volume", "trade_count", "vwap"])
         out = df.copy()
         out["symbol"] = out["symbol"].astype(str).str.upper()
-        out["timestamp"] = pd.to_datetime(out["timestamp"], utc=True, errors="coerce")
+        out["timestamp"] = pd.to_datetime(out["timestamp"], utc=True, errors="coerce", format="ISO8601")
         out = out.dropna(subset=["timestamp"])
         for col in ["open", "high", "low", "close", "vwap"]:
             if col in out.columns:
@@ -181,6 +181,25 @@ class AlpacaDataClient:
             cursor = chunk_end
         return chunks
 
+    @classmethod
+    def _month_chunks(cls, start: str | datetime, end: str | datetime) -> list[tuple[str, str]]:
+        """Monthly chunks for session-aware extended-hours gap checks.
+
+        The original yearly chunks are preserved for regular backtests.  Extended
+        research needs finer granularity so one existing premarket bar in a year
+        does not incorrectly mark the entire year as locally complete.
+        """
+        start_ts = cls._to_utc_timestamp(start).normalize()
+        end_ts = cls._to_utc_timestamp(end).normalize()
+        chunks: list[tuple[str, str]] = []
+        cursor = start_ts
+        while cursor < end_ts:
+            next_month = (cursor + pd.offsets.MonthBegin(1)).normalize()
+            chunk_end = min(next_month, end_ts)
+            chunks.append((cursor.strftime("%Y-%m-%d"), chunk_end.strftime("%Y-%m-%d")))
+            cursor = chunk_end
+        return chunks
+
     def _fetch_bars_api(
         self,
         symbols: list[str],
@@ -220,6 +239,42 @@ class AlpacaDataClient:
             return pd.DataFrame()
         return self._normalize_bars_df(pd.concat(frames, ignore_index=True))
 
+    def _fetch_bars_api_tolerant(
+        self,
+        symbols: list[str],
+        timeframe: str,
+        start: str | datetime,
+        end: str | datetime,
+        feed: str,
+        adjustment: str,
+    ) -> pd.DataFrame:
+        """Fetch bars without letting one unsupported/invalid symbol kill a custom run.
+
+        Alpaca can reject a multi-symbol request if one symbol is not available on
+        the selected feed.  That is common with custom penny/micro-cap lists.  The
+        original preset universe did not hit this much, but custom watchlists need
+        graceful degradation: fetch what Alpaca has, skip what it does not.
+        """
+        symbols = [s.upper() for s in symbols if s]
+        if not symbols:
+            return pd.DataFrame()
+        try:
+            return self._fetch_bars_api(symbols, timeframe, start, end, feed, adjustment)
+        except AlpacaAPIError:
+            if len(symbols) <= 1:
+                return pd.DataFrame()
+            frames: list[pd.DataFrame] = []
+            for symbol in symbols:
+                try:
+                    frame = self._fetch_bars_api([symbol], timeframe, start, end, feed, adjustment)
+                    if frame is not None and not frame.empty:
+                        frames.append(frame)
+                except AlpacaAPIError:
+                    continue
+            if not frames:
+                return pd.DataFrame()
+            return self._normalize_bars_df(pd.concat(frames, ignore_index=True))
+
     def _symbol_has_chunk(self, symbol: str, timeframe: str, chunk_start: str, chunk_end: str, feed: str, adjustment: str) -> bool:
         df = self._read_local_symbol(symbol, timeframe, feed, adjustment)
         if df.empty:
@@ -228,6 +283,45 @@ class AlpacaDataClient:
         end_ts = self._to_utc_timestamp(chunk_end)
         mask = (df["timestamp"] >= start_ts) & (df["timestamp"] < end_ts)
         return bool(mask.any())
+
+    def _symbol_has_session_chunk(
+        self,
+        symbol: str,
+        timeframe: str,
+        chunk_start: str,
+        chunk_end: str,
+        feed: str,
+        adjustment: str,
+        session_mode: str = "regular_only",
+    ) -> bool:
+        """Return True when the local store already contains bars for the requested session.
+
+        This preserves the original yearly-chunk cache behavior while adding a
+        stricter check for extended-hours research.  For extended-hours mode, a
+        symbol/year is considered present only if it has at least one bar outside
+        the regular 09:30-16:00 ET session.  That prevents an existing
+        regular-only cache file from blocking an extended-hours download.
+        """
+        df = self._read_local_symbol(symbol, timeframe, feed, adjustment)
+        if df.empty:
+            return False
+        start_ts = self._to_utc_timestamp(chunk_start)
+        end_ts = self._to_utc_timestamp(chunk_end)
+        work = df[(df["timestamp"] >= start_ts) & (df["timestamp"] < end_ts)].copy()
+        if work.empty:
+            return False
+        mode = str(session_mode or "regular_only").lower()
+        if str(timeframe).lower() not in {"5min", "1min", "1m", "5m"}:
+            return True
+        ts_ny = pd.to_datetime(work["timestamp"], utc=True, errors="coerce").dt.tz_convert("America/New_York")
+        time_str = ts_ny.dt.strftime("%H:%M")
+        regular = (time_str >= "09:30") & (time_str <= "16:00")
+        if mode in {"extended_hours", "extended", "prepost"}:
+            ext = ((time_str >= "04:00") & (time_str < "09:30")) | ((time_str > "16:00") & (time_str <= "20:00"))
+            return bool(ext.any())
+        if mode in {"twenty_four_five", "24_5", "all", "all_available"}:
+            return bool((~regular).any()) or bool(regular.any())
+        return bool(regular.any())
 
     def prefetch_stock_bars(
         self,
@@ -238,6 +332,7 @@ class AlpacaDataClient:
         feed: str = "iex",
         adjustment: str = "split",
         use_cache: bool = True,
+        session_mode: str = "regular_only",
     ) -> dict[str, Any]:
         """Download missing local bars for symbols/date range and return a status dict."""
         symbols = list(dict.fromkeys([s.upper() for s in symbols if s]))
@@ -246,12 +341,17 @@ class AlpacaDataClient:
         downloaded_rows = 0
         downloaded_chunks = 0
         skipped_chunks = 0
-        for chunk_start, chunk_end in self._year_chunks(start, end):
-            missing = [s for s in symbols if not self._symbol_has_chunk(s, timeframe, chunk_start, chunk_end, feed, adjustment)]
+        mode_l = str(session_mode or "regular_only").lower()
+        chunk_source = self._month_chunks(start, end) if (str(timeframe).lower() in {"5min", "1min", "1m", "5m"} and mode_l in {"extended_hours", "extended", "prepost", "twenty_four_five", "24_5", "all", "all_available"}) else self._year_chunks(start, end)
+        for chunk_start, chunk_end in chunk_source:
+            if mode_l in {"extended_hours", "extended", "prepost", "twenty_four_five", "24_5", "all", "all_available"}:
+                missing = [s for s in symbols if not self._symbol_has_session_chunk(s, timeframe, chunk_start, chunk_end, feed, adjustment, session_mode=session_mode)]
+            else:
+                missing = [s for s in symbols if not self._symbol_has_chunk(s, timeframe, chunk_start, chunk_end, feed, adjustment)]
             if not missing:
                 skipped_chunks += len(symbols)
                 continue
-            fetched = self._fetch_bars_api(missing, timeframe, chunk_start, chunk_end, feed, adjustment)
+            fetched = self._fetch_bars_api_tolerant(missing, timeframe, chunk_start, chunk_end, feed, adjustment)
             downloaded_rows += int(len(fetched))
             downloaded_chunks += len(missing)
             for symbol in missing:
@@ -282,13 +382,14 @@ class AlpacaDataClient:
         feed: str = "iex",
         adjustment: str = "split",
         use_cache: bool = True,
+        session_mode: str = "regular_only",
     ) -> pd.DataFrame:
         symbols = list(dict.fromkeys([s.upper() for s in symbols if s]))
         if not symbols:
             return pd.DataFrame()
 
         if use_cache:
-            self.prefetch_stock_bars(symbols, timeframe, start, end, feed=feed, adjustment=adjustment, use_cache=True)
+            self.prefetch_stock_bars(symbols, timeframe, start, end, feed=feed, adjustment=adjustment, use_cache=True, session_mode=session_mode)
             start_ts = self._to_utc_timestamp(start)
             end_ts = self._to_utc_timestamp(end)
             frames: list[pd.DataFrame] = []
@@ -305,7 +406,7 @@ class AlpacaDataClient:
             return self._normalize_bars_df(pd.concat(frames, ignore_index=True))
 
         # Non-cache path: direct API request for exactly the requested symbols/range.
-        return self._fetch_bars_api(symbols, timeframe, start, end, feed, adjustment)
+        return self._fetch_bars_api_tolerant(symbols, timeframe, start, end, feed, adjustment)
 
     def get_news_counts_by_day(
         self,
@@ -335,7 +436,7 @@ class AlpacaDataClient:
                 params["page_token"] = page_token
             payload = self._get("/v1beta1/news", params)
             for article in payload.get("news", []) or []:
-                ts = pd.to_datetime(article.get("created_at") or article.get("updated_at"), utc=True, errors="coerce")
+                ts = pd.to_datetime(article.get("created_at") or article.get("updated_at"), utc=True, errors="coerce", format="ISO8601")
                 if pd.isna(ts):
                     continue
                 symbols_for_article = [s.upper() for s in article.get("symbols", []) or []]

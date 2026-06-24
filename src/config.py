@@ -60,6 +60,51 @@ class StrategyParams:
 
     strategy_profile: str = "symbol_playbook_v25"
     direction_mode: str = "long_short"  # long_only, short_only, or long_short
+    # Backtest data/session mode. regular_only preserves the original V25 replay
+    # behavior for the packaged Best Report 153601 preset. extended_hours and
+    # twenty_four_five use raw local Alpaca bars.
+    backtest_session_mode: str = "regular_only"
+    # When the dashboard custom-symbols box is populated, the V25 replay file
+    # cannot be used because it only contains the researched V25 preset symbols.
+    # This flag forces the raw-bar engine and permits generic V25 event scans on
+    # user-supplied symbols. The preset baseline keeps this False.
+    v25_allow_generic_symbols: bool = False
+
+    # Backtest decision mode.
+    # - end_of_day_top_n: original research replay behavior. It ranks the full day
+    #   after all candidates are known. This preserves the historical baseline.
+    # - live_simulated: walk-forward historical simulation. At each candidate
+    #   timestamp, it only knows candidates seen up to that moment, like live mode.
+    backtest_decision_mode: str = "end_of_day_top_n"
+
+    # Optional research-only OpenAI candidate review. The algorithm still creates
+    # trade candidates from market data first. When enabled, a no-lookahead feature
+    # payload for each candidate is sent to the OpenAI Responses API and only
+    # approved candidates continue into the normal portfolio/risk simulator.
+    openai_trade_filter_enabled: bool = False
+    openai_trade_filter_model: str = "gpt-5-mini"
+    # V35.1: default is full-run batch review, not one trade/day loop.
+    # The max_candidates value is now candidates per OpenAI prompt/chunk.
+    openai_trade_filter_max_candidates_per_day: int = 5000
+    openai_trade_filter_batch_mode: str = "full_run"  # full_run or per_day
+    openai_trade_filter_min_confidence: float = 0.0
+
+    # V37 optional tabular Q-learning trade/skip filter. This implements the
+    # Ritter-style reinforcement-learning idea as an auditable, risk-averse
+    # candidate gate. It is off by default; train models with the tools in
+    # tools/build_q_learning_dataset.py and tools/train_q_learning_policy.py.
+    q_learning_filter_enabled: bool = False
+    q_learning_policy_path: str = ""
+    q_learning_min_edge: float = 0.0
+    q_learning_min_state_count: int = 8
+
+    # V37.1 optional PyBroker/MachineLearningStocks-inspired walk-forward ML ranker.
+    # It is a candidate filter/ranker, not a signal generator. Train with
+    # tools/build_ml_ranker_dataset.py and tools/train_walkforward_ml_ranker.py.
+    ml_ranker_filter_enabled: bool = False
+    ml_ranker_model_path: str = ""
+    ml_ranker_min_pred_r: float = 0.05
+    ml_ranker_min_win_prob: float = 0.0
 
     # V25 Symbol/Event Playbook. Derived from direct raw-bar research on the local
     # 2022-2026 dataset. It is intentionally different from the broad ML/event attempts:
@@ -72,6 +117,80 @@ class StrategyParams:
     v25_profile_bins: int = 48
     v25_profile_tolerance_atr: float = 0.18
     v25_min_rvol: float = 0.75
+
+
+    # V35.8 live/raw-bar quality gate. This is a live-safe filter discovered from
+    # raw-bar replay diagnostics: it only uses fields available on the signal bar.
+    # It is OFF by default and enabled by the new Live Raw-Bar Optimized preset.
+    enable_v358_live_quality_filter: bool = False
+    v358_quality_start_time: str = "10:00"
+    v358_quality_end_time: str = "11:00"
+    v358_min_rvol: float = 1.50
+    v358_min_directional_rs: float = 0.00
+    v358_max_directional_rs: float = 2.00
+    v358_min_directional_open_rs: float = 0.00
+    v358_max_directional_open_rs: float = 2.00
+    v358_min_directional_vwap_extension_atr: float = -999.0
+    v358_max_directional_vwap_extension_atr: float = 999.0
+    v358_max_abs_vwap_extension_atr: float = 999.0
+    v358_min_daily_atr_pct: float = 0.0
+
+    # V35.9 Professional Live Hunter. This is a broader live-safe raw-bar
+    # replay filter than V35.8. It uses only signal-bar fields available at
+    # the decision timestamp. It was designed to increase opportunity count
+    # while preserving positive out-of-sample validation in multiple periods.
+    enable_v359_live_hunter_filter: bool = False
+    v359_quality_start_time: str = "10:00"
+    v359_quality_end_time: str = "11:00"
+    v359_min_rvol: float = 1.00
+    v359_min_directional_rs: float = 0.00
+    v359_max_directional_rs: float = 999.00
+    v359_min_directional_open_rs: float = -999.00
+    v359_max_directional_open_rs: float = 999.00
+    v359_min_directional_vwap_extension_atr: float = 0.50
+    v359_max_directional_vwap_extension_atr: float = 2.00
+    v359_max_abs_vwap_extension_atr: float = 1.50
+    v359_min_daily_atr_pct: float = 0.0
+
+
+    # V36.4 Professional Momentum Hybrid. Inspired by common modern intraday
+    # techniques (opening-range/momentum, VWAP expansion, volatility-normalized
+    # ranking), but implemented as a deterministic live-safe gate over the raw-bar
+    # V25 signal stream. It uses only signal-bar fields and is off by default.
+    enable_v364_professional_momentum_filter: bool = False
+    v364_quality_start_time: str = "10:00"
+    v364_quality_end_time: str = "12:00"
+    v364_min_rvol: float = 1.00
+    v364_min_directional_rs: float = -1.00
+    v364_max_directional_rs: float = 3.00
+    v364_min_directional_open_rs: float = -999.00
+    v364_max_directional_open_rs: float = 999.00
+    v364_min_directional_vwap_extension_atr: float = 0.50
+    v364_max_directional_vwap_extension_atr: float = 2.00
+    v364_max_abs_vwap_extension_atr: float = 2.00
+    v364_min_daily_atr_pct: float = 4.00
+    v364_min_signal_risk_pct: float = 0.15
+    v364_max_signal_risk_pct: float = 1.50
+    v364_score_weight_rvol: float = 3.00
+    v364_score_weight_directional_rs: float = 0.00
+    v364_score_weight_directional_vwap: float = 1.00
+    v364_score_penalty_abs_vwap: float = 1.00
+
+
+    # V37.8 mined profitable-indicator pattern matcher. This gate was derived from
+    # selected_trade_market_conditions in the latest profitable Top-N report, but
+    # live/replay decisions only use signal-time indicator fields. Off by default.
+    enable_v377_positive_context_filter: bool = False
+    v377_min_source_total_r: float = 0.0
+    v377_min_profile_total_r: float = 0.0
+    v377_min_profile_profit_factor: float = 1.0
+
+    # V37.9 decision-time indicator pattern scorer. This is a causal/live-safe
+    # filter derived from the repeated indicator conditions observed in profitable
+    # trades, then tested against the raw-live candidate dataset. It never uses
+    # future R/P&L/MFE/MAE to approve a trade.
+    enable_v379_decision_pattern_filter: bool = False
+    v379_pattern_mode: str = "balanced_vwap_prevhigh"  # baseline_user, balanced_vwap_prevhigh, short_vwap_morning, orb_vwap
 
     # V27 optional risk filters for Symbol/Event Playbook replay.
     # These are off by default so V26 baseline can be reproduced.

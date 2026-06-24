@@ -141,3 +141,111 @@ hr { border: none; border-top: 1px solid var(--border); margin: 20px 0; }
   line-height: 1.45;
   font-weight: 650;
 }
+
+/* V36 dashboard cleanup: compact, grouped controls */
+.layout { grid-template-columns: minmax(380px, 430px) 1fr; }
+.sidebar {
+  max-height: calc(100vh - 40px);
+  overflow-y: auto;
+  scrollbar-width: thin;
+}
+.sidebar::-webkit-scrollbar { width: 8px; }
+.sidebar::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 999px; }
+.section-title { margin-top: 18px; margin-bottom: 8px; }
+.control-section {
+  margin: 14px 0;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  background: rgba(248, 250, 252, 0.78);
+}
+.section-mini-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+.section-mini-head h4 {
+  margin: 0;
+  font-size: 14px;
+  letter-spacing: -0.01em;
+}
+.section-mini-head span {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.three-col { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+.sidebar .Select-control, .sidebar input[type="text"], .sidebar input[type="number"], .sidebar .DateInput_input {
+  min-height: 38px;
+  border-radius: 10px;
+}
+.sidebar label { margin: 10px 0 5px; }
+.sidebar .hint {
+  margin: 8px 0 12px;
+  padding: 10px 11px;
+  border-radius: 12px;
+  background: #f8fafc;
+  border: 1px dashed #cbd5e1;
+  color: #475569;
+  font-size: 12px;
+  line-height: 1.4;
+}
+.sidebar .primary-btn {
+  position: sticky;
+  bottom: 0;
+  z-index: 4;
+}
+@media (max-width: 1350px) { .three-col { grid-template-columns: 1fr; } }
+
+/* V37.5 dashboard cleanup and dropdown readability */
+.hero { padding: 24px 28px; }
+.hero h1 { font-size: 32px; }
+.hero p { max-width: 680px; line-height: 1.45; }
+.sidebar h3 { margin-bottom: 12px; }
+.sidebar h4 { margin: 14px 0 6px; }
+.sidebar label { font-size: 12px; margin: 8px 0 4px; }
+.sidebar .hint { display: none; }
+.info-box { display: none; }
+.compact-notes { font-size: 12px; line-height: 1.35; }
+.control-section { margin: 10px 0; padding: 12px; }
+.two-col, .three-col { gap: 8px; }
+
+/* Dash legacy react-select: avoid text overlapping in dropdowns */
+.sidebar .Select-control,
+.sidebar .Select-placeholder,
+.sidebar .Select-value,
+.sidebar .Select-input,
+.sidebar .Select-input input {
+  min-height: 38px !important;
+  height: 38px !important;
+  line-height: 38px !important;
+}
+.sidebar .Select-value-label {
+  line-height: 38px !important;
+  white-space: nowrap !important;
+  overflow: hidden !important;
+  text-overflow: ellipsis !important;
+  display: block !important;
+  padding-right: 18px !important;
+}
+.sidebar .Select-menu-outer {
+  z-index: 9999 !important;
+  font-size: 12px !important;
+  line-height: 1.25 !important;
+}
+.sidebar .VirtualizedSelectOption,
+.sidebar .Select-option {
+  white-space: nowrap !important;
+  overflow: hidden !important;
+  text-overflow: ellipsis !important;
+  line-height: 22px !important;
+  padding: 7px 10px !important;
+}
+.sidebar .Select--multi .Select-value {
+  line-height: 24px !important;
+}
+.dash-dropdown { width: 100%; }
