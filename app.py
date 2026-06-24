@@ -7,6 +7,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from dash import Dash, Input, Output, State, dcc, html, dash_table, no_update, ctx
+from flask import send_file
 
 from src.backtest import run_backtest
 from src.config import AlpacaSettings, StrategyParams
@@ -15,8 +16,15 @@ from src.live_store import LiveStore
 from src.live_engine import live_variant_from_dashboard
 from src.symbols import WATCHLISTS, parse_symbols
 
-app = Dash(__name__, suppress_callback_exceptions=True, title="Alpaca Momentum Dashboard V38.6")
+app = Dash(__name__, suppress_callback_exceptions=True, title="Alpaca Momentum Dashboard V38.7")
 server = app.server
+
+
+@server.route("/download-live-report.zip")
+def download_live_report_direct():
+    """Direct download endpoint for Render/browser cases where dcc.Download does not trigger."""
+    zip_path = generate_live_report_zip(days=3650)
+    return send_file(str(zip_path), as_attachment=True, download_name=zip_path.name, mimetype="application/zip")
 
 DEFAULT_END = date.today()
 DEFAULT_START = DEFAULT_END - timedelta(days=90)
@@ -356,10 +364,13 @@ app.layout = html.Div(
                             html.Div(id="live-status", className="run-status"),
                             html.Div(className="two-col", children=[
                                 html.Button("Apply current settings to live worker", id="apply-live-settings-btn", className="primary-btn", n_clicks=0),
-                                html.Button("Generate live report ZIP", id="generate-live-report-btn", className="secondary-btn", n_clicks=0),
+                                html.Div(children=[
+                                    html.Button("Generate live report ZIP", id="generate-live-report-btn", className="secondary-btn", n_clicks=0),
+                                    html.A("Direct download", href="/download-live-report.zip", target="_blank", className="secondary-btn", style={"marginLeft": "8px", "display": "inline-block", "textDecoration": "none"}),
+                                ]),
                             ]),
                             dcc.Download(id="live-report-download"),
-                            html.Div(id="live-action-status", className="run-status"),
+                            html.Div("Use Generate live report ZIP first. If your browser does not start a download, click Direct download.", id="live-action-status", className="run-status"),
                             html.Div(id="live-metrics-row", className="metrics-grid"),
                         ]),
                         html.Div(className="grid-2", children=[
@@ -391,6 +402,264 @@ app.layout = html.Div(
 )
 
 
+
+
+# -----------------------------------------------------------------------------
+# V38.7 clean customer-facing layout
+# -----------------------------------------------------------------------------
+# The original V38.6 layout kept all research, backtest and live controls on one
+# long page.  This override keeps every callback id intact, but presents the app
+# as a cleaner two-tab product: Backtest Lab and Live Monitor.
+
+STRATEGY_PRESET_OPTIONS = [
+    {"label": "Manual / custom", "value": "manual"},
+    {"label": "Best Report 153601 baseline", "value": "best_qqq_news"},
+    {"label": "V35.8 Raw quality gate", "value": "live_raw_optimized_v358"},
+    {"label": "V35.9 Live Hunter", "value": "live_hunter_v359"},
+    {"label": "V36.2 Long-run robust", "value": "live_longrun_robust_v362"},
+    {"label": "V36.3 Grid-tested robust", "value": "live_grid_robust_v363"},
+    {"label": "V36.4 Pro momentum hybrid", "value": "live_professional_momentum_v364"},
+    {"label": "V37.8 Mined pattern matcher", "value": "live_positive_context_v377"},
+    {"label": "V37.9 Indicator pattern scorer", "value": "live_indicator_pattern_v379"},
+    {"label": "V38 Active pattern scorer", "value": "live_active_pattern_v38"},
+    {"label": "V38 Stable pattern scorer", "value": "live_stable_pattern_v38"},
+    {"label": "V38.2 Active Plus - more trades", "value": "live_active_plus_v382"},
+    {"label": "V38.2 More Trades Research", "value": "live_more_trades_v382"},
+    {"label": "V38.3 Adaptive Composite", "value": "live_adaptive_composite_v383"},
+    {"label": "V38.4 Failure-aware router", "value": "live_failure_reversal_v384"},
+    {"label": "V38.5 Adaptive Plus", "value": "live_adaptive_plus_v385"},
+]
+
+QUALITY_GATE_OPTIONS = [
+    {"label": "Off", "value": "off"},
+    {"label": "V35.8 strict morning gate", "value": "v358"},
+    {"label": "V35.9 live hunter gate", "value": "v359"},
+    {"label": "V36.4 professional momentum hybrid", "value": "v364"},
+    {"label": "V37.8 mined profitable-indicator pattern", "value": "v377"},
+    {"label": "V37.9 decision-time indicator pattern scorer", "value": "v379"},
+    {"label": "V38 active pattern scorer", "value": "v38_active"},
+    {"label": "V38 stable pattern scorer", "value": "v38_stable"},
+    {"label": "V38.2 active plus", "value": "v382_active_plus"},
+    {"label": "V38.2 more trades research", "value": "v382_more_trades"},
+    {"label": "V38.3 adaptive composite", "value": "v383_adaptive"},
+    {"label": "V38.4 failure-aware reversal router", "value": "v384_failure_reversal"},
+    {"label": "V38.5 adaptive plus", "value": "v385_adaptive_plus"},
+    {"label": "Custom gate", "value": "custom"},
+]
+
+
+def field(label: str, component, className: str = "field"):
+    return html.Div(className=className, children=[html.Label(label), component])
+
+
+def pro_card(title: str, subtitle: str = "", children=None, className: str = "card pro-card"):
+    return html.Div(
+        className=className,
+        children=[
+            html.Div(className="section-head compact", children=[html.H3(title), html.Span(subtitle) if subtitle else None]),
+            html.Div(className="card-body", children=children or []),
+        ],
+    )
+
+
+def details_block(title: str, children, open_: bool = False):
+    return html.Details(className="details-card", open=open_, children=[html.Summary(title), html.Div(className="details-body", children=children)])
+
+
+def strategy_controls():
+    return pro_card(
+        "Strategy & Universe",
+        "Shared by backtest and live worker",
+        [
+            html.Div(style={"display": "none"}, children=[dcc.Dropdown(id="strategy-profile", options=[{"label": "Symbol/Event Playbook", "value": "symbol_playbook_v25"}], value="symbol_playbook_v25")]),
+            html.Div(className="form-grid three", children=[
+                field("Strategy preset", dcc.Dropdown(id="settings-preset", options=STRATEGY_PRESET_OPTIONS, value="best_qqq_news", clearable=False)),
+                field("Watchlist", dcc.Dropdown(id="preset", options=[{"label": k.replace("_", " ").title(), "value": k} for k in WATCHLISTS.keys()], value="v25_playbook", clearable=False)),
+                field("Feed", dcc.Dropdown(id="feed", options=[{"label": "IEX - free plan", "value": "iex"}, {"label": "SIP - paid/unlimited", "value": "sip"}], value=os.getenv("ALPACA_FEED", "iex"), clearable=False)),
+            ]),
+            field("Custom symbols - optional, overrides watchlist", dcc.Textarea(id="custom-symbols", placeholder="Example: AAPL, TSLA, MU, AMD", value="", className="textarea compact-textarea")),
+            html.Div(className="form-grid three", children=[
+                field("Max trades/day", dcc.Dropdown(id="max-trades", options=[{"label": f"Top {x}", "value": x} for x in [1,2,3,5,7,10,15]], value=2, clearable=False)),
+                field("Direction", dcc.Dropdown(id="direction-mode", options=[{"label": "Long + short", "value": "long_short"}, {"label": "Long only", "value": "long_only"}, {"label": "Short only", "value": "short_only"}], value="long_short", clearable=False)),
+                field("Min score", dcc.Input(id="min-score", value=2, type="number", min=0, max=60, step=1)),
+            ]),
+        ],
+    )
+
+
+def risk_controls():
+    return pro_card(
+        "Risk & Position Sizing",
+        "Kept separate from strategy presets",
+        [
+            html.Div(id="risk-mode-help", className="subtle-note", children="Risk sizing is independent from the strategy preset."),
+            html.Div(className="form-grid three", children=[
+                field("Account value", dcc.Input(id="account-value", value=10000, type="number", min=500, step=100)),
+                field("Fixed risk $/trade", dcc.RadioItems(id="risk-dollars-v12", options=[{"label": "$10", "value": 10}, {"label": "$25", "value": 25}, {"label": "$50", "value": 50}, {"label": "$100", "value": 100}, {"label": "$200", "value": 200}, {"label": "$500", "value": 500}], value=100, inline=True)),
+                field("Risk mode", dcc.Dropdown(id="risk-mode", options=[{"label": "Fixed dollar risk", "value": "fixed_dollar_risk"}, {"label": "Percent of equity", "value": "percent_equity"}, {"label": "Controlled compounding", "value": "controlled_compounding"}], value="percent_equity", clearable=False)),
+            ]),
+            html.Div(id="risk-percent-panel", className="form-grid three", children=[
+                field("Base risk %", dcc.Input(id="base-risk-pct", value=1.0, type="number", min=0.1, max=5.0, step=0.05)),
+            ]),
+            html.Div(id="controlled-compounding-panel", children=[
+                html.Div(className="form-grid five", children=[
+                    field("Min risk $", dcc.Input(id="min-risk-dollars", value=10, type="number", min=0, max=1000, step=5)),
+                    field("Max risk $", dcc.Input(id="max-risk-dollars", value=300, type="number", min=0, max=5000, step=25)),
+                    field("DD 5% risk %", dcc.Input(id="dd1-risk-pct", value=0.75, type="number", min=0.0, max=5.0, step=0.05)),
+                    field("DD 10% risk %", dcc.Input(id="dd2-risk-pct", value=0.50, type="number", min=0.0, max=5.0, step=0.05)),
+                    field("Pause DD %", dcc.Input(id="pause-dd-pct", value=15.0, type="number", min=1.0, max=50.0, step=0.5)),
+                ])
+            ]),
+        ],
+    )
+
+
+def live_quality_controls(open_: bool = False):
+    return details_block(
+        "Advanced live-safe quality gate",
+        [
+            html.Div(className="form-grid three", children=[
+                field("Quality gate", dcc.Dropdown(id="live-quality-gate", options=QUALITY_GATE_OPTIONS, value="off", clearable=False)),
+                field("Start ET", dcc.Input(id="quality-start-time", value="10:00", type="text")),
+                field("End ET", dcc.Input(id="quality-end-time", value="11:00", type="text")),
+            ]),
+            html.Div(className="form-grid five", children=[
+                field("Min RVOL", dcc.Input(id="quality-min-rvol", value=1.0, type="number", min=0.0, max=20.0, step=0.05)),
+                field("Min daily ATR %", dcc.Input(id="quality-min-daily-atr", value=0.0, type="number", min=0.0, max=20.0, step=0.05)),
+                field("Min dir RS", dcc.Input(id="quality-min-dir-rs", value=0.0, type="number", min=-20.0, max=20.0, step=0.05)),
+                field("Max dir RS", dcc.Input(id="quality-max-dir-rs", value=999.0, type="number", min=-20.0, max=999.0, step=0.05)),
+                field("Max abs VWAP", dcc.Input(id="quality-max-abs-vwap", value=1.5, type="number", min=0.0, max=20.0, step=0.05)),
+            ]),
+            html.Div(className="form-grid four", children=[
+                field("Min open RS", dcc.Input(id="quality-min-dir-open-rs", value=-999.0, type="number", min=-999.0, max=999.0, step=0.05)),
+                field("Max open RS", dcc.Input(id="quality-max-dir-open-rs", value=999.0, type="number", min=-999.0, max=999.0, step=0.05)),
+                field("Min dir VWAP", dcc.Input(id="quality-min-dir-vwap", value=0.5, type="number", min=-20.0, max=20.0, step=0.05)),
+                field("Max dir VWAP", dcc.Input(id="quality-max-dir-vwap", value=2.0, type="number", min=-20.0, max=20.0, step=0.05)),
+            ]),
+        ],
+        open_=open_,
+    )
+
+
+def playbook_advanced_controls():
+    return details_block(
+        "Advanced playbook filters",
+        [
+            html.Div(className="form-grid four", children=[
+                field("Slippage bps", dcc.Input(id="slippage-bps", value=3, type="number", min=0, max=50, step=1)),
+                field("News proxy", dcc.Dropdown(id="use-news", options=[{"label": "Off", "value": "false"}, {"label": "On", "value": "true"}], value="false", clearable=False)),
+                field("Candle mode", dcc.Dropdown(id="candle-mode", options=[{"label": "Off", "value": "off"}, {"label": "Selective", "value": "selective"}, {"label": "Broad", "value": "broad"}], value="off", clearable=False)),
+                field("Macro filter", dcc.Dropdown(id="macro-filter", options=[{"label": "Off", "value": "off"}, {"label": "On", "value": "on"}], value="off", clearable=False)),
+            ]),
+            html.Div(className="form-grid four", children=[
+                field("QQQ stress filter", dcc.Dropdown(id="stress-filter", options=[{"label": "Off", "value": "off"}, {"label": "Skip stress days", "value": "skip"}], value="off", clearable=False)),
+                field("Stress threshold", dcc.Input(id="qqq-stress-threshold", value=4.2, type="number", min=0.0, max=20.0, step=0.1)),
+                field("Catalyst filter", dcc.Dropdown(id="news-filter", options=[{"label": "Off", "value": "off"}, {"label": "Skip catalyst", "value": "skip"}], value="off", clearable=False)),
+                field("Kill switch", dcc.Dropdown(id="kill-switch", options=[{"label": "Off", "value": "off"}, {"label": "On", "value": "on"}], value="off", clearable=False)),
+            ]),
+            html.Div(className="form-grid two", children=[
+                field("Mean reversion", dcc.Dropdown(id="enable-mr", options=[{"label": "Off", "value": "false"}, {"label": "On", "value": "true"}], value="false", clearable=False)),
+                field("Opening range / retest", dcc.Dropdown(id="enable-or", options=[{"label": "Off", "value": "false"}, {"label": "On", "value": "true"}], value="true", clearable=False)),
+            ]),
+        ],
+    )
+
+
+def openai_controls():
+    return details_block(
+        "Optional OpenAI review filter - research only",
+        [
+            html.Div(className="form-grid four", children=[
+                field("OpenAI filter", dcc.Dropdown(id="openai-filter-mode", options=[{"label": "Off", "value": "off"}, {"label": "On", "value": "on"}], value="off", clearable=False)),
+                field("Model", dcc.Input(id="openai-model", value=os.getenv("OPENAI_TRADE_FILTER_MODEL", "gpt-5-mini"), type="text")),
+                field("Max decisions/API call", dcc.Input(id="openai-max-candidates", value=5000, type="number", min=1, max=20000, step=1)),
+                field("Min confidence", dcc.Input(id="openai-min-confidence", value=0.0, type="number", min=0.0, max=1.0, step=0.05)),
+            ])
+        ],
+    )
+
+
+def backtest_tab():
+    return html.Div(className="tab-panel", children=[
+        html.Div(className="panel-grid two-one", children=[
+            pro_card("Backtest Setup", "Date range and replay mode", [
+                html.Div(className="form-grid four", children=[
+                    field("Start", dcc.DatePickerSingle(id="start-date", date=DEFAULT_START.isoformat())),
+                    field("End", dcc.DatePickerSingle(id="end-date", date=DEFAULT_END.isoformat())),
+                    field("Data session", dcc.Dropdown(id="backtest-session-mode", options=[{"label": "Regular hours only", "value": "regular_only"}, {"label": "Extended hours", "value": "extended_hours"}, {"label": "24/5 available bars", "value": "twenty_four_five"}], value="regular_only", clearable=False)),
+                    field("Decision mode", dcc.Dropdown(id="backtest-decision-mode", options=[{"label": "Classic research replay", "value": "end_of_day_top_n"}, {"label": "Live simulation", "value": "live_simulated"}, {"label": "Full raw-bar replay", "value": "raw_bar_replay"}], value="end_of_day_top_n", clearable=False)),
+                ]),
+                html.Button("Run backtest", id="run-btn", n_clicks=0, className="primary-btn action-btn"),
+                html.Div(id="run-status", className="run-status"),
+            ]),
+            pro_card("Report Output", "Backtest ZIP is generated automatically after each run", [
+                html.P("After a backtest finishes, download/open the report ZIP path shown in the status line. It includes selected_trade_market_conditions.csv, selected_trades.csv, symbol/setup summaries, and full context for analysis.", className="subtle-note"),
+                html.P("Use Full raw-bar replay for live-style validation. Classic replay is research only.", className="subtle-note strong"),
+            ]),
+        ]),
+        html.Div(id="metrics-row", className="metrics-grid compact-metrics"),
+        html.Div(className="grid-2", children=[html.Div(className="card chart-card", children=[dcc.Graph(id="equity-fig", figure=empty_figure("Equity Curve"))]), html.Div(className="card chart-card", children=[dcc.Graph(id="drawdown-fig", figure=empty_figure("Drawdown"))])]),
+        html.Div(className="grid-2", children=[html.Div(className="card chart-card", children=[dcc.Graph(id="symbol-fig", figure=empty_figure("P&L by Symbol"))]), html.Div(className="card chart-card", children=[dcc.Graph(id="r-fig", figure=empty_figure("R-Multiple Distribution"))])]),
+        table_card("Trades", "Selected trades. Full detail is saved in selected_trade_market_conditions.csv", "trades-table", page_size=12, filterable=True),
+        html.Div(className="grid-2", children=[table_card("Symbol Summary", "Which symbols helped or hurt?", "symbol-table", page_size=10), table_card("Setup Summary", "Which trigger type works?", "setup-table", page_size=10)]),
+        details_block("Advanced backtest diagnostics", [
+            html.Div(className="grid-2", children=[html.Div(className="card chart-card", children=[dcc.Graph(id="setup-fig", figure=empty_figure("P&L by Setup Type"))]), html.Div(className="card chart-card", children=[dcc.Graph(id="daily-fig", figure=empty_figure("Trades by Day"))])]),
+            html.Div(className="grid-2", children=[table_card("Daily Summary", "Frequency and daily consistency", "daily-table", page_size=8), table_card("Exit Reason Summary", "Are exits helping or hurting?", "exit-table", page_size=8)]),
+            html.Div(className="grid-2", children=[table_card("MFE / MAE Diagnosis", "Entry vs exit failure clues", "mfe-table", page_size=8), table_card("Candlestick Pattern Summary", "Candle contribution", "candle-table", page_size=8)]),
+            html.Div(className="grid-2", children=[table_card("Score Band Summary", "Is score predictive?", "score-table", page_size=8), table_card("Time Bucket Summary", "Best time of day", "time-table", page_size=8)]),
+        ]),
+    ])
+
+
+def live_tab():
+    return html.Div(className="tab-panel", children=[
+        dcc.Interval(id="live-refresh-interval", interval=60_000, n_intervals=0),
+        dcc.Download(id="live-report-download"),
+        pro_card("Live Worker Controls", "Apply selected dashboard settings to Render and export live reports", [
+            html.Div(id="live-status", className="live-status", children="Live monitor loading..."),
+            html.Div(className="live-actions", children=[
+                html.Button("Apply current settings to live worker", id="apply-live-settings-btn", n_clicks=0, className="primary-btn action-btn"),
+                html.Button("Generate live report ZIP", id="generate-live-report-btn", n_clicks=0, className="secondary-btn action-btn"),
+                html.A("Direct report download", href="/download-live-report.zip", className="secondary-link", target="_blank"),
+            ]),
+            html.Div(id="live-action-status", className="run-status"),
+        ]),
+        html.Div(id="live-metrics-row", className="metrics-grid compact-metrics"),
+        table_card("Live / Paper Trade P&L", "Every strategy trade with realized/unrealized profit and the strategy/gate used", "live-trade-report-table", page_size=12, filterable=True),
+        html.Div(className="grid-2", children=[
+            table_card("Open Positions", "Positions currently open in Alpaca paper and synced by the worker", "live-positions-table", page_size=8, filterable=True),
+            table_card("Recent Signal Plans", "Algorithm decisions, sizing, stop, target and submission status", "live-plans-table", page_size=8, filterable=True),
+        ]),
+        details_block("Operational details", [
+            html.Div(className="grid-2", children=[
+                table_card("Recent Alpaca Paper Orders", "Parent brackets and exit legs synced from Alpaca", "live-orders-table", page_size=8, filterable=True),
+                table_card("Closed / Recently Closed Positions", "Positions the worker saw open and later missing from Alpaca /positions", "live-closed-positions-table", page_size=8, filterable=True),
+            ]),
+            table_card("Worker Events", "Scans, blocked entries, submitted paper orders, sync errors and max-hold exits", "live-events-table", page_size=10, filterable=True),
+        ]),
+    ])
+
+
+app.layout = html.Div(
+    className="page clean-page",
+    children=[
+        html.Div(className="hero clean-hero", children=[
+            html.Div(children=[html.Div("ALPACA MOMENTUM LAB", className="eyebrow"), html.H1("Trading Research & Live Monitor V38.7"), html.P("Clean two-tab workspace for backtesting, live paper execution, strategy settings and analysis reports.")]),
+            html.Div(className=status_class, children=status_text),
+        ]),
+        html.Div(className="clean-shell", children=[
+            strategy_controls(),
+            risk_controls(),
+            live_quality_controls(open_=False),
+            playbook_advanced_controls(),
+            openai_controls(),
+            dcc.Tabs(id="main-tabs", value="tab-backtest", className="main-tabs", children=[
+                dcc.Tab(label="Backtest", value="tab-backtest", className="custom-tab", selected_className="custom-tab selected", children=backtest_tab()),
+                dcc.Tab(label="Live", value="tab-live", className="custom-tab", selected_className="custom-tab selected", children=live_tab()),
+            ]),
+        ]),
+    ],
+)
 
 @app.callback(
     Output("live-metrics-row", "children"),
@@ -505,7 +774,7 @@ def _live_config_from_controls(strategy_profile, settings_preset, preset, custom
     State("quality-min-rvol", "value"), State("quality-min-daily-atr", "value"), State("quality-min-dir-rs", "value"), State("quality-max-dir-rs", "value"),
     State("quality-min-dir-open-rs", "value"), State("quality-max-dir-open-rs", "value"),
     State("quality-min-dir-vwap", "value"), State("quality-max-dir-vwap", "value"), State("quality-max-abs-vwap", "value"),
-    State("account-value", "value"), State("risk-dollars", "value"), State("risk-mode", "value"), State("base-risk-pct", "value"), State("min-risk-dollars", "value"), State("max-risk-dollars", "value"), State("dd1-risk-pct", "value"), State("dd2-risk-pct", "value"), State("pause-dd-pct", "value"),
+    State("account-value", "value"), State("risk-dollars-v12", "value"), State("risk-mode", "value"), State("base-risk-pct", "value"), State("min-risk-dollars", "value"), State("max-risk-dollars", "value"), State("dd1-risk-pct", "value"), State("dd2-risk-pct", "value"), State("pause-dd-pct", "value"),
     State("min-score", "value"), State("max-trades", "value"), State("slippage-bps", "value"), State("use-news", "value"), State("candle-mode", "value"),
     State("macro-filter", "value"), State("stress-filter", "value"), State("news-filter", "value"), State("qqq-stress-threshold", "value"), State("kill-switch", "value"), State("enable-mr", "value"), State("enable-or", "value"), State("direction-mode", "value"),
     prevent_initial_call=True,
@@ -515,7 +784,7 @@ def live_actions(apply_clicks, report_clicks, strategy_profile, settings_preset,
     if trigger == "generate-live-report-btn":
         try:
             zip_path = generate_live_report_zip(days=3650)
-            return f"Live report generated: {zip_path}", dcc.send_file(str(zip_path))
+            return f"Live report generated and download triggered: {zip_path.name}. If the browser does not download it, click Direct download.", dcc.send_file(str(zip_path))
         except Exception as exc:
             return f"Live report generation failed: {exc}", no_update
     if trigger == "apply-live-settings-btn":
