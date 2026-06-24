@@ -653,6 +653,7 @@ def live_tab():
 app.layout = html.Div(
     className="page clean-page",
     children=[
+        dcc.Interval(id="settings-load-interval", interval=500, n_intervals=0, max_intervals=1),
         html.Div(className="hero clean-hero", children=[
             html.Div(children=[html.Div("ALPACA MOMENTUM LAB", className="eyebrow"), html.H1("Trading Research & Live Monitor V38.8"), html.P("Clean two-tab workspace for backtesting, live paper execution, strategy settings and analysis reports.")]),
             html.Div(className=status_class, children=status_text),
@@ -670,6 +671,115 @@ app.layout = html.Div(
         ]),
     ],
 )
+
+
+def _cfg_value(cfg: dict, key: str, default=None):
+    value = (cfg or {}).get(key, default)
+    return default if value is None else value
+
+def _cfg_bool_string(cfg: dict, key: str, default: bool = False) -> str:
+    value = (cfg or {}).get(key, default)
+    return "true" if str(value).lower() in {"1", "true", "yes", "on"} or value is True else "false"
+
+
+@app.callback(
+    Output("settings-preset", "value", allow_duplicate=True),
+    Output("preset", "value", allow_duplicate=True),
+    Output("custom-symbols", "value", allow_duplicate=True),
+    Output("feed", "value", allow_duplicate=True),
+    Output("backtest-session-mode", "value", allow_duplicate=True),
+    Output("live-quality-gate", "value", allow_duplicate=True),
+    Output("quality-start-time", "value", allow_duplicate=True),
+    Output("quality-end-time", "value", allow_duplicate=True),
+    Output("quality-min-rvol", "value", allow_duplicate=True),
+    Output("quality-min-daily-atr", "value", allow_duplicate=True),
+    Output("quality-min-dir-rs", "value", allow_duplicate=True),
+    Output("quality-max-dir-rs", "value", allow_duplicate=True),
+    Output("quality-min-dir-open-rs", "value", allow_duplicate=True),
+    Output("quality-max-dir-open-rs", "value", allow_duplicate=True),
+    Output("quality-min-dir-vwap", "value", allow_duplicate=True),
+    Output("quality-max-dir-vwap", "value", allow_duplicate=True),
+    Output("quality-max-abs-vwap", "value", allow_duplicate=True),
+    Output("account-value", "value", allow_duplicate=True),
+    Output("risk-dollars-v12", "value", allow_duplicate=True),
+    Output("risk-mode", "value", allow_duplicate=True),
+    Output("base-risk-pct", "value", allow_duplicate=True),
+    Output("min-risk-dollars", "value", allow_duplicate=True),
+    Output("max-risk-dollars", "value", allow_duplicate=True),
+    Output("dd1-risk-pct", "value", allow_duplicate=True),
+    Output("dd2-risk-pct", "value", allow_duplicate=True),
+    Output("pause-dd-pct", "value", allow_duplicate=True),
+    Output("min-score", "value", allow_duplicate=True),
+    Output("max-trades", "value", allow_duplicate=True),
+    Output("slippage-bps", "value", allow_duplicate=True),
+    Output("use-news", "value", allow_duplicate=True),
+    Output("candle-mode", "value", allow_duplicate=True),
+    Output("macro-filter", "value", allow_duplicate=True),
+    Output("stress-filter", "value", allow_duplicate=True),
+    Output("news-filter", "value", allow_duplicate=True),
+    Output("qqq-stress-threshold", "value", allow_duplicate=True),
+    Output("kill-switch", "value", allow_duplicate=True),
+    Output("enable-mr", "value", allow_duplicate=True),
+    Output("enable-or", "value", allow_duplicate=True),
+    Output("direction-mode", "value", allow_duplicate=True),
+    Output("live-entry-start-time", "value", allow_duplicate=True),
+    Output("live-entry-end-time", "value", allow_duplicate=True),
+    Output("live-require-market-open", "value", allow_duplicate=True),
+    Output("live-allow-extended-hours", "value", allow_duplicate=True),
+    Output("live-enable-max-hold-exit", "value", allow_duplicate=True),
+    Input("settings-load-interval", "n_intervals"),
+    prevent_initial_call=True,
+)
+def load_saved_live_settings(n_intervals):
+    cfg = LiveStore().get_state("live_config_override", None)
+    if not isinstance(cfg, dict) or not cfg:
+        return tuple([no_update] * 44)
+    return (
+        _cfg_value(cfg, "settings_preset", "best_qqq_news"),
+        _cfg_value(cfg, "watchlist_preset", "v25_playbook"),
+        _cfg_value(cfg, "custom_symbols", ""),
+        _cfg_value(cfg, "feed", os.getenv("ALPACA_FEED", "iex")),
+        _cfg_value(cfg, "backtest_session_mode", "regular_only"),
+        _cfg_value(cfg, "live_quality_gate", "off"),
+        _cfg_value(cfg, "quality_start_time", "10:00"),
+        _cfg_value(cfg, "quality_end_time", "11:00"),
+        _cfg_value(cfg, "quality_min_rvol", 1.0),
+        _cfg_value(cfg, "quality_min_daily_atr", 0.0),
+        _cfg_value(cfg, "quality_min_dir_rs", 0.0),
+        _cfg_value(cfg, "quality_max_dir_rs", 999.0),
+        _cfg_value(cfg, "quality_min_dir_open_rs", -999.0),
+        _cfg_value(cfg, "quality_max_dir_open_rs", 999.0),
+        _cfg_value(cfg, "quality_min_dir_vwap", 0.5),
+        _cfg_value(cfg, "quality_max_dir_vwap", 2.0),
+        _cfg_value(cfg, "quality_max_abs_vwap", 1.5),
+        _cfg_value(cfg, "account_value", 10000),
+        _cfg_value(cfg, "risk_dollars", 100),
+        _cfg_value(cfg, "risk_mode", "percent_equity"),
+        _cfg_value(cfg, "base_risk_pct", 1.0),
+        _cfg_value(cfg, "min_risk_dollars", 10),
+        _cfg_value(cfg, "max_risk_dollars", 300),
+        _cfg_value(cfg, "dd1_risk_pct", 0.75),
+        _cfg_value(cfg, "dd2_risk_pct", 0.50),
+        _cfg_value(cfg, "pause_dd_pct", 15.0),
+        _cfg_value(cfg, "min_score", 2),
+        _cfg_value(cfg, "max_trades", 2),
+        _cfg_value(cfg, "slippage_bps", 2.0),
+        "true" if bool(cfg.get("use_news")) else "false",
+        _cfg_value(cfg, "candle_mode", "selective"),
+        _cfg_value(cfg, "macro_filter", "off"),
+        _cfg_value(cfg, "stress_filter", "off"),
+        _cfg_value(cfg, "news_filter", "skip"),
+        _cfg_value(cfg, "qqq_stress_threshold", 4.2),
+        _cfg_value(cfg, "kill_switch", "off"),
+        "true" if bool(cfg.get("enable_mr")) else "false",
+        "true" if bool(cfg.get("enable_or")) else "false",
+        _cfg_value(cfg, "direction_mode", "long_short"),
+        _cfg_value(cfg, "live_entry_start_time_et", "09:35"),
+        _cfg_value(cfg, "live_entry_end_time_et", "15:55"),
+        _cfg_bool_string(cfg, "live_require_market_open", True),
+        _cfg_bool_string(cfg, "live_allow_extended_hours_entries", False),
+        _cfg_bool_string(cfg, "live_enable_max_hold_exit", True),
+    )
 
 @app.callback(
     Output("live-metrics-row", "children"),
