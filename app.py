@@ -683,6 +683,26 @@ def _cfg_bool_string(cfg: dict, key: str, default: bool = False) -> str:
     return "true" if str(value).lower() in {"1", "true", "yes", "on"} or value is True else "false"
 
 
+def _normalize_time_et(value, default: str) -> str:
+    """Normalize HH:MM dashboard time fields and reject partial typing values.
+
+    This prevents a half-typed value like "2" from being saved to the shared
+    Render database and blocking the live worker entry window.
+    """
+    text = str(value or "").strip()
+    if not text or ":" not in text:
+        return default
+    try:
+        hh, mm = text.split(":", 1)
+        h = int(hh)
+        m = int(mm)
+        if 0 <= h <= 23 and 0 <= m <= 59:
+            return f"{h:02d}:{m:02d}"
+    except Exception:
+        pass
+    return default
+
+
 @app.callback(
     Output("settings-preset", "value", allow_duplicate=True),
     Output("preset", "value", allow_duplicate=True),
@@ -729,11 +749,10 @@ def _cfg_bool_string(cfg: dict, key: str, default: bool = False) -> str:
     Output("live-allow-extended-hours", "value", allow_duplicate=True),
     Output("live-enable-max-hold-exit", "value", allow_duplicate=True),
     Input("settings-load-interval", "n_intervals"),
-    Input("live-settings-store", "modified_timestamp"),
     State("live-settings-store", "data"),
     prevent_initial_call="initial_duplicate",
 )
-def load_saved_live_settings(n_intervals, store_modified_ts=None, store_data=None):
+def load_saved_live_settings(n_intervals, store_data=None):
     # Render has two separate processes: the Dash web service and trading_worker.py.
     # The database row is therefore the source of truth for live trading settings.
     # Browser local storage is only a fallback for local/dev cases where the DB row
@@ -791,8 +810,8 @@ def load_saved_live_settings(n_intervals, store_modified_ts=None, store_data=Non
         "true" if bool(cfg.get("enable_mr")) else "false",
         "true" if bool(cfg.get("enable_or")) else "false",
         _cfg_value(cfg, "direction_mode", "long_short"),
-        _cfg_value(cfg, "live_entry_start_time_et", "09:35"),
-        _cfg_value(cfg, "live_entry_end_time_et", "15:55"),
+        _normalize_time_et(_cfg_value(cfg, "live_entry_start_time_et", "09:35"), "09:35"),
+        _normalize_time_et(_cfg_value(cfg, "live_entry_end_time_et", "15:55"), "15:55"),
         _cfg_bool_string(cfg, "live_require_market_open", True),
         _cfg_bool_string(cfg, "live_allow_extended_hours_entries", False),
         _cfg_bool_string(cfg, "live_enable_max_hold_exit", True),
@@ -897,8 +916,8 @@ def _live_config_from_controls(strategy_profile, settings_preset, preset, custom
         "enable_mr": _bool_from_dropdown(enable_mr),
         "enable_or": _bool_from_dropdown(enable_or),
         "direction_mode": direction_mode or "long_short",
-        "live_entry_start_time_et": live_entry_start_time or "09:35",
-        "live_entry_end_time_et": live_entry_end_time or "15:55",
+        "live_entry_start_time_et": _normalize_time_et(live_entry_start_time, "09:35"),
+        "live_entry_end_time_et": _normalize_time_et(live_entry_end_time, "15:55"),
         "live_require_market_open": _bool_from_dropdown(live_require_market_open),
         "live_allow_extended_hours_entries": _bool_from_dropdown(live_allow_extended_hours),
         "live_enable_max_hold_exit": _bool_from_dropdown(live_enable_max_hold_exit),
@@ -920,27 +939,11 @@ def _save_live_config_to_shared_db(cfg: dict) -> str:
     return str(cfg.get("applied_at_utc") or "")
 
 
-@app.callback(
-    Output("live-action-status", "children", allow_duplicate=True),
-    Output("live-settings-store", "data", allow_duplicate=True),
-    Input("strategy-profile", "value"), Input("settings-preset", "value"), Input("preset", "value"), Input("custom-symbols", "value"), Input("feed", "value"), Input("backtest-session-mode", "value"),
-    Input("live-quality-gate", "value"), Input("quality-start-time", "value"), Input("quality-end-time", "value"),
-    Input("quality-min-rvol", "value"), Input("quality-min-daily-atr", "value"), Input("quality-min-dir-rs", "value"), Input("quality-max-dir-rs", "value"),
-    Input("quality-min-dir-open-rs", "value"), Input("quality-max-dir-open-rs", "value"),
-    Input("quality-min-dir-vwap", "value"), Input("quality-max-dir-vwap", "value"), Input("quality-max-abs-vwap", "value"),
-    Input("account-value", "value"), Input("risk-dollars-v12", "value"), Input("risk-mode", "value"), Input("base-risk-pct", "value"), Input("min-risk-dollars", "value"), Input("max-risk-dollars", "value"), Input("dd1-risk-pct", "value"), Input("dd2-risk-pct", "value"), Input("pause-dd-pct", "value"),
-    Input("min-score", "value"), Input("max-trades", "value"), Input("slippage-bps", "value"), Input("use-news", "value"), Input("candle-mode", "value"),
-    Input("macro-filter", "value"), Input("stress-filter", "value"), Input("news-filter", "value"), Input("qqq-stress-threshold", "value"), Input("kill-switch", "value"), Input("enable-mr", "value"), Input("enable-or", "value"), Input("direction-mode", "value"),
-    Input("live-entry-start-time", "value"), Input("live-entry-end-time", "value"), Input("live-require-market-open", "value"), Input("live-allow-extended-hours", "value"), Input("live-enable-max-hold-exit", "value"),
-    prevent_initial_call=True,
-)
-def autosave_live_settings_to_shared_db(strategy_profile, settings_preset, preset, custom_symbols, feed, backtest_session_mode, live_quality_gate, quality_start_time, quality_end_time, quality_min_rvol, quality_min_daily_atr, quality_min_dir_rs, quality_max_dir_rs, quality_min_dir_open_rs, quality_max_dir_open_rs, quality_min_dir_vwap, quality_max_dir_vwap, quality_max_abs_vwap, account_value, risk_dollars, risk_mode, base_risk_pct, min_risk_dollars, max_risk_dollars, dd1_risk_pct, dd2_risk_pct, pause_dd_pct, min_score, max_trades, slippage_bps, use_news, candle_mode, macro_filter, stress_filter, news_filter, qqq_stress_threshold, kill_switch, enable_mr, enable_or, direction_mode, live_entry_start_time, live_entry_end_time, live_require_market_open, live_allow_extended_hours, live_enable_max_hold_exit):
-    cfg = _live_config_from_controls(strategy_profile, settings_preset, preset, custom_symbols, feed, backtest_session_mode, live_quality_gate, quality_start_time, quality_end_time, quality_min_rvol, quality_min_daily_atr, quality_min_dir_rs, quality_max_dir_rs, quality_min_dir_open_rs, quality_max_dir_open_rs, quality_min_dir_vwap, quality_max_dir_vwap, quality_max_abs_vwap, account_value, risk_dollars, risk_mode, base_risk_pct, min_risk_dollars, max_risk_dollars, dd1_risk_pct, dd2_risk_pct, pause_dd_pct, min_score, max_trades, slippage_bps, use_news, candle_mode, macro_filter, stress_filter, news_filter, qqq_stress_threshold, kill_switch, enable_mr, enable_or, direction_mode, live_entry_start_time, live_entry_end_time, live_require_market_open, live_allow_extended_hours, live_enable_max_hold_exit)
-    try:
-        _save_live_config_to_shared_db(cfg)
-        return f"Saved live settings to database: strategy_variant={cfg['strategy_variant']}, preset={cfg['settings_preset']}, symbols={len(cfg['symbols'])}, max daily trades={cfg['max_daily_trades']}, entries {cfg['live_entry_start_time_et']}-{cfg['live_entry_end_time_et']} ET. Render worker will read this on its next scan.", cfg
-    except Exception as exc:
-        return f"Could not save live settings to database, but kept them in this browser: {exc}", cfg
+# Do not save every control keystroke to Postgres.
+# The shared Render database is updated only when the user clicks
+# "Apply current settings to live worker" below.  This avoids Dash callback
+# loops, partial typed times like "2", and the browser tab staying in
+# "Updating..." forever.
 
 
 @app.callback(

@@ -96,10 +96,13 @@ def build_live_trade_report(days: int = 3650) -> pd.DataFrame:
     closed trades show realized P/L when filled exit legs are available.
     """
     store = LiveStore()
-    plans = store.recent_signal_plans(5000)
-    orders = store.recent_orders(10000)
+    # For the live dashboard refresh, only a recent window is needed.  Full
+    # historical exports still use the larger limits through days=3650.
+    full_history = int(days or 0) >= 365
+    plans = store.recent_signal_plans(5000 if full_history else 500)
+    orders = store.recent_orders(10000 if full_history else 1000)
     open_positions = store.open_positions()
-    closed_positions = store.closed_positions(5000)
+    closed_positions = store.closed_positions(5000 if full_history else 500)
     if plans is None or plans.empty:
         return pd.DataFrame()
     if orders is None:

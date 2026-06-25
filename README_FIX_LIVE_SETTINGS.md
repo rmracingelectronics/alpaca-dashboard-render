@@ -1,31 +1,38 @@
-# V33 live settings/database persistence fix
+# V33 Live Settings / Render Database Fix v3
 
-This package was fixed from the uploaded `alpaca_dashboard_v33.zip`.
+This version keeps the Render PostgreSQL database as the source of truth for live-worker settings, but avoids saving every individual keystroke to the database.
 
-## Main changes
+## What changed in v3
 
-- `app.py` now treats Postgres/`DATABASE_URL` as the source of truth for live settings.
-- On page load, the dashboard reads `live_worker_state.key = 'live_config_override'` from the shared database first.
-- Browser local storage is now only a fallback when the database row does not exist yet.
-- Changing live/backtest/risk controls automatically saves the complete live configuration to the shared database.
-- The `Apply current settings to live worker` button remains as a manual force-sync/status button and writes the same database row.
-- The same config is also mirrored to `live_worker_state.key = 'settings'` under `settings.live` for older dashboard/report code.
-- The worker already reads `live_config_override` on every `run_once()`, so it will pick up changes on the next scan if the web service and worker share the same `DATABASE_URL`.
+- Dashboard loads saved live settings from `live_worker_state.key = 'live_config_override'` on page open.
+- Clicking **Apply current settings to live worker** writes the current dashboard config to:
+  - `live_worker_state.key = 'live_config_override'`
+  - `live_worker_state.key = 'settings'`
+- Removed the previous automatic database-save callback that fired on every control change/keystroke. That callback could keep the browser tab stuck on **Updating...** and could save partial typed values such as `2` instead of `20:00`.
+- Added validation for live entry time fields so invalid/partial times do not get saved to the shared database.
+- Worker still reads `live_config_override` during its scan loop and reports `config_source = dashboard_db` in the heartbeat when it applies dashboard settings.
 
-## Database row to verify on Render
+## Expected behavior
 
-```sql
-SELECT key, value_json, updated_at_utc
-FROM live_worker_state
-WHERE key IN ('live_config_override', 'settings', 'heartbeat');
+1. Open dashboard.
+2. Dashboard controls load from Postgres first, browser storage only as fallback.
+3. Change settings.
+4. Click **Apply current settings to live worker**.
+5. Worker reads the saved database config on the next scan.
+
+## Check from Render shell
+
+Run this from the web service shell from the project root:
+
+```bash
+cd ~/project
+python - <<'PY'
+from src.live_store import LiveStore
+store = LiveStore()
+for key in ["live_config_override", "settings", "heartbeat", "market_clock"]:
+    print("\n---", key, "---")
+    print(store.get_state(key, None))
+PY
 ```
 
-`live_config_override.updated_at_utc` should update whenever a setting changes or when Apply is clicked.
-
-`heartbeat.value_json` should eventually show:
-
-```json
-"config_source": "dashboard_db"
-```
-
-That confirms the worker is reading the database config.
+If you paste into the Render shell and see `^[[200~python`, clear the line with Ctrl+C and paste only the command starting with `cd ~/project`.

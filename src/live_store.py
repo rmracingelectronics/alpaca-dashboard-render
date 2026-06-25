@@ -59,7 +59,7 @@ class LiveStore:
                 import psycopg2
             except Exception as exc:  # pragma: no cover
                 raise RuntimeError("DATABASE_URL is Postgres, but psycopg2-binary is not installed.") from exc
-            conn = psycopg2.connect(self.database_url)
+            conn = psycopg2.connect(self.database_url, connect_timeout=int(os.getenv("DB_CONNECT_TIMEOUT", "10")), application_name=os.getenv("RENDER_SERVICE_NAME", "alpaca-dashboard"))
             conn.autocommit = True
             try:
                 yield conn
@@ -372,6 +372,25 @@ class LiveStore:
         for table, cols in migrations.items():
             for column, definition in cols:
                 self._add_column_if_missing(table, column, definition)
+
+        # Dashboard and worker read these tables continuously.  These indexes keep
+        # Render Postgres responsive as live_events/orders/plans grow.
+        index_statements = [
+            "CREATE INDEX IF NOT EXISTS idx_live_events_id_desc ON live_events (id DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_live_events_created_at ON live_events (created_at_utc)",
+            "CREATE INDEX IF NOT EXISTS idx_live_orders_updated ON live_orders (updated_at, created_at, submitted_at)",
+            "CREATE INDEX IF NOT EXISTS idx_live_orders_symbol ON live_orders (symbol)",
+            "CREATE INDEX IF NOT EXISTS idx_live_signal_plans_submitted ON live_signal_plans (submitted_at_utc)",
+            "CREATE INDEX IF NOT EXISTS idx_live_signal_plans_symbol ON live_signal_plans (symbol)",
+            "CREATE INDEX IF NOT EXISTS idx_live_positions_open ON live_positions (is_open, symbol)",
+            "CREATE INDEX IF NOT EXISTS idx_live_account_snapshots_id_desc ON live_account_snapshots (id DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_live_candidate_audit_updated ON live_candidate_audit (updated_at_utc, created_at_utc)",
+        ]
+        for sql in index_statements:
+            try:
+                self._execute(sql)
+            except Exception:
+                pass
 
     @staticmethod
     def _float_or_none(value: Any) -> float | None:
@@ -730,7 +749,10 @@ class LiveStore:
     def dashboard_snapshot(self) -> dict[str, pd.DataFrame | Any]:
         return {
             "events": self.recent_events(100),
-            "candidate_audit": self.recent_candidate_audit(5000),
+            # Candidate audit is intentionally not loaded on every dashboard refresh;
+            # it can become large and make the Dash page stay in "Updating".
+            # Full audit rows are still included when generating the live report ZIP.
+            "candidate_audit": pd.DataFrame(),
             "open_positions": self.open_positions(),
             "closed_positions": self.closed_positions(100),
             "orders": self.recent_orders(100),
