@@ -654,6 +654,7 @@ app.layout = html.Div(
     className="page clean-page",
     children=[
         dcc.Interval(id="settings-load-interval", interval=500, n_intervals=0, max_intervals=1),
+        dcc.Store(id="live-settings-store", storage_type="local"),
         html.Div(className="hero clean-hero", children=[
             html.Div(children=[html.Div("ALPACA MOMENTUM LAB", className="eyebrow"), html.H1("Trading Research & Live Monitor V38.8"), html.P("Clean two-tab workspace for backtesting, live paper execution, strategy settings and analysis reports.")]),
             html.Div(className=status_class, children=status_text),
@@ -728,10 +729,19 @@ def _cfg_bool_string(cfg: dict, key: str, default: bool = False) -> str:
     Output("live-allow-extended-hours", "value", allow_duplicate=True),
     Output("live-enable-max-hold-exit", "value", allow_duplicate=True),
     Input("settings-load-interval", "n_intervals"),
-    prevent_initial_call=True,
+    Input("live-settings-store", "modified_timestamp"),
+    State("live-settings-store", "data"),
+    prevent_initial_call=False,
 )
-def load_saved_live_settings(n_intervals):
-    cfg = LiveStore().get_state("live_config_override", None)
+def load_saved_live_settings(n_intervals, store_modified_ts=None, store_data=None):
+    cfg = None
+    if isinstance(store_data, dict) and store_data:
+        cfg = store_data
+    if not isinstance(cfg, dict) or not cfg:
+        try:
+            cfg = LiveStore().get_state("live_config_override", None)
+        except Exception:
+            cfg = None
     if not isinstance(cfg, dict) or not cfg:
         return tuple([no_update] * 44)
     return (
@@ -892,6 +902,7 @@ def _live_config_from_controls(strategy_profile, settings_preset, preset, custom
 @app.callback(
     Output("live-action-status", "children"),
     Output("live-report-download", "data"),
+    Output("live-settings-store", "data", allow_duplicate=True),
     Input("apply-live-settings-btn", "n_clicks"),
     Input("generate-live-report-btn", "n_clicks"),
     State("strategy-profile", "value"), State("settings-preset", "value"), State("preset", "value"), State("custom-symbols", "value"), State("feed", "value"), State("backtest-session-mode", "value"),
@@ -910,17 +921,18 @@ def live_actions(apply_clicks, report_clicks, strategy_profile, settings_preset,
     if trigger == "generate-live-report-btn":
         try:
             zip_path = generate_live_report_zip(days=3650)
-            return f"Live report generated and download triggered: {zip_path.name}. If the browser does not download it, click Direct download.", dcc.send_file(str(zip_path))
+            return f"Live report generated and download triggered: {zip_path.name}. If the browser does not download it, click Direct download.", dcc.send_file(str(zip_path)), no_update
         except Exception as exc:
-            return f"Live report generation failed: {exc}", no_update
+            return f"Live report generation failed: {exc}", no_update, no_update
     if trigger == "apply-live-settings-btn":
         cfg = _live_config_from_controls(strategy_profile, settings_preset, preset, custom_symbols, feed, backtest_session_mode, live_quality_gate, quality_start_time, quality_end_time, quality_min_rvol, quality_min_daily_atr, quality_min_dir_rs, quality_max_dir_rs, quality_min_dir_open_rs, quality_max_dir_open_rs, quality_min_dir_vwap, quality_max_dir_vwap, quality_max_abs_vwap, account_value, risk_dollars, risk_mode, base_risk_pct, min_risk_dollars, max_risk_dollars, dd1_risk_pct, dd2_risk_pct, pause_dd_pct, min_score, max_trades, slippage_bps, use_news, candle_mode, macro_filter, stress_filter, news_filter, qqq_stress_threshold, kill_switch, enable_mr, enable_or, direction_mode, live_entry_start_time, live_entry_end_time, live_require_market_open, live_allow_extended_hours, live_enable_max_hold_exit)
         try:
             LiveStore().set_state("live_config_override", cfg)
-            return f"Applied live worker settings: strategy_variant={cfg['strategy_variant']}, gate={cfg['live_quality_gate']}, symbols={len(cfg['symbols'])}, max daily trades={cfg['max_daily_trades']}, live entries {cfg['live_entry_start_time_et']}-{cfg['live_entry_end_time_et']} ET. The Render worker will pick this up on its next scan if it shares DATABASE_URL.", no_update
+            return f"Applied live worker settings: strategy_variant={cfg['strategy_variant']}, gate={cfg['live_quality_gate']}, symbols={len(cfg['symbols'])}, max daily trades={cfg['max_daily_trades']}, live entries {cfg['live_entry_start_time_et']}-{cfg['live_entry_end_time_et']} ET. The Render worker will pick this up on its next scan if it shares DATABASE_URL.", no_update, cfg
         except Exception as exc:
-            return f"Could not apply live worker settings: {exc}", no_update
-    return no_update, no_update
+            # Still persist in this browser so a database issue does not make the UI forget values on refresh.
+            return f"Saved settings in browser, but could not write shared live worker settings: {exc}", no_update, cfg
+    return no_update, no_update, no_update
 
 
 @app.callback(
