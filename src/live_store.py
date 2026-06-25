@@ -59,7 +59,7 @@ class LiveStore:
                 import psycopg2
             except Exception as exc:  # pragma: no cover
                 raise RuntimeError("DATABASE_URL is Postgres, but psycopg2-binary is not installed.") from exc
-            conn = psycopg2.connect(self.database_url, connect_timeout=int(os.getenv("DB_CONNECT_TIMEOUT", "10")), application_name=os.getenv("RENDER_SERVICE_NAME", "alpaca-dashboard"))
+            conn = psycopg2.connect(self.database_url, connect_timeout=int(os.getenv("DB_CONNECT_TIMEOUT", "5")), application_name=os.getenv("RENDER_SERVICE_NAME", "alpaca-dashboard"))
             conn.autocommit = True
             try:
                 yield conn

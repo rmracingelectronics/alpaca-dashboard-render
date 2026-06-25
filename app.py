@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import os
+import json
+import traceback
 from datetime import date, timedelta
 
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from dash import Dash, Input, Output, State, dcc, html, dash_table, no_update, ctx
-from flask import send_file
+from flask import send_file, jsonify
 
 from src.backtest import run_backtest
 from src.config import AlpacaSettings, StrategyParams
@@ -16,8 +18,65 @@ from src.live_store import LiveStore
 from src.live_engine import live_variant_from_dashboard
 from src.symbols import WATCHLISTS, parse_symbols
 
-app = Dash(__name__, suppress_callback_exceptions=True, title="Alpaca Momentum Dashboard V38.8")
+app = Dash(__name__, suppress_callback_exceptions=True, title="Alpaca Momentum Dashboard V38.8", update_title=None)
 server = app.server
+
+
+def _safe_diag_value(value):
+    try:
+        return json.loads(json.dumps(value, default=str))
+    except Exception:
+        return str(value)
+
+
+@server.route("/healthz")
+def healthz():
+    return jsonify({"ok": True, "service": os.getenv("RENDER_SERVICE_NAME", "unknown")})
+
+
+@server.route("/debug/live-state")
+def debug_live_state():
+    """No-Dash diagnostic endpoint for Render.
+
+    Open /debug/live-state in the browser if the Dash page says Updating.
+    This route bypasses all Dash callbacks and directly checks the shared
+    database state used by both the dashboard and trading worker.
+    """
+    out = {
+        "ok": False,
+        "service": os.getenv("RENDER_SERVICE_NAME", "unknown"),
+        "database_url_present": bool(os.getenv("DATABASE_URL")),
+        "database_url_type": "postgres" if str(os.getenv("DATABASE_URL", "")).startswith(("postgresql://", "postgres://")) else "sqlite_or_missing",
+        "alpaca_env_present": {
+            "ALPACA_API_KEY": bool(os.getenv("ALPACA_API_KEY")),
+            "ALPACA_SECRET_KEY": bool(os.getenv("ALPACA_SECRET_KEY")),
+            "ALPACA_TRADING_BASE_URL": bool(os.getenv("ALPACA_TRADING_BASE_URL")),
+            "ALPACA_DATA_BASE_URL": bool(os.getenv("ALPACA_DATA_BASE_URL")),
+            "ALPACA_FEED": os.getenv("ALPACA_FEED", ""),
+        },
+    }
+    try:
+        store = LiveStore()
+        out["store"] = {"is_postgres": store.is_postgres}
+        for key in ["live_config_override", "settings", "heartbeat", "market_clock"]:
+            out[key] = _safe_diag_value(store.get_state(key, None))
+        try:
+            out["recent_events"] = store.recent_events(20).to_dict("records")
+        except Exception as exc:
+            out["recent_events_error"] = str(exc)
+        try:
+            out["recent_plans"] = store.recent_signal_plans(10).to_dict("records")
+        except Exception as exc:
+            out["recent_plans_error"] = str(exc)
+        try:
+            out["recent_orders"] = store.recent_orders(10).to_dict("records")
+        except Exception as exc:
+            out["recent_orders_error"] = str(exc)
+        out["ok"] = True
+    except Exception as exc:
+        out["error"] = str(exc)
+        out["traceback"] = traceback.format_exc()
+    return jsonify(out)
 
 
 @server.route("/download-live-report.zip")
@@ -753,6 +812,7 @@ def _normalize_time_et(value, default: str) -> str:
     prevent_initial_call="initial_duplicate",
 )
 def load_saved_live_settings(n_intervals, store_data=None):
+    print("[dashboard] load_saved_live_settings start", flush=True)
     # Render has two separate processes: the Dash web service and trading_worker.py.
     # The database row is therefore the source of truth for live trading settings.
     # Browser local storage is only a fallback for local/dev cases where the DB row
@@ -769,7 +829,9 @@ def load_saved_live_settings(n_intervals, store_data=None):
         if isinstance(store_data, dict) and store_data:
             cfg = store_data
     if not isinstance(cfg, dict) or not cfg:
+        print("[dashboard] load_saved_live_settings no saved config", flush=True)
         return tuple([no_update] * 44)
+    print(f"[dashboard] load_saved_live_settings loaded preset={cfg.get('settings_preset')} variant={cfg.get('strategy_variant')}", flush=True)
     return (
         _cfg_value(cfg, "settings_preset", "best_qqq_news"),
         _cfg_value(cfg, "watchlist_preset", "v25_playbook"),
@@ -827,8 +889,10 @@ def load_saved_live_settings(n_intervals, store_data=None):
     Output("live-events-table", "data"), Output("live-events-table", "columns"),
     Output("live-status", "children"),
     Input("live-refresh-interval", "n_intervals"),
+    prevent_initial_call=True,
 )
 def refresh_live_paper_monitor(n_intervals):
+    print(f"[dashboard] refresh_live_paper_monitor start n={n_intervals}", flush=True)
     try:
         snapshot = load_live_paper_snapshot(days=7)
         metrics = [metric_card(m.get("label", "Metric"), m.get("value", "--"), m.get("help", "")) for m in snapshot.get("metrics", [])]
@@ -845,8 +909,10 @@ def refresh_live_paper_monitor(n_intervals):
         closed_data, closed_cols = table_payload(snapshot.get("closed_positions", pd.DataFrame()))
         live_trade_data, live_trade_cols = table_payload(snapshot.get("trade_report", pd.DataFrame()))
         event_data, event_cols = table_payload(snapshot.get("events", pd.DataFrame()))
+        print("[dashboard] refresh_live_paper_monitor ok", flush=True)
         return metrics, pos_data, pos_cols, plan_data, plan_cols, order_data, order_cols, closed_data, closed_cols, live_trade_data, live_trade_cols, event_data, event_cols, snapshot.get("status", "Live paper monitor refreshed.")
     except Exception as exc:
+        print(f"[dashboard] refresh_live_paper_monitor error: {exc}", flush=True)
         metrics = [metric_card("Live Monitor", "Error", str(exc)[:80]), metric_card("Open Positions", "--"), metric_card("Signal Plans", "--"), metric_card("Worker", "--")]
         blank = ([], [])
         return metrics, *blank, *blank, *blank, *blank, *blank, *blank, f"Live paper monitor error: {exc}"
@@ -965,6 +1031,7 @@ def _save_live_config_to_shared_db(cfg: dict) -> str:
 )
 def live_actions(apply_clicks, report_clicks, strategy_profile, settings_preset, preset, custom_symbols, feed, backtest_session_mode, live_quality_gate, quality_start_time, quality_end_time, quality_min_rvol, quality_min_daily_atr, quality_min_dir_rs, quality_max_dir_rs, quality_min_dir_open_rs, quality_max_dir_open_rs, quality_min_dir_vwap, quality_max_dir_vwap, quality_max_abs_vwap, account_value, risk_dollars, risk_mode, base_risk_pct, min_risk_dollars, max_risk_dollars, dd1_risk_pct, dd2_risk_pct, pause_dd_pct, min_score, max_trades, slippage_bps, use_news, candle_mode, macro_filter, stress_filter, news_filter, qqq_stress_threshold, kill_switch, enable_mr, enable_or, direction_mode, live_entry_start_time, live_entry_end_time, live_require_market_open, live_allow_extended_hours, live_enable_max_hold_exit):
     trigger = ctx.triggered_id
+    print(f"[dashboard] live_actions trigger={trigger}", flush=True)
     if trigger == "generate-live-report-btn":
         try:
             zip_path = generate_live_report_zip(days=3650)
