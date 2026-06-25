@@ -734,14 +734,21 @@ def _cfg_bool_string(cfg: dict, key: str, default: bool = False) -> str:
     prevent_initial_call="initial_duplicate",
 )
 def load_saved_live_settings(n_intervals, store_modified_ts=None, store_data=None):
+    # Render has two separate processes: the Dash web service and trading_worker.py.
+    # The database row is therefore the source of truth for live trading settings.
+    # Browser local storage is only a fallback for local/dev cases where the DB row
+    # does not exist yet.  This prevents stale browser storage from overwriting or
+    # visually reverting a config that was already applied to the live worker.
     cfg = None
-    if isinstance(store_data, dict) and store_data:
-        cfg = store_data
+    try:
+        db_cfg = LiveStore().get_state("live_config_override", None)
+        if isinstance(db_cfg, dict) and db_cfg:
+            cfg = db_cfg
+    except Exception:
+        cfg = None
     if not isinstance(cfg, dict) or not cfg:
-        try:
-            cfg = LiveStore().get_state("live_config_override", None)
-        except Exception:
-            cfg = None
+        if isinstance(store_data, dict) and store_data:
+            cfg = store_data
     if not isinstance(cfg, dict) or not cfg:
         return tuple([no_update] * 44)
     return (
@@ -899,6 +906,43 @@ def _live_config_from_controls(strategy_profile, settings_preset, preset, custom
     }
 
 
+def _save_live_config_to_shared_db(cfg: dict) -> str:
+    """Persist dashboard settings to the shared database used by Render worker.
+
+    The worker reads live_config_override on every run_once(), so this is the
+    authoritative save path for deployed live trading.  We also keep a compact
+    settings.live copy for status/report code that already reads the older
+    settings key.
+    """
+    store = LiveStore()
+    store.set_state("live_config_override", cfg)
+    store.set_state("settings", {"live": cfg})
+    return str(cfg.get("applied_at_utc") or "")
+
+
+@app.callback(
+    Output("live-action-status", "children", allow_duplicate=True),
+    Output("live-settings-store", "data", allow_duplicate=True),
+    Input("strategy-profile", "value"), Input("settings-preset", "value"), Input("preset", "value"), Input("custom-symbols", "value"), Input("feed", "value"), Input("backtest-session-mode", "value"),
+    Input("live-quality-gate", "value"), Input("quality-start-time", "value"), Input("quality-end-time", "value"),
+    Input("quality-min-rvol", "value"), Input("quality-min-daily-atr", "value"), Input("quality-min-dir-rs", "value"), Input("quality-max-dir-rs", "value"),
+    Input("quality-min-dir-open-rs", "value"), Input("quality-max-dir-open-rs", "value"),
+    Input("quality-min-dir-vwap", "value"), Input("quality-max-dir-vwap", "value"), Input("quality-max-abs-vwap", "value"),
+    Input("account-value", "value"), Input("risk-dollars-v12", "value"), Input("risk-mode", "value"), Input("base-risk-pct", "value"), Input("min-risk-dollars", "value"), Input("max-risk-dollars", "value"), Input("dd1-risk-pct", "value"), Input("dd2-risk-pct", "value"), Input("pause-dd-pct", "value"),
+    Input("min-score", "value"), Input("max-trades", "value"), Input("slippage-bps", "value"), Input("use-news", "value"), Input("candle-mode", "value"),
+    Input("macro-filter", "value"), Input("stress-filter", "value"), Input("news-filter", "value"), Input("qqq-stress-threshold", "value"), Input("kill-switch", "value"), Input("enable-mr", "value"), Input("enable-or", "value"), Input("direction-mode", "value"),
+    Input("live-entry-start-time", "value"), Input("live-entry-end-time", "value"), Input("live-require-market-open", "value"), Input("live-allow-extended-hours", "value"), Input("live-enable-max-hold-exit", "value"),
+    prevent_initial_call=True,
+)
+def autosave_live_settings_to_shared_db(strategy_profile, settings_preset, preset, custom_symbols, feed, backtest_session_mode, live_quality_gate, quality_start_time, quality_end_time, quality_min_rvol, quality_min_daily_atr, quality_min_dir_rs, quality_max_dir_rs, quality_min_dir_open_rs, quality_max_dir_open_rs, quality_min_dir_vwap, quality_max_dir_vwap, quality_max_abs_vwap, account_value, risk_dollars, risk_mode, base_risk_pct, min_risk_dollars, max_risk_dollars, dd1_risk_pct, dd2_risk_pct, pause_dd_pct, min_score, max_trades, slippage_bps, use_news, candle_mode, macro_filter, stress_filter, news_filter, qqq_stress_threshold, kill_switch, enable_mr, enable_or, direction_mode, live_entry_start_time, live_entry_end_time, live_require_market_open, live_allow_extended_hours, live_enable_max_hold_exit):
+    cfg = _live_config_from_controls(strategy_profile, settings_preset, preset, custom_symbols, feed, backtest_session_mode, live_quality_gate, quality_start_time, quality_end_time, quality_min_rvol, quality_min_daily_atr, quality_min_dir_rs, quality_max_dir_rs, quality_min_dir_open_rs, quality_max_dir_open_rs, quality_min_dir_vwap, quality_max_dir_vwap, quality_max_abs_vwap, account_value, risk_dollars, risk_mode, base_risk_pct, min_risk_dollars, max_risk_dollars, dd1_risk_pct, dd2_risk_pct, pause_dd_pct, min_score, max_trades, slippage_bps, use_news, candle_mode, macro_filter, stress_filter, news_filter, qqq_stress_threshold, kill_switch, enable_mr, enable_or, direction_mode, live_entry_start_time, live_entry_end_time, live_require_market_open, live_allow_extended_hours, live_enable_max_hold_exit)
+    try:
+        _save_live_config_to_shared_db(cfg)
+        return f"Saved live settings to database: strategy_variant={cfg['strategy_variant']}, preset={cfg['settings_preset']}, symbols={len(cfg['symbols'])}, max daily trades={cfg['max_daily_trades']}, entries {cfg['live_entry_start_time_et']}-{cfg['live_entry_end_time_et']} ET. Render worker will read this on its next scan.", cfg
+    except Exception as exc:
+        return f"Could not save live settings to database, but kept them in this browser: {exc}", cfg
+
+
 @app.callback(
     Output("live-action-status", "children"),
     Output("live-report-download", "data"),
@@ -927,11 +971,11 @@ def live_actions(apply_clicks, report_clicks, strategy_profile, settings_preset,
     if trigger == "apply-live-settings-btn":
         cfg = _live_config_from_controls(strategy_profile, settings_preset, preset, custom_symbols, feed, backtest_session_mode, live_quality_gate, quality_start_time, quality_end_time, quality_min_rvol, quality_min_daily_atr, quality_min_dir_rs, quality_max_dir_rs, quality_min_dir_open_rs, quality_max_dir_open_rs, quality_min_dir_vwap, quality_max_dir_vwap, quality_max_abs_vwap, account_value, risk_dollars, risk_mode, base_risk_pct, min_risk_dollars, max_risk_dollars, dd1_risk_pct, dd2_risk_pct, pause_dd_pct, min_score, max_trades, slippage_bps, use_news, candle_mode, macro_filter, stress_filter, news_filter, qqq_stress_threshold, kill_switch, enable_mr, enable_or, direction_mode, live_entry_start_time, live_entry_end_time, live_require_market_open, live_allow_extended_hours, live_enable_max_hold_exit)
         try:
-            LiveStore().set_state("live_config_override", cfg)
-            return f"Applied live worker settings: strategy_variant={cfg['strategy_variant']}, gate={cfg['live_quality_gate']}, symbols={len(cfg['symbols'])}, max daily trades={cfg['max_daily_trades']}, live entries {cfg['live_entry_start_time_et']}-{cfg['live_entry_end_time_et']} ET. The Render worker will pick this up on its next scan if it shares DATABASE_URL.", no_update, cfg
+            _save_live_config_to_shared_db(cfg)
+            return f"Applied and saved live worker settings to database: strategy_variant={cfg['strategy_variant']}, gate={cfg['live_quality_gate']}, symbols={len(cfg['symbols'])}, max daily trades={cfg['max_daily_trades']}, live entries {cfg['live_entry_start_time_et']}-{cfg['live_entry_end_time_et']} ET. The Render worker reads this database config on every scan.", no_update, cfg
         except Exception as exc:
             # Still persist in this browser so a database issue does not make the UI forget values on refresh.
-            return f"Saved settings in browser, but could not write shared live worker settings: {exc}", no_update, cfg
+            return f"Saved settings in browser, but could not write shared live worker settings to database: {exc}", no_update, cfg
     return no_update, no_update, no_update
 
 
