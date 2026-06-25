@@ -40,17 +40,23 @@ class LiveStore:
     the same live account, order, signal-plan, and position state.
     """
 
-    def __init__(self, database_url: str | None = None):
+    def __init__(self, database_url: str | None = None, initialize_schema: bool = True):
         self.database_url = _coerce_database_url(database_url or os.getenv("DATABASE_URL"))
         self.is_postgres = self.database_url.startswith("postgresql://")
         self.sqlite_path: Path | None = None
+        self._state_table_checked = False
         if not self.is_postgres:
             if self.database_url.startswith("sqlite:///"):
                 self.sqlite_path = Path(self.database_url.replace("sqlite:///", "", 1))
             else:
                 self.sqlite_path = PROJECT_ROOT / "data" / "live_trading" / "live_trading.sqlite3"
             self.sqlite_path.parent.mkdir(parents=True, exist_ok=True)
-        self.initialize()
+        # The full schema/index migration can be expensive on a live Render DB.
+        # Worker/report code still uses the default full initialization.
+        # Dashboard settings load/save uses initialize_schema=False so the page
+        # cannot get stuck on Dash "Updating..." while indexes/migrations run.
+        if initialize_schema:
+            self.initialize()
 
     @contextmanager
     def connect(self):
@@ -59,7 +65,12 @@ class LiveStore:
                 import psycopg2
             except Exception as exc:  # pragma: no cover
                 raise RuntimeError("DATABASE_URL is Postgres, but psycopg2-binary is not installed.") from exc
-            conn = psycopg2.connect(self.database_url, connect_timeout=int(os.getenv("DB_CONNECT_TIMEOUT", "5")), application_name=os.getenv("RENDER_SERVICE_NAME", "alpaca-dashboard"))
+            conn = psycopg2.connect(
+                self.database_url,
+                connect_timeout=int(os.getenv("DB_CONNECT_TIMEOUT", "5")),
+                application_name=os.getenv("RENDER_SERVICE_NAME", "alpaca-dashboard"),
+                options=f"-c statement_timeout={int(os.getenv('DB_STATEMENT_TIMEOUT_MS', '5000'))}",
+            )
             conn.autocommit = True
             try:
                 yield conn
@@ -640,7 +651,22 @@ class LiveStore:
             ],
         )
 
+    def _ensure_state_table(self) -> None:
+        if self._state_table_checked:
+            return
+        self._execute(
+            """
+            CREATE TABLE IF NOT EXISTS live_worker_state (
+                key TEXT PRIMARY KEY,
+                value_json TEXT,
+                updated_at_utc TEXT NOT NULL
+            )
+            """
+        )
+        self._state_table_checked = True
+
     def set_state(self, key: str, value: Any) -> None:
+        self._ensure_state_table()
         ph = self._ph()
         sql = f"""
             INSERT INTO live_worker_state (key, value_json, updated_at_utc) VALUES ({ph},{ph},{ph})
@@ -648,15 +674,24 @@ class LiveStore:
         """
         self._execute(sql, [key, _json_dumps(value), utc_now_iso()])
 
-    def get_state(self, key: str, default: Any = None) -> Any:
+    def get_state_row(self, key: str) -> dict[str, Any] | None:
+        self._ensure_state_table()
         ph = self._ph()
-        rows = self._fetch(f"SELECT value_json FROM live_worker_state WHERE key={ph}", [key])
-        if not rows:
-            return default
+        rows = self._fetch(f"SELECT key, value_json, updated_at_utc FROM live_worker_state WHERE key={ph}", [key])
+        return rows[0] if rows else None
+
+    def get_state_with_updated_at(self, key: str, default: Any = None) -> tuple[Any, str | None]:
+        row = self.get_state_row(key)
+        if not row:
+            return default, None
         try:
-            return json.loads(rows[0].get("value_json") or "null")
+            return json.loads(row.get("value_json") or "null"), row.get("updated_at_utc")
         except Exception:
-            return default
+            return default, row.get("updated_at_utc")
+
+    def get_state(self, key: str, default: Any = None) -> Any:
+        value, _updated_at = self.get_state_with_updated_at(key, default)
+        return value
 
     def upsert_candidate_audit(self, record: dict[str, Any]) -> None:
         if not record:

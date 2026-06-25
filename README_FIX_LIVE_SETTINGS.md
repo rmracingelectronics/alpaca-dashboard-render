@@ -26,3 +26,11 @@ This bypasses Dash and shows whether the web service can read the database, hear
 ## Render service settings
 
 Both web and worker services must use the same `DATABASE_URL`. Rotate the DB password because it was pasted in chat.
+
+
+## V5 fix
+
+- Live settings load/save now uses `LiveStore(initialize_schema=False)` so the dashboard no longer runs full schema/index migrations during page load or settings save.
+- Added fast diagnostics: `/debug/live-state` and `/debug/db-ping`. These avoid large table scans and should return quickly.
+- Settings Apply now verifies the Postgres write by reading `live_config_override` back and comparing `applied_at_utc`; the UI confirmation is a real DB verification, not just a button condition.
+- Added Postgres `statement_timeout` default of 5000 ms to prevent a blocked DB statement from leaving Dash stuck forever.

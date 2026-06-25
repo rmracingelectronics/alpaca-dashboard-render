@@ -36,11 +36,11 @@ def healthz():
 
 @server.route("/debug/live-state")
 def debug_live_state():
-    """No-Dash diagnostic endpoint for Render.
+    """Fast no-Dash diagnostic endpoint.
 
-    Open /debug/live-state in the browser if the Dash page says Updating.
-    This route bypasses all Dash callbacks and directly checks the shared
-    database state used by both the dashboard and trading worker.
+    This route intentionally avoids full LiveStore schema initialization and
+    avoids large history queries.  It should open quickly even if the Dash UI is
+    stuck or the live tables are large.
     """
     out = {
         "ok": False,
@@ -56,26 +56,28 @@ def debug_live_state():
         },
     }
     try:
-        store = LiveStore()
+        store = LiveStore(initialize_schema=False)
         out["store"] = {"is_postgres": store.is_postgres}
         for key in ["live_config_override", "settings", "heartbeat", "market_clock"]:
-            out[key] = _safe_diag_value(store.get_state(key, None))
-        try:
-            out["recent_events"] = store.recent_events(20).to_dict("records")
-        except Exception as exc:
-            out["recent_events_error"] = str(exc)
-        try:
-            out["recent_plans"] = store.recent_signal_plans(10).to_dict("records")
-        except Exception as exc:
-            out["recent_plans_error"] = str(exc)
-        try:
-            out["recent_orders"] = store.recent_orders(10).to_dict("records")
-        except Exception as exc:
-            out["recent_orders_error"] = str(exc)
+            value, updated_at = store.get_state_with_updated_at(key, None)
+            out[key] = {"updated_at_utc": updated_at, "value": _safe_diag_value(value)}
         out["ok"] = True
     except Exception as exc:
         out["error"] = str(exc)
         out["traceback"] = traceback.format_exc()
+    return jsonify(out)
+
+
+@server.route("/debug/db-ping")
+def debug_db_ping():
+    out = {"ok": False, "database_url_present": bool(os.getenv("DATABASE_URL"))}
+    try:
+        store = LiveStore(initialize_schema=False)
+        store.set_state("debug_ping", {"at_utc": pd.Timestamp.now(tz="UTC").isoformat(), "service": os.getenv("RENDER_SERVICE_NAME", "unknown")})
+        value, updated_at = store.get_state_with_updated_at("debug_ping", None)
+        out.update({"ok": True, "is_postgres": store.is_postgres, "updated_at_utc": updated_at, "value": _safe_diag_value(value)})
+    except Exception as exc:
+        out.update({"ok": False, "error": str(exc), "traceback": traceback.format_exc()})
     return jsonify(out)
 
 
@@ -820,10 +822,12 @@ def load_saved_live_settings(n_intervals, store_data=None):
     # visually reverting a config that was already applied to the live worker.
     cfg = None
     try:
-        db_cfg = LiveStore().get_state("live_config_override", None)
+        db_cfg, db_updated_at = LiveStore(initialize_schema=False).get_state_with_updated_at("live_config_override", None)
         if isinstance(db_cfg, dict) and db_cfg:
             cfg = db_cfg
-    except Exception:
+            print(f"[dashboard] load_saved_live_settings db row updated_at={db_updated_at}", flush=True)
+    except Exception as exc:
+        print(f"[dashboard] load_saved_live_settings db error: {exc}", flush=True)
         cfg = None
     if not isinstance(cfg, dict) or not cfg:
         if isinstance(store_data, dict) and store_data:
@@ -832,7 +836,7 @@ def load_saved_live_settings(n_intervals, store_data=None):
         print("[dashboard] load_saved_live_settings no saved config", flush=True)
         return tuple([no_update] * 44)
     print(f"[dashboard] load_saved_live_settings loaded preset={cfg.get('settings_preset')} variant={cfg.get('strategy_variant')}", flush=True)
-    return (
+    values = (
         _cfg_value(cfg, "settings_preset", "best_qqq_news"),
         _cfg_value(cfg, "watchlist_preset", "v25_playbook"),
         _cfg_value(cfg, "custom_symbols", ""),
@@ -878,6 +882,8 @@ def load_saved_live_settings(n_intervals, store_data=None):
         _cfg_bool_string(cfg, "live_allow_extended_hours_entries", False),
         _cfg_bool_string(cfg, "live_enable_max_hold_exit", True),
     )
+    print("[dashboard] load_saved_live_settings ok", flush=True)
+    return values
 
 @app.callback(
     Output("live-metrics-row", "children"),
@@ -999,10 +1005,15 @@ def _save_live_config_to_shared_db(cfg: dict) -> str:
     settings.live copy for status/report code that already reads the older
     settings key.
     """
-    store = LiveStore()
+    store = LiveStore(initialize_schema=False)
     store.set_state("live_config_override", cfg)
     store.set_state("settings", {"live": cfg})
-    return str(cfg.get("applied_at_utc") or "")
+    saved, updated_at = store.get_state_with_updated_at("live_config_override", None)
+    if not isinstance(saved, dict):
+        raise RuntimeError("Postgres write verification failed: live_config_override row could not be read back.")
+    if str(saved.get("applied_at_utc")) != str(cfg.get("applied_at_utc")):
+        raise RuntimeError("Postgres write verification failed: applied_at_utc readback mismatch.")
+    return str(updated_at or cfg.get("applied_at_utc") or "")
 
 
 # Do not save every control keystroke to Postgres.
@@ -1041,11 +1052,13 @@ def live_actions(apply_clicks, report_clicks, strategy_profile, settings_preset,
     if trigger == "apply-live-settings-btn":
         cfg = _live_config_from_controls(strategy_profile, settings_preset, preset, custom_symbols, feed, backtest_session_mode, live_quality_gate, quality_start_time, quality_end_time, quality_min_rvol, quality_min_daily_atr, quality_min_dir_rs, quality_max_dir_rs, quality_min_dir_open_rs, quality_max_dir_open_rs, quality_min_dir_vwap, quality_max_dir_vwap, quality_max_abs_vwap, account_value, risk_dollars, risk_mode, base_risk_pct, min_risk_dollars, max_risk_dollars, dd1_risk_pct, dd2_risk_pct, pause_dd_pct, min_score, max_trades, slippage_bps, use_news, candle_mode, macro_filter, stress_filter, news_filter, qqq_stress_threshold, kill_switch, enable_mr, enable_or, direction_mode, live_entry_start_time, live_entry_end_time, live_require_market_open, live_allow_extended_hours, live_enable_max_hold_exit)
         try:
-            _save_live_config_to_shared_db(cfg)
-            return f"Applied and saved live worker settings to database: strategy_variant={cfg['strategy_variant']}, gate={cfg['live_quality_gate']}, symbols={len(cfg['symbols'])}, max daily trades={cfg['max_daily_trades']}, live entries {cfg['live_entry_start_time_et']}-{cfg['live_entry_end_time_et']} ET. The Render worker reads this database config on every scan.", no_update, cfg
+            saved_at = _save_live_config_to_shared_db(cfg)
+            print(f"[dashboard] live_actions saved verified at {saved_at}", flush=True)
+            return f"✅ Verified database save at {saved_at}. Live worker settings saved and read back from Postgres: strategy_variant={cfg['strategy_variant']}, gate={cfg['live_quality_gate']}, symbols={len(cfg['symbols'])}, max daily trades={cfg['max_daily_trades']}, live entries {cfg['live_entry_start_time_et']}-{cfg['live_entry_end_time_et']} ET. The Render worker reads live_config_override on every scan.", no_update, cfg
         except Exception as exc:
             # Still persist in this browser so a database issue does not make the UI forget values on refresh.
-            return f"Saved settings in browser, but could not write shared live worker settings to database: {exc}", no_update, cfg
+            print(f"[dashboard] live_actions save error: {exc}", flush=True)
+            return f"❌ Database save failed. The worker was NOT updated. Error: {exc}", no_update, cfg
     return no_update, no_update, no_update
 
 
