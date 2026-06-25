@@ -731,7 +731,7 @@ def _cfg_bool_string(cfg: dict, key: str, default: bool = False) -> str:
     Input("settings-load-interval", "n_intervals"),
     Input("live-settings-store", "modified_timestamp"),
     State("live-settings-store", "data"),
-    prevent_initial_call=False,
+    prevent_initial_call="initial_duplicate",
 )
 def load_saved_live_settings(n_intervals, store_modified_ts=None, store_data=None):
     cfg = None
