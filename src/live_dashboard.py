@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 import json
+import re
 import zipfile
 from typing import Any
 
@@ -87,6 +88,293 @@ def _json_loads_safe(value: Any) -> dict[str, Any]:
         return {}
 
 
+_STRATEGY_CID_RE = re.compile(r"^(rmv\d+|rm\d+)-([A-Z0-9.]+)-(\d{12})-([ls])", flags=re.IGNORECASE)
+
+
+def _parse_strategy_client_order_id(client_order_id: Any) -> dict[str, Any] | None:
+    cid = str(client_order_id or "").strip()
+    if not cid:
+        return None
+    match = _STRATEGY_CID_RE.match(cid)
+    if not match:
+        return None
+    _prefix, symbol, stamp, side_code = match.groups()
+    try:
+        ts_et = pd.Timestamp(datetime.strptime(stamp, "%Y%m%d%H%M"), tz="America/New_York")
+        signal_time_utc = ts_et.tz_convert("UTC").isoformat()
+        signal_time_et = ts_et.strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        signal_time_utc = ""
+        signal_time_et = ""
+    return {
+        "client_order_id": cid,
+        "symbol": symbol.upper(),
+        "strategy_side": "long" if side_code.lower() == "l" else "short",
+        "alpaca_side": "buy" if side_code.lower() == "l" else "sell",
+        "signal_time_utc": signal_time_utc,
+        "signal_time_et": signal_time_et,
+    }
+
+
+def _order_row_from_raw(raw: dict[str, Any], parent_order_id: str = "") -> dict[str, Any]:
+    """Convert an Alpaca raw order/leg JSON object into live_orders-like fields."""
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        "order_id": raw.get("id") or raw.get("order_id") or "",
+        "client_order_id": raw.get("client_order_id"),
+        "parent_order_id": raw.get("parent_order_id") or parent_order_id or None,
+        "symbol": str(raw.get("symbol") or "").upper(),
+        "side": raw.get("side"),
+        "type": raw.get("type") or raw.get("order_type"),
+        "order_class": raw.get("order_class"),
+        "qty": raw.get("qty"),
+        "filled_qty": raw.get("filled_qty"),
+        "limit_price": raw.get("limit_price"),
+        "stop_price": raw.get("stop_price"),
+        "filled_avg_price": raw.get("filled_avg_price"),
+        "status": raw.get("status"),
+        "time_in_force": raw.get("time_in_force"),
+        "submitted_at": raw.get("submitted_at"),
+        "filled_at": raw.get("filled_at"),
+        "expired_at": raw.get("expired_at"),
+        "canceled_at": raw.get("canceled_at"),
+        "created_at": raw.get("created_at"),
+        "updated_at": raw.get("updated_at"),
+        "raw_json": _json_dumps_for_diag(raw),
+    }
+
+
+def _json_dumps_for_diag(value: Any) -> str:
+    try:
+        return json.dumps(value, default=str, sort_keys=True)
+    except Exception:
+        return "{}"
+
+
+def _augment_orders_with_nested_legs(orders: pd.DataFrame) -> pd.DataFrame:
+    """Return order rows plus nested Alpaca bracket legs with parent_order_id restored.
+
+    Alpaca's nested order response often includes exit legs inside the parent
+    order JSON, but the leg objects do not always arrive with parent_order_id set.
+    Older dashboard code only joined exits by parent_order_id, so closed trades
+    looked like pending/open trades and P/L disappeared.  This reconstructs that
+    parent relationship from the raw nested JSON.
+    """
+    if orders is None or orders.empty:
+        return pd.DataFrame()
+    by_id: dict[str, dict[str, Any]] = {}
+    anonymous: list[dict[str, Any]] = []
+
+    def add_row(row: dict[str, Any]) -> None:
+        oid = str(row.get("order_id") or row.get("id") or "")
+        if oid:
+            old = by_id.get(oid, {})
+            merged = dict(old)
+            merged.update({k: v for k, v in row.items() if v not in (None, "", "\\N")})
+            if not merged.get("parent_order_id") and row.get("parent_order_id"):
+                merged["parent_order_id"] = row.get("parent_order_id")
+            by_id[oid] = merged
+        else:
+            anonymous.append(row)
+
+    for _, rec in orders.iterrows():
+        od = rec.to_dict()
+        add_row(od)
+        raw = _json_loads_safe(od.get("raw_json"))
+        parent_id = str(od.get("order_id") or raw.get("id") or "")
+        for leg in raw.get("legs") or []:
+            if isinstance(leg, dict):
+                add_row(_order_row_from_raw(leg, parent_order_id=parent_id))
+    rows = list(by_id.values()) + anonymous
+    return pd.DataFrame(rows)
+
+
+def _plans_from_strategy_orders(orders: pd.DataFrame) -> pd.DataFrame:
+    """Build fallback signal-plan rows from Alpaca orders when plan rows are absent.
+
+    This keeps older paper trades visible even if live_signal_plans was empty or
+    partially lost during a redesign/redeploy.  Only orders with our rm/rmv
+    strategy client_order_id shape are converted.
+    """
+    if orders is None or orders.empty:
+        return pd.DataFrame()
+    rows: list[dict[str, Any]] = []
+    for _, rec in orders.iterrows():
+        od = rec.to_dict()
+        parsed = _parse_strategy_client_order_id(od.get("client_order_id"))
+        if not parsed:
+            continue
+        status = str(od.get("status") or "")
+        qty = _safe_float(od.get("filled_qty"), _safe_float(od.get("qty"), 0.0))
+        ref = _safe_float(od.get("filled_avg_price"), _safe_float(od.get("limit_price"), _safe_float(od.get("stop_price"), 0.0)))
+        row = {
+            **parsed,
+            "submitted_at_utc": od.get("submitted_at") or od.get("created_at") or parsed.get("signal_time_utc"),
+            "max_hold_until_utc": "",
+            "trigger_type": "alpaca_order_history",
+            "candidate_score": "",
+            "qty": qty,
+            "entry_reference_price": ref,
+            "risk_per_share": "",
+            "risk_budget": "",
+            "stop_price": od.get("stop_price") or "",
+            "target_price": od.get("limit_price") or "",
+            "status": status or "alpaca_order_history",
+            "alpaca_order_id": od.get("order_id"),
+            "dry_run": 0,
+            "payload_json": _json_dumps_for_diag({"derived_from": "live_orders", "order": od}),
+            "strategy_variant": "",
+            "strategy_preset": "",
+            "strategy_profile": "",
+            "quality_gate": "",
+            "pattern_mode": "",
+            "selection_mode": "",
+            "realized_pl": "",
+            "realized_r": "",
+        }
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _opposite_alpaca_side(strategy_side: str) -> str:
+    return "sell" if str(strategy_side).lower() == "long" else "buy"
+
+
+def _find_fallback_exit_order(entry_order: dict[str, Any], orders: list[dict[str, Any]], strategy_side: str) -> dict[str, Any] | None:
+    """Find a filled opposite-side exit when parent_order_id was not preserved."""
+    if not entry_order:
+        return None
+    sym = str(entry_order.get("symbol") or "").upper()
+    entry_id = str(entry_order.get("order_id") or "")
+    wanted_side = _opposite_alpaca_side(strategy_side)
+    entry_ts = pd.to_datetime(entry_order.get("filled_at") or entry_order.get("submitted_at") or entry_order.get("created_at"), utc=True, errors="coerce")
+    candidates = []
+    for od in orders:
+        if str(od.get("order_id") or "") == entry_id:
+            continue
+        if str(od.get("symbol") or "").upper() != sym:
+            continue
+        if str(od.get("side") or "").lower() != wanted_side:
+            continue
+        if str(od.get("status") or "").lower() != "filled":
+            continue
+        if _safe_float(od.get("filled_qty"), 0.0) <= 0 or _safe_float(od.get("filled_avg_price"), 0.0) <= 0:
+            continue
+        od_ts = pd.to_datetime(od.get("filled_at") or od.get("updated_at") or od.get("submitted_at"), utc=True, errors="coerce")
+        if not pd.isna(entry_ts) and not pd.isna(od_ts) and od_ts < entry_ts:
+            continue
+        candidates.append(od)
+    candidates.sort(key=lambda x: str(x.get("filled_at") or x.get("updated_at") or x.get("submitted_at") or ""))
+    return candidates[-1] if candidates else None
+
+
+def _order_time(order: dict[str, Any], *fields: str) -> pd.Timestamp:
+    for field in fields:
+        value = order.get(field)
+        if value:
+            ts = pd.to_datetime(value, utc=True, errors="coerce")
+            if not pd.isna(ts):
+                return ts
+    return pd.NaT
+
+
+def _order_status(order: dict[str, Any]) -> str:
+    return str((order or {}).get("status") or "").lower()
+
+
+def _order_side(order: dict[str, Any]) -> str:
+    return str((order or {}).get("side") or "").lower()
+
+
+def _order_symbol(order: dict[str, Any]) -> str:
+    return str((order or {}).get("symbol") or "").upper()
+
+
+def _extract_raw_legs(order: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return child legs stored inside the raw Alpaca parent order JSON."""
+    raw = order.get("raw_json")
+    if not raw:
+        return []
+    payload = _json_loads_safe(raw)
+    legs = payload.get("legs") if isinstance(payload, dict) else None
+    if not isinstance(legs, list):
+        return []
+    parent_id = str(order.get("order_id") or payload.get("id") or "")
+    out: list[dict[str, Any]] = []
+    for leg in legs:
+        if not isinstance(leg, dict):
+            continue
+        row = {
+            "order_id": leg.get("id") or leg.get("order_id"),
+            "client_order_id": leg.get("client_order_id"),
+            "parent_order_id": leg.get("parent_order_id") or parent_id,
+            "symbol": leg.get("symbol") or order.get("symbol"),
+            "side": leg.get("side"),
+            "type": leg.get("type") or leg.get("order_type"),
+            "order_class": leg.get("order_class") or order.get("order_class"),
+            "qty": leg.get("qty"),
+            "filled_qty": leg.get("filled_qty"),
+            "limit_price": leg.get("limit_price"),
+            "stop_price": leg.get("stop_price"),
+            "filled_avg_price": leg.get("filled_avg_price"),
+            "status": leg.get("status"),
+            "time_in_force": leg.get("time_in_force"),
+            "submitted_at": leg.get("submitted_at"),
+            "filled_at": leg.get("filled_at"),
+            "expired_at": leg.get("expired_at"),
+            "canceled_at": leg.get("canceled_at"),
+            "created_at": leg.get("created_at"),
+            "updated_at": leg.get("updated_at"),
+            "raw_json": json.dumps(leg, default=str),
+        }
+        out.append(row)
+    return out
+
+
+def _infer_exit_order(entry_order: dict[str, Any] | None, plan: dict[str, Any], orders: pd.DataFrame, side: str, qty: float) -> dict[str, Any] | None:
+    """Find a filled exit when Alpaca did not provide parent_order_id on child legs.
+
+    Historical Render data shows Alpaca bracket exit legs can be returned with a
+    blank parent_order_id even though the parent order raw JSON includes the legs.
+    The old report paired exits only by parent_order_id, so previous filled paper
+    trades appeared as pending with blank P/L.  This fallback pairs by same symbol,
+    opposite side, filled status, and timestamp after the entry order.
+    """
+    if orders is None or orders.empty:
+        return None
+    sym = str(plan.get("symbol") or (entry_order or {}).get("symbol") or "").upper()
+    if not sym:
+        return None
+    wanted_side = "sell" if str(side).lower() == "long" else "buy"
+    entry_ts = _order_time(entry_order or {}, "filled_at", "submitted_at", "created_at", "updated_at")
+    if pd.isna(entry_ts):
+        entry_ts = pd.to_datetime(plan.get("submitted_at_utc") or plan.get("signal_time_utc"), utc=True, errors="coerce")
+    candidates: list[dict[str, Any]] = []
+    for _, row in orders.iterrows():
+        od = row.to_dict()
+        if str(od.get("order_id") or "") == str((entry_order or {}).get("order_id") or ""):
+            continue
+        if _order_symbol(od) != sym:
+            continue
+        if _order_side(od) != wanted_side:
+            continue
+        if _order_status(od) != "filled":
+            continue
+        fill_ts = _order_time(od, "filled_at", "updated_at", "submitted_at", "created_at")
+        if not pd.isna(entry_ts) and not pd.isna(fill_ts) and fill_ts < entry_ts:
+            continue
+        filled_qty = _safe_float(od.get("filled_qty"), _safe_float(od.get("qty"), 0.0))
+        if qty > 0 and filled_qty > 0 and abs(filled_qty - qty) / max(qty, 1.0) > 0.35:
+            # Avoid pairing an unrelated same-symbol order of a very different size.
+            continue
+        candidates.append(od)
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: str(x.get("filled_at") or x.get("updated_at") or x.get("submitted_at") or ""))
+    return candidates[0]
+
+
 def build_live_trade_report(days: int = 3650) -> pd.DataFrame:
     """Build an audit report of live/paper trades from the shared store.
 
@@ -95,7 +383,7 @@ def build_live_trade_report(days: int = 3650) -> pd.DataFrame:
     indicator context captured at entry.  Open trades show unrealized P/L;
     closed trades show realized P/L when filled exit legs are available.
     """
-    store = LiveStore()
+    store = LiveStore(initialize_schema=False)
     # For the live dashboard refresh, only a recent window is needed.  Full
     # historical exports still use the larger limits through days=3650.
     full_history = int(days or 0) >= 365
@@ -112,10 +400,11 @@ def build_live_trade_report(days: int = 3650) -> pd.DataFrame:
     if closed_positions is None:
         closed_positions = pd.DataFrame()
 
-    by_client = {}
-    by_order_id = {}
+    by_client: dict[str, dict[str, Any]] = {}
+    by_order_id: dict[str, dict[str, Any]] = {}
     children_by_parent: dict[str, list[dict[str, Any]]] = {}
     if not orders.empty:
+        extra_leg_rows: list[dict[str, Any]] = []
         for _, o in orders.iterrows():
             od = o.to_dict()
             oid = str(od.get("order_id") or "")
@@ -124,6 +413,20 @@ def build_live_trade_report(days: int = 3650) -> pd.DataFrame:
             if oid:
                 by_order_id[oid] = od
             if cid:
+                by_client[cid] = od
+            if parent:
+                children_by_parent.setdefault(parent, []).append(od)
+            extra_leg_rows.extend(_extract_raw_legs(od))
+        # Parent raw_json often contains legs with the parent relationship even
+        # when the child rows themselves have parent_order_id blank.  Add those
+        # extracted leg rows to the lookup maps without changing the DB.
+        for od in extra_leg_rows:
+            oid = str(od.get("order_id") or "")
+            cid = str(od.get("client_order_id") or "")
+            parent = str(od.get("parent_order_id") or "")
+            if oid and oid not in by_order_id:
+                by_order_id[oid] = od
+            if cid and cid not in by_client:
                 by_client[cid] = od
             if parent:
                 children_by_parent.setdefault(parent, []).append(od)
@@ -156,12 +459,17 @@ def build_live_trade_report(days: int = 3650) -> pd.DataFrame:
         entry_order_id = str((entry_order or {}).get("order_id") or plan.get("alpaca_order_id") or payload.get("alpaca_order_id") or "")
         entry_fill = _safe_float((entry_order or {}).get("filled_avg_price"), _safe_float(plan.get("entry_reference_price"), 0.0))
         qty = _safe_float((entry_order or {}).get("filled_qty"), _safe_float(plan.get("qty"), 0.0))
-        exit_orders = [x for x in children_by_parent.get(entry_order_id, []) if str(x.get("status", "")).lower() == "filled"]
-        exit_orders.sort(key=lambda x: str(x.get("filled_at") or x.get("updated_at") or ""))
+        exit_orders = [x for x in children_by_parent.get(entry_order_id, []) if _order_status(x) == "filled"]
+        if not exit_orders:
+            inferred = _infer_exit_order(entry_order, plan, orders, side, qty)
+            if inferred:
+                exit_orders = [inferred]
+        exit_orders.sort(key=lambda x: str(x.get("filled_at") or x.get("updated_at") or x.get("submitted_at") or ""))
         exit_order = exit_orders[-1] if exit_orders else None
         exit_fill = _safe_float((exit_order or {}).get("filled_avg_price"), 0.0) if exit_order else 0.0
         realized_pl = None
         realized_r = None
+        entry_status = _order_status(entry_order or {})
         status = str(plan.get("status") or payload.get("status") or "planned")
         exit_time = (exit_order or {}).get("filled_at") or (exit_order or {}).get("updated_at") or ""
         if exit_order and qty > 0 and entry_fill > 0 and exit_fill > 0:
@@ -169,6 +477,11 @@ def build_live_trade_report(days: int = 3650) -> pd.DataFrame:
             risk_budget = _safe_float(plan.get("risk_budget"), _safe_float(payload.get("risk_budget"), 0.0))
             realized_r = realized_pl / risk_budget if risk_budget > 0 else None
             status = "closed_filled_exit"
+        elif entry_status:
+            if entry_status == "filled":
+                status = "entry_filled_exit_unmatched"
+            else:
+                status = entry_status
         unrealized_pl = None
         if sym in open_by_symbol:
             unrealized_pl = _safe_float(open_by_symbol[sym].get("unrealized_pl"), 0.0)
@@ -236,15 +549,15 @@ def build_live_trade_report(days: int = 3650) -> pd.DataFrame:
         out = out.sort_values("submitted_at_utc", ascending=False)
     return out.reset_index(drop=True)
 
-
 def generate_live_report_zip(days: int = 3650) -> Path:
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     folder = REPORTS_DIR / f"live_paper_report_{ts}"
     folder.mkdir(parents=True, exist_ok=True)
-    store = LiveStore()
+    store = LiveStore(initialize_schema=False)
     trade_report = build_live_trade_report(days=days)
     candidate_audit = store.recent_candidate_audit(20000)
+    symbol_monitor = store.latest_symbol_monitor(1000)
     summary_rows = []
     if isinstance(trade_report, pd.DataFrame) and not trade_report.empty:
         pl = pd.to_numeric(trade_report.get("trade_pl_live", 0), errors="coerce").fillna(0.0)
@@ -266,6 +579,7 @@ def generate_live_report_zip(days: int = 3650) -> Path:
     tables = {
         "live_trade_report.csv": trade_report,
         "live_candidate_audit.csv": candidate_audit,
+        "live_symbol_monitor.csv": symbol_monitor,
         "live_report_summary.csv": pd.DataFrame(summary_rows),
         "live_signal_plans.csv": store.recent_signal_plans(5000),
         "live_orders.csv": store.recent_orders(10000),
@@ -288,6 +602,7 @@ def generate_live_report_zip(days: int = 3650) -> Path:
         "notes": [
             "live_trade_report.csv includes each paper/live strategy trade with strategy_variant, strategy_preset, quality_gate, realized/unrealized P/L, execution diagnostics, and signal-time indicators where captured.",
             "live_candidate_audit.csv includes accepted and rejected candidates with reject_reason and universal signal-time indicator fields for diagnosing any selected strategy.",
+            "live_symbol_monitor.csv is one row per configured live symbol with the latest indicator values, threshold checks, status and reason displayed in the Live Symbol Intelligence panel.",
             "This report is generated from the shared DATABASE_URL live store, so it works on Render when the web and worker use the same database.",
         ],
     }
@@ -372,6 +687,63 @@ def format_orders(df: pd.DataFrame) -> pd.DataFrame:
     return _ensure_columns(out, ["updated_at_et", "symbol", "side", "type", "order_class", "status", "qty", "filled_qty", "limit_price", "stop_price", "filled_avg_price", "client_order_id", "order_id"])
 
 
+
+def _format_decimal(value: Any, places: int = 2, suffix: str = "") -> str:
+    try:
+        if value in (None, "") or pd.isna(value):
+            return ""
+        return f"{float(value):,.{places}f}{suffix}"
+    except Exception:
+        return ""
+
+
+def format_symbol_monitor(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=[
+            "symbol", "status", "bar_et", "checks", "close", "rvol", "daily_atr_%",
+            "day_rs", "open_rs", "vwap_atr", "score", "side", "trigger", "reason"
+        ])
+    out = df.copy()
+    if "latest_bar_time_et" in out.columns:
+        out["bar_et"] = out["latest_bar_time_et"].astype(str).str.replace("T", " ").str.slice(0, 16)
+    else:
+        out = _apply_time_columns(out, {"latest_bar_time_utc": "bar_et"})
+    out["status"] = out.get("monitor_status", "").astype(str)
+    out["checks"] = out.apply(lambda r: f"{int(_safe_float(r.get('checks_passed'), 0))}/{int(_safe_float(r.get('checks_total'), 0))}" if str(r.get("checks_total", "")) not in {"", "nan", "None"} else "", axis=1)
+    for src, dest, places, suffix in [
+        ("close_price", "close", 2, ""),
+        ("rvol_time_of_day", "rvol", 2, "x"),
+        ("daily_atr14_percent", "daily_atr_%", 2, "%"),
+        ("day_relative_strength", "day_rs", 2, ""),
+        ("open_relative_strength", "open_rs", 2, ""),
+        ("vwap_extension_atr", "vwap_atr", 2, " ATR"),
+        ("candidate_score", "score", 2, ""),
+    ]:
+        out[dest] = out[src].map(lambda x, p=places, s=suffix: _format_decimal(x, p, s)) if src in out.columns else ""
+    out["side"] = out.get("strategy_side", "").map(lambda x: "" if x in (None, "None") or pd.isna(x) else str(x)) if "strategy_side" in out.columns else ""
+    out["trigger"] = out.get("trigger_type", "").map(lambda x: "" if x in (None, "None") or pd.isna(x) else str(x).replace("v25_", "")) if "trigger_type" in out.columns else ""
+    out["gate"] = out.get("quality_gate", "").map(lambda x: "" if x in (None, "None") or pd.isna(x) else str(x)) if "quality_gate" in out.columns else ""
+    out["reason"] = out.get("check_summary", out.get("reject_reason", "")).map(lambda x: "" if x in (None, "None") or pd.isna(x) else str(x)[:180]) if ("check_summary" in out.columns or "reject_reason" in out.columns) else ""
+    cols = ["symbol", "status", "bar_et", "checks", "close", "rvol", "daily_atr_%", "day_rs", "open_rs", "vwap_atr", "score", "side", "trigger", "gate", "reason"]
+    return _ensure_columns(out, cols)
+
+
+def symbol_monitor_summary(df: pd.DataFrame, heartbeat: dict[str, Any] | None = None) -> str:
+    heartbeat = heartbeat or {}
+    if df is None or df.empty:
+        symbols = int(heartbeat.get("symbols", 0) or 0)
+        return f"No symbol monitor snapshots yet. Worker is configured for {symbols} symbols; the table fills after the next worker scan."
+    status = df.get("monitor_status", pd.Series([], dtype="object")).astype(str)
+    selected = int(status.str.contains("selected", case=False, na=False).sum())
+    candidates = int(status.str.contains("candidate", case=False, na=False).sum())
+    blocked = int(status.str.contains("blocked", case=False, na=False).sum())
+    watching = int(status.str.contains("watching", case=False, na=False).sum())
+    paused = int(status.str.contains("paused|waiting", case=False, na=False).sum())
+    updated = df.get("updated_at_utc", pd.Series([], dtype="object")).dropna()
+    last = _age_text(updated.max()) if not updated.empty else "unknown age"
+    configured = int(heartbeat.get("symbols", len(df)) or len(df))
+    return f"Monitoring {len(df)}/{configured} symbols. Selected/candidate: {selected + candidates}; blocked: {blocked}; watching: {watching}; paused/waiting: {paused}. Last symbol snapshot {last}."
+
 def format_events(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame(columns=["created_at_et", "event", "symbol", "strategy_side", "status", "message", "client_order_id"])
@@ -426,19 +798,44 @@ def load_live_paper_snapshot(days: int = 7) -> dict[str, Any]:
     the shared DATABASE_URL store instead of relying on a local file.
     """
     try:
-        store = LiveStore()
+        store = LiveStore(initialize_schema=False)
         snapshot = store.dashboard_snapshot()
+        settings = snapshot.get("settings") if isinstance(snapshot.get("settings"), dict) else {}
+        live_cfg = settings.get("live", {}) if isinstance(settings.get("live"), dict) else {}
+        configured_symbols = [str(s).upper() for s in (live_cfg.get("symbols") or []) if str(s).strip()]
+        if configured_symbols and isinstance(snapshot.get("symbol_monitor"), pd.DataFrame) and not snapshot["symbol_monitor"].empty and "symbol" in snapshot["symbol_monitor"].columns:
+            snapshot["symbol_monitor"] = snapshot["symbol_monitor"][snapshot["symbol_monitor"]["symbol"].astype(str).str.upper().isin(configured_symbols)].copy()
         snapshot["trade_report"] = build_live_trade_report(days=days)
         metrics = _metrics_from_snapshot(snapshot)
         heartbeat = snapshot.get("heartbeat") if isinstance(snapshot.get("heartbeat"), dict) else {}
+        counts = {
+            "plans": len(snapshot.get("plans")) if isinstance(snapshot.get("plans"), pd.DataFrame) else 0,
+            "orders": len(snapshot.get("orders")) if isinstance(snapshot.get("orders"), pd.DataFrame) else 0,
+            "trades": len(snapshot.get("trade_report")) if isinstance(snapshot.get("trade_report"), pd.DataFrame) else 0,
+            "events": len(snapshot.get("events")) if isinstance(snapshot.get("events"), pd.DataFrame) else 0,
+            "open_positions": len(snapshot.get("open_positions")) if isinstance(snapshot.get("open_positions"), pd.DataFrame) else 0,
+            "closed_positions": len(snapshot.get("closed_positions")) if isinstance(snapshot.get("closed_positions"), pd.DataFrame) else 0,
+            "symbol_monitor": len(snapshot.get("symbol_monitor")) if isinstance(snapshot.get("symbol_monitor"), pd.DataFrame) else 0,
+        }
         if heartbeat:
-            status = f"Live monitor refreshed {datetime.now(timezone.utc).astimezone().strftime('%Y-%m-%d %H:%M:%S')}. Worker status: {heartbeat.get('status', 'unknown')} ({_age_text(heartbeat.get('updated_at_utc'))})."
+            status = (
+                f"Live monitor refreshed {datetime.now(timezone.utc).astimezone().strftime('%Y-%m-%d %H:%M:%S')}. "
+                f"Worker status: {heartbeat.get('status', 'unknown')} ({_age_text(heartbeat.get('updated_at_utc'))}). "
+                f"Loaded {counts['trades']} trades, {counts['orders']} orders, {counts['plans']} signal plans, "
+                f"{counts['open_positions']} open positions, {counts['closed_positions']} closed positions, "
+                f"{counts['symbol_monitor']} symbol monitor rows, and {counts['events']} events from the shared DB."
+            )
         else:
-            status = "Live monitor is connected to the shared store, but the worker has not written a heartbeat yet."
+            status = (
+                "Live monitor is connected to the shared store, but the worker has not written a heartbeat yet. "
+                f"Loaded {counts['orders']} orders, {counts['plans']} signal plans and {counts['events']} events from the shared DB."
+            )
         return {
             "ok": True,
             "status": status,
             "metrics": metrics,
+            "symbol_monitor": format_symbol_monitor(snapshot.get("symbol_monitor", pd.DataFrame())),
+            "symbol_monitor_summary": symbol_monitor_summary(snapshot.get("symbol_monitor", pd.DataFrame()), heartbeat),
             "open_positions": format_open_positions(snapshot.get("open_positions", pd.DataFrame())),
             "plans": format_signal_plans(snapshot.get("plans", pd.DataFrame())),
             "orders": format_orders(snapshot.get("orders", pd.DataFrame())),
@@ -456,6 +853,8 @@ def load_live_paper_snapshot(days: int = 7) -> dict[str, Any]:
                 {"label": "Open Positions", "value": "--", "help": ""},
                 {"label": "Orders", "value": "--", "help": ""},
             ],
+            "symbol_monitor": pd.DataFrame(),
+            "symbol_monitor_summary": "Live symbol monitor unavailable because dashboard refresh failed.",
             "open_positions": pd.DataFrame(),
             "plans": pd.DataFrame(),
             "orders": pd.DataFrame(),

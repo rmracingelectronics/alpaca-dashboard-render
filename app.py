@@ -22,11 +22,88 @@ app = Dash(__name__, suppress_callback_exceptions=True, title="Alpaca Momentum D
 server = app.server
 
 
+def _sanitize_diag_value(value):
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            key = str(k).lower()
+            if "secret" in key or key in {"api_key", "key_id"}:
+                out[k] = "***"
+            elif key in {"account_id", "account_number", "id"} and isinstance(v, str) and len(v) > 4:
+                out[k] = "***" + v[-4:]
+            elif key in {"raw_json", "payload_json"}:
+                out[k] = "[omitted]"
+            else:
+                out[k] = _sanitize_diag_value(v)
+        return out
+    if isinstance(value, list):
+        return [_sanitize_diag_value(v) for v in value]
+    return value
+
+
 def _safe_diag_value(value):
     try:
-        return json.loads(json.dumps(value, default=str))
+        return json.loads(json.dumps(_sanitize_diag_value(value), default=str))
     except Exception:
         return str(value)
+
+
+def _df_preview(df, limit: int = 10):
+    try:
+        if df is None or getattr(df, "empty", True):
+            return {"count_loaded": 0, "rows": []}
+        clean = df.head(int(limit)).copy()
+        for col in ["raw_json", "payload_json"]:
+            if col in clean.columns:
+                clean = clean.drop(columns=[col])
+        for col in clean.columns:
+            if pd.api.types.is_datetime64_any_dtype(clean[col]):
+                clean[col] = clean[col].astype(str)
+        return {"count_loaded": int(len(df)), "rows": _safe_diag_value(clean.to_dict("records"))}
+    except Exception as exc:
+        return {"count_loaded": 0, "rows": [], "error": str(exc)}
+
+
+def _settings_snapshot_from_cfg(cfg: dict, existing_settings: dict | None = None) -> dict:
+    """Build the worker/report-compatible settings row without erasing Alpaca/risk info."""
+    existing = existing_settings if isinstance(existing_settings, dict) else {}
+    try:
+        alpaca = existing.get("alpaca") if isinstance(existing.get("alpaca"), dict) else AlpacaSettings().redacted()
+    except Exception:
+        alpaca = existing.get("alpaca", {}) if isinstance(existing, dict) else {}
+    live_existing = existing.get("live", {}) if isinstance(existing.get("live"), dict) else {}
+    risk_existing = existing.get("risk", {}) if isinstance(existing.get("risk"), dict) else {}
+    live = dict(live_existing)
+    live.update({
+        "enabled": bool(cfg.get("enabled", True)),
+        "dry_run": bool(cfg.get("dry_run", False)),
+        "feed": cfg.get("feed", live_existing.get("feed", os.getenv("ALPACA_FEED", "iex"))),
+        "symbols": cfg.get("symbols", live_existing.get("symbols", [])),
+        "strategy_variant": cfg.get("strategy_variant", live_existing.get("strategy_variant", "best_report_153601")),
+        "live_config_source": "dashboard_db",
+        "entry_start_time_et": cfg.get("live_entry_start_time_et", live_existing.get("entry_start_time_et", "09:35")),
+        "entry_end_time_et": cfg.get("live_entry_end_time_et", live_existing.get("entry_end_time_et", "15:55")),
+        "force_market_open": bool(cfg.get("live_require_market_open", live_existing.get("force_market_open", True))),
+        "allow_extended_hours_entries": bool(cfg.get("live_allow_extended_hours_entries", live_existing.get("allow_extended_hours_entries", False))),
+        "enable_max_hold_exit": bool(cfg.get("live_enable_max_hold_exit", live_existing.get("enable_max_hold_exit", True))),
+        "max_daily_trades": int(cfg.get("max_daily_trades", cfg.get("max_trades", live_existing.get("max_daily_trades", 1))) or 1),
+        "max_open_positions": int(cfg.get("max_open_positions", live_existing.get("max_open_positions", 1)) or 1),
+        "max_orders_per_symbol_per_day": int(cfg.get("max_orders_per_symbol_per_day", live_existing.get("max_orders_per_symbol_per_day", 1)) or 1),
+        "selection_mode": cfg.get("selection_mode", live_existing.get("selection_mode", "seen_so_far_top_n")),
+    })
+    risk = dict(risk_existing)
+    risk.update({
+        "position_sizing_mode": cfg.get("risk_mode", risk_existing.get("position_sizing_mode", "percent_equity")),
+        "fixed_risk_dollars": float(cfg.get("risk_dollars", risk_existing.get("fixed_risk_dollars", 100)) or 100),
+        "account_value_fallback": float(cfg.get("account_value", risk_existing.get("account_value_fallback", 10000)) or 10000),
+        "base_risk_pct": float(cfg.get("base_risk_pct", risk_existing.get("base_risk_pct", 1.0)) or 1.0),
+        "min_risk_dollars": float(cfg.get("min_risk_dollars", risk_existing.get("min_risk_dollars", 10)) or 10),
+        "max_risk_dollars": float(cfg.get("max_risk_dollars", risk_existing.get("max_risk_dollars", 300)) or 300),
+        "dd1_risk_pct": float(cfg.get("dd1_risk_pct", risk_existing.get("dd1_risk_pct", 0.75)) or 0.75),
+        "dd2_risk_pct": float(cfg.get("dd2_risk_pct", risk_existing.get("dd2_risk_pct", 0.50)) or 0.50),
+        "pause_dd_pct": float(cfg.get("pause_dd_pct", risk_existing.get("pause_dd_pct", 15)) or 15),
+    })
+    return {"live": live, "risk": risk, "alpaca": alpaca}
 
 
 @server.route("/healthz")
@@ -61,6 +138,10 @@ def debug_live_state():
         for key in ["live_config_override", "settings", "heartbeat", "market_clock"]:
             value, updated_at = store.get_state_with_updated_at(key, None)
             out[key] = {"updated_at_utc": updated_at, "value": _safe_diag_value(value)}
+        out["table_counts"] = {
+            name: store.table_count(name)
+            for name in ["live_account_snapshots", "live_positions", "live_orders", "live_signal_plans", "live_events", "live_candidate_audit", "live_symbol_monitor"]
+        }
         out["ok"] = True
     except Exception as exc:
         out["error"] = str(exc)
@@ -76,6 +157,105 @@ def debug_db_ping():
         store.set_state("debug_ping", {"at_utc": pd.Timestamp.now(tz="UTC").isoformat(), "service": os.getenv("RENDER_SERVICE_NAME", "unknown")})
         value, updated_at = store.get_state_with_updated_at("debug_ping", None)
         out.update({"ok": True, "is_postgres": store.is_postgres, "updated_at_utc": updated_at, "value": _safe_diag_value(value)})
+    except Exception as exc:
+        out.update({"ok": False, "error": str(exc), "traceback": traceback.format_exc()})
+    return jsonify(out)
+
+
+@server.route("/debug/live-data")
+@server.route("/debug/live-tables")
+@server.route("/debug/live-snapshot")
+def debug_live_data():
+    """No-Dash diagnostic endpoint for the live dashboard tables."""
+    out = {"ok": False, "service": os.getenv("RENDER_SERVICE_NAME", "unknown"), "database_url_present": bool(os.getenv("DATABASE_URL"))}
+    try:
+        from src.live_dashboard import build_live_trade_report
+        store = LiveStore(initialize_schema=False)
+        events = store.recent_events(25)
+        orders = store.recent_orders(50)
+        plans = store.recent_signal_plans(50)
+        open_positions = store.open_positions()
+        closed_positions = store.closed_positions(50)
+        account = store.latest_account()
+        trade_report = build_live_trade_report(days=3650)
+        symbol_monitor = store.latest_symbol_monitor(250)
+        out.update({
+            "ok": True,
+            "store": {"is_postgres": store.is_postgres},
+            "counts": {
+                "events_loaded": int(len(events)),
+                "orders_loaded": int(len(orders)),
+                "signal_plans_loaded": int(len(plans)),
+                "open_positions_loaded": int(len(open_positions)),
+                "closed_positions_loaded": int(len(closed_positions)),
+                "account_snapshots_loaded": int(len(account)),
+                "trade_report_rows": int(len(trade_report)),
+                "symbol_monitor_rows": int(len(symbol_monitor)),
+            },
+            "latest_account": _df_preview(account, 3),
+            "recent_signal_plans": _df_preview(plans, 10),
+            "recent_orders": _df_preview(orders, 10),
+            "live_trade_report": _df_preview(trade_report, 10),
+            "symbol_monitor": _df_preview(symbol_monitor, 50),
+            "recent_events": _df_preview(events, 10),
+        })
+    except Exception as exc:
+        out.update({"ok": False, "error": str(exc), "traceback": traceback.format_exc()})
+    return jsonify(out)
+
+
+@server.route("/debug/live-symbol-monitor")
+def debug_live_symbol_monitor():
+    """No-Dash diagnostic endpoint for the professional Live Symbol Intelligence panel."""
+    out = {"ok": False, "service": os.getenv("RENDER_SERVICE_NAME", "unknown"), "database_url_present": bool(os.getenv("DATABASE_URL"))}
+    try:
+        store = LiveStore(initialize_schema=False)
+        cfg = store.get_state("live_config_override", {}) or {}
+        heartbeat = store.get_state("heartbeat", {}) or {}
+        monitor = store.latest_symbol_monitor(250)
+        out.update({
+            "ok": True,
+            "store": {"is_postgres": store.is_postgres},
+            "configured_symbols": cfg.get("symbols") or heartbeat.get("symbols"),
+            "heartbeat": _safe_diag_value(heartbeat),
+            "symbol_monitor": _df_preview(monitor, 250),
+        })
+    except Exception as exc:
+        out.update({"ok": False, "error": str(exc), "traceback": traceback.format_exc()})
+    return jsonify(out)
+
+
+@server.route("/debug/alpaca-connection")
+def debug_alpaca_connection():
+    """Verify the Alpaca trading API from the web service without exposing secrets."""
+    out = {
+        "ok": False,
+        "alpaca_env_present": {
+            "ALPACA_API_KEY": bool(os.getenv("ALPACA_API_KEY")),
+            "ALPACA_SECRET_KEY": bool(os.getenv("ALPACA_SECRET_KEY")),
+            "ALPACA_TRADING_BASE_URL": bool(os.getenv("ALPACA_TRADING_BASE_URL")),
+            "ALPACA_DATA_BASE_URL": bool(os.getenv("ALPACA_DATA_BASE_URL")),
+            "ALPACA_FEED": os.getenv("ALPACA_FEED", ""),
+        },
+    }
+    try:
+        from src.alpaca_trading import AlpacaTradingClient
+        settings = AlpacaSettings()
+        out["configured"] = bool(settings.is_configured)
+        out["trading_base_url"] = str(settings.trading_base_url)
+        if not settings.is_configured:
+            out["error"] = "Missing ALPACA_API_KEY or ALPACA_SECRET_KEY."
+            return jsonify(out)
+        account = AlpacaTradingClient(settings).get_account()
+        account_id = str(account.get("account_number") or account.get("id") or "")
+        out.update({
+            "ok": True,
+            "paper_endpoint": "paper-api" in str(settings.trading_base_url).lower(),
+            "account_status": account.get("status"),
+            "account_id_last4": account_id[-4:] if account_id else "",
+            "equity_present": bool(account.get("equity")),
+            "buying_power_present": bool(account.get("buying_power")),
+        })
     except Exception as exc:
         out.update({"ok": False, "error": str(exc), "traceback": traceback.format_exc()})
     return jsonify(out)
@@ -170,6 +350,41 @@ def table_card(title: str, subtitle: str, table_id: str, page_size: int = 10, fi
                 style_table={"overflowX": "auto"},
                 style_cell={"textAlign": "left", "padding": "10px", "fontFamily": "Inter, Arial", "fontSize": "12px"},
                 style_header={"fontWeight": "700", "backgroundColor": "#f8fafc"},
+            ),
+        ],
+    )
+
+
+def symbol_monitor_card() -> html.Div:
+    return html.Div(
+        className="card symbol-monitor-card",
+        children=[
+            html.Div(
+                className="section-head",
+                children=[
+                    html.Div(children=[html.H3("Live Symbol Intelligence"), html.Span("One lightweight row per monitored symbol: latest closed bar, strategy gate, indicator readings and pass/fail checks.")]),
+                    html.Div(className="intel-legend", children=[html.Span("Selected"), html.Span("Candidate"), html.Span("Blocked"), html.Span("Watching")]),
+                ],
+            ),
+            html.Div(className="symbol-intel-intro", children=[
+                html.Div(id="live-symbol-monitor-summary", className="symbol-intel-summary", children="Symbol monitor will populate after the worker writes its next scan."),
+            ]),
+            dash_table.DataTable(
+                id="live-symbol-monitor-table",
+                page_size=16,
+                sort_action="native",
+                filter_action="native",
+                fixed_rows={"headers": True},
+                style_table={"overflowX": "auto", "maxHeight": "520px", "overflowY": "auto"},
+                style_cell={"textAlign": "left", "padding": "9px 10px", "fontFamily": "Inter, Arial", "fontSize": "12px", "minWidth": "82px", "whiteSpace": "normal", "height": "auto"},
+                style_header={"fontWeight": "800", "backgroundColor": "#f8fafc", "borderBottom": "1px solid #e2e8f0"},
+                style_data_conditional=[
+                    {"if": {"filter_query": "{status} contains Selected"}, "backgroundColor": "#ecfdf5", "borderLeft": "4px solid #10b981"},
+                    {"if": {"filter_query": "{status} contains Candidate"}, "backgroundColor": "#eff6ff", "borderLeft": "4px solid #2563eb"},
+                    {"if": {"filter_query": "{status} contains Blocked"}, "backgroundColor": "#fff7ed", "borderLeft": "4px solid #f97316"},
+                    {"if": {"filter_query": "{status} contains Paused"}, "backgroundColor": "#f8fafc", "color": "#64748b"},
+                    {"if": {"filter_query": "{status} contains Waiting"}, "backgroundColor": "#f8fafc", "color": "#64748b"},
+                ],
             ),
         ],
     )
@@ -677,7 +892,7 @@ def live_tab():
         dcc.Interval(id="live-refresh-interval", interval=60_000, n_intervals=0),
         dcc.Download(id="live-report-download"),
         pro_card("Live Worker Controls", "Apply selected dashboard settings to Render and export live reports", [
-            html.Div(id="live-status", className="live-status", children="Live monitor loading..."),
+            html.Div(id="live-status", className="live-status", children="Open this Live tab or click Refresh live data now to load the shared Postgres/Alpaca paper history."),
             html.Div(className="form-grid four", children=[
                 field("Live entries from ET", dcc.Input(id="live-entry-start-time", value="09:35", type="text")),
                 field("Live entries until ET", dcc.Input(id="live-entry-end-time", value="15:55", type="text")),
@@ -689,6 +904,7 @@ def live_tab():
                 html.Div(className="subtle-note", children="These live schedule controls apply globally to every strategy before strategy-specific filters."),
             ]),
             html.Div(className="live-actions", children=[
+                html.Button("Refresh live data now", id="refresh-live-now-btn", n_clicks=0, className="secondary-btn action-btn"),
                 html.Button("Apply current settings to live worker", id="apply-live-settings-btn", n_clicks=0, className="primary-btn action-btn"),
                 html.Button("Generate live report ZIP", id="generate-live-report-btn", n_clicks=0, className="secondary-btn action-btn"),
                 html.A("Direct report download", href="/download-live-report.zip", className="secondary-link", target="_blank"),
@@ -696,6 +912,7 @@ def live_tab():
             html.Div(id="live-action-status", className="run-status"),
         ]),
         html.Div(id="live-metrics-row", className="metrics-grid compact-metrics"),
+        symbol_monitor_card(),
         table_card("Live / Paper Trade P&L", "Every strategy trade with realized/unrealized profit and the strategy/gate used", "live-trade-report-table", page_size=12, filterable=True),
         html.Div(className="grid-2", children=[
             table_card("Open Positions", "Positions currently open in Alpaca paper and synced by the worker", "live-positions-table", page_size=8, filterable=True),
@@ -887,6 +1104,8 @@ def load_saved_live_settings(n_intervals, store_data=None):
 
 @app.callback(
     Output("live-metrics-row", "children"),
+    Output("live-symbol-monitor-summary", "children"),
+    Output("live-symbol-monitor-table", "data"), Output("live-symbol-monitor-table", "columns"),
     Output("live-positions-table", "data"), Output("live-positions-table", "columns"),
     Output("live-plans-table", "data"), Output("live-plans-table", "columns"),
     Output("live-orders-table", "data"), Output("live-orders-table", "columns"),
@@ -894,13 +1113,18 @@ def load_saved_live_settings(n_intervals, store_data=None):
     Output("live-trade-report-table", "data"), Output("live-trade-report-table", "columns"),
     Output("live-events-table", "data"), Output("live-events-table", "columns"),
     Output("live-status", "children"),
+    Input("main-tabs", "value"),
+    Input("refresh-live-now-btn", "n_clicks"),
     Input("live-refresh-interval", "n_intervals"),
-    prevent_initial_call=True,
+    prevent_initial_call=False,
 )
-def refresh_live_paper_monitor(n_intervals):
-    print(f"[dashboard] refresh_live_paper_monitor start n={n_intervals}", flush=True)
+def refresh_live_paper_monitor(active_tab, refresh_clicks, n_intervals):
+    trigger = ctx.triggered_id
+    print(f"[dashboard] refresh_live_paper_monitor trigger={trigger} tab={active_tab} n={n_intervals}", flush=True)
+    if active_tab != "tab-live":
+        return tuple([no_update] * 17)
     try:
-        snapshot = load_live_paper_snapshot(days=7)
+        snapshot = load_live_paper_snapshot(days=3650)
         metrics = [metric_card(m.get("label", "Metric"), m.get("value", "--"), m.get("help", "")) for m in snapshot.get("metrics", [])]
         if not metrics:
             metrics = [
@@ -909,19 +1133,22 @@ def refresh_live_paper_monitor(n_intervals):
                 metric_card("Signal Plans", "--"),
                 metric_card("Worker", "--"),
             ]
+        monitor_summary = snapshot.get("symbol_monitor_summary", "Symbol monitor snapshot unavailable.")
+        monitor_data, monitor_cols = table_payload(snapshot.get("symbol_monitor", pd.DataFrame()))
         pos_data, pos_cols = table_payload(snapshot.get("open_positions", pd.DataFrame()))
         plan_data, plan_cols = table_payload(snapshot.get("plans", pd.DataFrame()))
         order_data, order_cols = table_payload(snapshot.get("orders", pd.DataFrame()))
         closed_data, closed_cols = table_payload(snapshot.get("closed_positions", pd.DataFrame()))
         live_trade_data, live_trade_cols = table_payload(snapshot.get("trade_report", pd.DataFrame()))
         event_data, event_cols = table_payload(snapshot.get("events", pd.DataFrame()))
-        print("[dashboard] refresh_live_paper_monitor ok", flush=True)
-        return metrics, pos_data, pos_cols, plan_data, plan_cols, order_data, order_cols, closed_data, closed_cols, live_trade_data, live_trade_cols, event_data, event_cols, snapshot.get("status", "Live paper monitor refreshed.")
+        print(f"[dashboard] refresh_live_paper_monitor ok monitor={len(monitor_data)} plans={len(plan_data)} orders={len(order_data)} trades={len(live_trade_data)} events={len(event_data)}", flush=True)
+        status_text = snapshot.get("status", "Live paper monitor refreshed.") + f" Loaded symbols={len(monitor_data)}, trades={len(live_trade_data)}, plans={len(plan_data)}, orders={len(order_data)}, events={len(event_data)}."
+        return metrics, monitor_summary, monitor_data, monitor_cols, pos_data, pos_cols, plan_data, plan_cols, order_data, order_cols, closed_data, closed_cols, live_trade_data, live_trade_cols, event_data, event_cols, status_text
     except Exception as exc:
         print(f"[dashboard] refresh_live_paper_monitor error: {exc}", flush=True)
         metrics = [metric_card("Live Monitor", "Error", str(exc)[:80]), metric_card("Open Positions", "--"), metric_card("Signal Plans", "--"), metric_card("Worker", "--")]
         blank = ([], [])
-        return metrics, *blank, *blank, *blank, *blank, *blank, *blank, f"Live paper monitor error: {exc}"
+        return metrics, "Live symbol monitor unavailable because dashboard refresh failed.", *blank, *blank, *blank, *blank, *blank, *blank, *blank, f"Live paper monitor error: {exc}"
 
 
 def _bool_from_dropdown(value) -> bool:
@@ -1000,14 +1227,15 @@ def _live_config_from_controls(strategy_profile, settings_preset, preset, custom
 def _save_live_config_to_shared_db(cfg: dict) -> str:
     """Persist dashboard settings to the shared database used by Render worker.
 
-    The worker reads live_config_override on every run_once(), so this is the
-    authoritative save path for deployed live trading.  We also keep a compact
-    settings.live copy for status/report code that already reads the older
-    settings key.
+    The real confirmation is: write live_config_override, read it back, and
+    verify the unique applied_at_utc token.  The settings row is merged rather
+    than overwritten so Alpaca/risk dashboard status is not erased by clicking
+    Apply.
     """
     store = LiveStore(initialize_schema=False)
+    existing_settings = store.get_state("settings", {})
     store.set_state("live_config_override", cfg)
-    store.set_state("settings", {"live": cfg})
+    store.set_state("settings", _settings_snapshot_from_cfg(cfg, existing_settings))
     saved, updated_at = store.get_state_with_updated_at("live_config_override", None)
     if not isinstance(saved, dict):
         raise RuntimeError("Postgres write verification failed: live_config_override row could not be read back.")
@@ -1054,7 +1282,9 @@ def live_actions(apply_clicks, report_clicks, strategy_profile, settings_preset,
         try:
             saved_at = _save_live_config_to_shared_db(cfg)
             print(f"[dashboard] live_actions saved verified at {saved_at}", flush=True)
-            return f"✅ Verified database save at {saved_at}. Live worker settings saved and read back from Postgres: strategy_variant={cfg['strategy_variant']}, gate={cfg['live_quality_gate']}, symbols={len(cfg['symbols'])}, max daily trades={cfg['max_daily_trades']}, live entries {cfg['live_entry_start_time_et']}-{cfg['live_entry_end_time_et']} ET. The Render worker reads live_config_override on every scan.", no_update, cfg
+            hb = LiveStore(initialize_schema=False).get_state("heartbeat", {}) or {}
+            worker_note = f" Worker heartbeat: {hb.get('status', 'unknown')} / source={hb.get('config_source', 'unknown')}." if isinstance(hb, dict) else ""
+            return f"✅ Verified database save at {saved_at}. Saved and read back from Postgres: strategy_variant={cfg['strategy_variant']}, gate={cfg['live_quality_gate']}, symbols={len(cfg['symbols'])}, max daily trades={cfg['max_daily_trades']}, live entries {cfg['live_entry_start_time_et']}-{cfg['live_entry_end_time_et']} ET.{worker_note}", no_update, cfg
         except Exception as exc:
             # Still persist in this browser so a database issue does not make the UI forget values on refresh.
             print(f"[dashboard] live_actions save error: {exc}", flush=True)

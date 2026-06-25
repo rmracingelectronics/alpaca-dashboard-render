@@ -239,6 +239,57 @@ class LiveStore:
                 payload_json TEXT
             )
             """,
+
+            """
+            CREATE TABLE IF NOT EXISTS live_symbol_monitor (
+                symbol TEXT PRIMARY KEY,
+                run_id TEXT,
+                updated_at_utc TEXT,
+                latest_bar_time_utc TEXT,
+                latest_bar_time_et TEXT,
+                session_date TEXT,
+                strategy_variant TEXT,
+                strategy_preset TEXT,
+                strategy_profile TEXT,
+                quality_gate TEXT,
+                pattern_mode TEXT,
+                selection_mode TEXT,
+                feed TEXT,
+                monitor_status TEXT,
+                decision_status TEXT,
+                reject_reason TEXT,
+                setup_signal INTEGER,
+                selected_signal INTEGER,
+                in_entry_window INTEGER,
+                liquidity_ok INTEGER,
+                score_ok INTEGER,
+                quality_gate_ok INTEGER,
+                candle_ok INTEGER,
+                checks_passed INTEGER,
+                checks_total INTEGER,
+                check_summary TEXT,
+                symbol_side_bias TEXT,
+                strategy_side TEXT,
+                trigger_type TEXT,
+                candidate_score REAL,
+                final_rank_score REAL,
+                close_price REAL,
+                volume REAL,
+                rvol_time_of_day REAL,
+                daily_atr14_percent REAL,
+                gap_percent REAL,
+                day_relative_strength REAL,
+                open_relative_strength REAL,
+                vwap_extension_atr REAL,
+                qqq_change_from_open REAL,
+                qqq_day_change_percent REAL,
+                atr5m14 REAL,
+                ema9 REAL,
+                ema20 REAL,
+                session_vwap REAL,
+                payload_json TEXT
+            )
+            """,
             f"""
             CREATE TABLE IF NOT EXISTS live_account_snapshots (
                 id {id_col},
@@ -273,6 +324,9 @@ class LiveStore:
             "CREATE INDEX IF NOT EXISTS idx_live_candidate_audit_time ON live_candidate_audit(candidate_time_utc)",
             "CREATE INDEX IF NOT EXISTS idx_live_candidate_audit_status ON live_candidate_audit(decision_status)",
             "CREATE INDEX IF NOT EXISTS idx_live_candidate_audit_symbol ON live_candidate_audit(symbol)",
+            "CREATE INDEX IF NOT EXISTS idx_live_symbol_monitor_updated ON live_symbol_monitor(updated_at_utc)",
+            "CREATE INDEX IF NOT EXISTS idx_live_symbol_monitor_status ON live_symbol_monitor(monitor_status)",
+            "CREATE INDEX IF NOT EXISTS idx_live_symbol_monitor_strategy ON live_symbol_monitor(strategy_variant, quality_gate)",
         ]
         for stmt in indexes:
             self._execute(stmt)
@@ -339,6 +393,53 @@ class LiveStore:
                 ("payload_json", "TEXT"),
                 ("message", "TEXT"),
             ],
+            "live_symbol_monitor": [
+                ("run_id", "TEXT"),
+                ("updated_at_utc", "TEXT"),
+                ("latest_bar_time_utc", "TEXT"),
+                ("latest_bar_time_et", "TEXT"),
+                ("session_date", "TEXT"),
+                ("strategy_variant", "TEXT"),
+                ("strategy_preset", "TEXT"),
+                ("strategy_profile", "TEXT"),
+                ("quality_gate", "TEXT"),
+                ("pattern_mode", "TEXT"),
+                ("selection_mode", "TEXT"),
+                ("feed", "TEXT"),
+                ("monitor_status", "TEXT"),
+                ("decision_status", "TEXT"),
+                ("reject_reason", "TEXT"),
+                ("setup_signal", "INTEGER"),
+                ("selected_signal", "INTEGER"),
+                ("in_entry_window", "INTEGER"),
+                ("liquidity_ok", "INTEGER"),
+                ("score_ok", "INTEGER"),
+                ("quality_gate_ok", "INTEGER"),
+                ("candle_ok", "INTEGER"),
+                ("checks_passed", "INTEGER"),
+                ("checks_total", "INTEGER"),
+                ("check_summary", "TEXT"),
+                ("symbol_side_bias", "TEXT"),
+                ("strategy_side", "TEXT"),
+                ("trigger_type", "TEXT"),
+                ("candidate_score", "REAL"),
+                ("final_rank_score", "REAL"),
+                ("close_price", "REAL"),
+                ("volume", "REAL"),
+                ("rvol_time_of_day", "REAL"),
+                ("daily_atr14_percent", "REAL"),
+                ("gap_percent", "REAL"),
+                ("day_relative_strength", "REAL"),
+                ("open_relative_strength", "REAL"),
+                ("vwap_extension_atr", "REAL"),
+                ("qqq_change_from_open", "REAL"),
+                ("qqq_day_change_percent", "REAL"),
+                ("atr5m14", "REAL"),
+                ("ema9", "REAL"),
+                ("ema20", "REAL"),
+                ("session_vwap", "REAL"),
+                ("payload_json", "TEXT"),
+            ],
             "live_candidate_audit": [
                 ("run_id", "TEXT"),
                 ("created_at_utc", "TEXT"),
@@ -396,6 +497,9 @@ class LiveStore:
             "CREATE INDEX IF NOT EXISTS idx_live_positions_open ON live_positions (is_open, symbol)",
             "CREATE INDEX IF NOT EXISTS idx_live_account_snapshots_id_desc ON live_account_snapshots (id DESC)",
             "CREATE INDEX IF NOT EXISTS idx_live_candidate_audit_updated ON live_candidate_audit (updated_at_utc, created_at_utc)",
+            "CREATE INDEX IF NOT EXISTS idx_live_symbol_monitor_updated_desc ON live_symbol_monitor (updated_at_utc DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_live_symbol_monitor_status_idx ON live_symbol_monitor (monitor_status)",
+            "CREATE INDEX IF NOT EXISTS idx_live_symbol_monitor_strategy_idx ON live_symbol_monitor (strategy_variant, quality_gate)",
         ]
         for sql in index_statements:
             try:
@@ -519,15 +623,32 @@ class LiveStore:
         self._execute(sql, [data[c] for c in cols])
 
     def upsert_orders_recursive(self, orders: Iterable[dict[str, Any]]) -> None:
-        for order in orders or []:
+        """Upsert Alpaca orders and nested bracket/OCO legs.
+
+        Alpaca's /orders?nested=true response often nests take-profit/stop legs
+        under the parent bracket order but does not populate parent_order_id on
+        each child leg.  Earlier dashboard builds saved those child legs with a
+        blank parent_order_id, which made the live trade report unable to pair
+        filled exits back to their entry order.  Preserve/repair that parent
+        relationship here for all future syncs.
+        """
+
+        def visit(order: dict[str, Any], parent_order_id: str | None = None) -> None:
             if not isinstance(order, dict):
-                continue
-            self.upsert_order(order)
-            legs = order.get("legs") or []
+                return
+            row = dict(order)
+            if parent_order_id and not row.get("parent_order_id"):
+                row["parent_order_id"] = parent_order_id
+            self.upsert_order(row)
+            oid = str(row.get("id") or row.get("order_id") or "") or parent_order_id
+            legs = row.get("legs") or []
             if isinstance(legs, list):
                 for leg in legs:
                     if isinstance(leg, dict):
-                        self.upsert_order(leg)
+                        visit(leg, oid)
+
+        for order in orders or []:
+            visit(order)
 
     def latest_plan_for_symbol(self, symbol: str) -> dict[str, Any] | None:
         ph = self._ph()
@@ -758,28 +879,161 @@ class LiveStore:
             except Exception:
                 pass
 
+
+    def upsert_symbol_monitor_snapshot(self, record: dict[str, Any]) -> None:
+        """Persist one lightweight per-symbol live indicator/decision snapshot.
+
+        The worker writes this table; the Dash app only reads it.  It is one row
+        per monitored symbol, so it stays small and safe to refresh on mobile.
+        """
+        if not record:
+            return
+        symbol = str(record.get("symbol") or "").upper().strip()
+        if not symbol:
+            return
+        ph = self._ph()
+        now = utc_now_iso()
+        data = {
+            "symbol": symbol,
+            "run_id": record.get("run_id"),
+            "updated_at_utc": record.get("updated_at_utc") or now,
+            "latest_bar_time_utc": record.get("latest_bar_time_utc"),
+            "latest_bar_time_et": record.get("latest_bar_time_et"),
+            "session_date": record.get("session_date"),
+            "strategy_variant": record.get("strategy_variant"),
+            "strategy_preset": record.get("strategy_preset"),
+            "strategy_profile": record.get("strategy_profile"),
+            "quality_gate": record.get("quality_gate"),
+            "pattern_mode": record.get("pattern_mode"),
+            "selection_mode": record.get("selection_mode"),
+            "feed": record.get("feed"),
+            "monitor_status": record.get("monitor_status"),
+            "decision_status": record.get("decision_status"),
+            "reject_reason": record.get("reject_reason"),
+            "setup_signal": int(bool(record.get("setup_signal"))) if record.get("setup_signal") is not None else None,
+            "selected_signal": int(bool(record.get("selected_signal"))) if record.get("selected_signal") is not None else None,
+            "in_entry_window": int(bool(record.get("in_entry_window"))) if record.get("in_entry_window") is not None else None,
+            "liquidity_ok": int(bool(record.get("liquidity_ok"))) if record.get("liquidity_ok") is not None else None,
+            "score_ok": int(bool(record.get("score_ok"))) if record.get("score_ok") is not None else None,
+            "quality_gate_ok": int(bool(record.get("quality_gate_ok"))) if record.get("quality_gate_ok") is not None else None,
+            "candle_ok": int(bool(record.get("candle_ok"))) if record.get("candle_ok") is not None else None,
+            "checks_passed": record.get("checks_passed"),
+            "checks_total": record.get("checks_total"),
+            "check_summary": record.get("check_summary"),
+            "symbol_side_bias": record.get("symbol_side_bias"),
+            "strategy_side": record.get("strategy_side"),
+            "trigger_type": record.get("trigger_type"),
+            "candidate_score": self._float_or_none(record.get("candidate_score")),
+            "final_rank_score": self._float_or_none(record.get("final_rank_score")),
+            "close_price": self._float_or_none(record.get("close_price")),
+            "volume": self._float_or_none(record.get("volume")),
+            "rvol_time_of_day": self._float_or_none(record.get("rvol_time_of_day")),
+            "daily_atr14_percent": self._float_or_none(record.get("daily_atr14_percent")),
+            "gap_percent": self._float_or_none(record.get("gap_percent")),
+            "day_relative_strength": self._float_or_none(record.get("day_relative_strength")),
+            "open_relative_strength": self._float_or_none(record.get("open_relative_strength")),
+            "vwap_extension_atr": self._float_or_none(record.get("vwap_extension_atr")),
+            "qqq_change_from_open": self._float_or_none(record.get("qqq_change_from_open")),
+            "qqq_day_change_percent": self._float_or_none(record.get("qqq_day_change_percent")),
+            "atr5m14": self._float_or_none(record.get("atr5m14")),
+            "ema9": self._float_or_none(record.get("ema9")),
+            "ema20": self._float_or_none(record.get("ema20")),
+            "session_vwap": self._float_or_none(record.get("session_vwap")),
+            "payload_json": _json_dumps(record.get("payload", record)),
+        }
+        cols = list(data.keys())
+        placeholders = ",".join([ph] * len(cols))
+        update_cols = [c for c in cols if c != "symbol"]
+        sql = f"""
+            INSERT INTO live_symbol_monitor ({','.join(cols)}) VALUES ({placeholders})
+            ON CONFLICT(symbol) DO UPDATE SET {','.join([f'{c}=excluded.{c}' for c in update_cols])}
+        """
+        self._execute(sql, [data[c] for c in cols])
+
+    def upsert_symbol_monitor_snapshots(self, records: Iterable[dict[str, Any]]) -> None:
+        for rec in records or []:
+            try:
+                self.upsert_symbol_monitor_snapshot(rec)
+            except Exception:
+                pass
+
+    def _fetch_df(self, sql: str, params: Iterable[Any] | None = None, columns: list[str] | None = None) -> pd.DataFrame:
+        """Fetch a DataFrame, returning an empty frame if a live table is not created yet.
+
+        The web dashboard can use LiveStore(initialize_schema=False) so page load
+        never blocks on schema/index migrations.  On a brand-new Render database
+        the worker may not have created all live_* tables yet; the dashboard should
+        show empty sections instead of failing the whole page.
+        """
+        try:
+            return pd.DataFrame(self._fetch(sql, params))
+        except Exception as exc:
+            msg = str(exc).lower()
+            if "does not exist" in msg or "no such table" in msg or "undefinedtable" in msg:
+                return pd.DataFrame(columns=columns or [])
+            raise
+
+    def table_count(self, table: str) -> int | None:
+        allowed = {
+            "live_events",
+            "live_positions",
+            "live_orders",
+            "live_signal_plans",
+            "live_account_snapshots",
+            "live_worker_state",
+            "live_candidate_audit",
+            "live_symbol_monitor",
+        }
+        if table not in allowed:
+            raise ValueError(f"Unsupported table for count: {table}")
+        try:
+            rows = self._fetch(f"SELECT COUNT(*) AS n FROM {table}")
+            return int(rows[0].get("n", 0)) if rows else 0
+        except Exception as exc:
+            msg = str(exc).lower()
+            if "does not exist" in msg or "no such table" in msg or "undefinedtable" in msg:
+                return None
+            raise
+
     def recent_candidate_audit(self, limit: int = 10000) -> pd.DataFrame:
-        return pd.DataFrame(self._fetch(f"SELECT * FROM live_candidate_audit ORDER BY COALESCE(updated_at_utc, created_at_utc) DESC LIMIT {int(limit)}"))
+        return self._fetch_df(
+            f"SELECT * FROM live_candidate_audit ORDER BY COALESCE(updated_at_utc, created_at_utc) DESC LIMIT {int(limit)}"
+        )
+
+    def latest_symbol_monitor(self, limit: int = 250) -> pd.DataFrame:
+        cols = [
+            "symbol", "updated_at_utc", "latest_bar_time_utc", "latest_bar_time_et", "session_date",
+            "strategy_variant", "strategy_preset", "strategy_profile", "quality_gate", "pattern_mode",
+            "selection_mode", "feed", "monitor_status", "decision_status", "reject_reason",
+            "setup_signal", "selected_signal", "in_entry_window", "liquidity_ok", "score_ok",
+            "quality_gate_ok", "candle_ok", "checks_passed", "checks_total", "check_summary",
+            "symbol_side_bias", "strategy_side", "trigger_type", "candidate_score", "final_rank_score",
+            "close_price", "volume", "rvol_time_of_day", "daily_atr14_percent", "gap_percent",
+            "day_relative_strength", "open_relative_strength", "vwap_extension_atr", "qqq_change_from_open",
+            "qqq_day_change_percent", "atr5m14", "ema9", "ema20", "session_vwap", "payload_json",
+        ]
+        return self._fetch_df(
+            f"SELECT * FROM live_symbol_monitor ORDER BY symbol ASC LIMIT {int(limit)}",
+            columns=cols,
+        )
 
     def recent_events(self, limit: int = 100) -> pd.DataFrame:
-        rows = self._fetch(f"SELECT * FROM live_events ORDER BY id DESC LIMIT {int(limit)}")
-        return pd.DataFrame(rows)
+        return self._fetch_df(f"SELECT * FROM live_events ORDER BY id DESC LIMIT {int(limit)}")
 
     def open_positions(self) -> pd.DataFrame:
-        return pd.DataFrame(self._fetch("SELECT * FROM live_positions WHERE is_open=1 ORDER BY symbol"))
+        return self._fetch_df("SELECT * FROM live_positions WHERE is_open=1 ORDER BY symbol")
 
     def closed_positions(self, limit: int = 100) -> pd.DataFrame:
-        return pd.DataFrame(self._fetch(f"SELECT * FROM live_positions WHERE is_open=0 ORDER BY closed_at_utc DESC LIMIT {int(limit)}"))
+        return self._fetch_df(f"SELECT * FROM live_positions WHERE is_open=0 ORDER BY closed_at_utc DESC LIMIT {int(limit)}")
 
     def recent_orders(self, limit: int = 100) -> pd.DataFrame:
-        return pd.DataFrame(self._fetch(f"SELECT * FROM live_orders ORDER BY COALESCE(updated_at, created_at, submitted_at) DESC LIMIT {int(limit)}"))
+        return self._fetch_df(f"SELECT * FROM live_orders ORDER BY COALESCE(updated_at, created_at, submitted_at) DESC LIMIT {int(limit)}")
 
     def recent_signal_plans(self, limit: int = 100) -> pd.DataFrame:
-        return pd.DataFrame(self._fetch(f"SELECT * FROM live_signal_plans ORDER BY submitted_at_utc DESC LIMIT {int(limit)}"))
+        return self._fetch_df(f"SELECT * FROM live_signal_plans ORDER BY submitted_at_utc DESC LIMIT {int(limit)}")
 
     def latest_account(self) -> pd.DataFrame:
-        rows = self._fetch("SELECT * FROM live_account_snapshots ORDER BY id DESC LIMIT 1")
-        return pd.DataFrame(rows)
+        return self._fetch_df("SELECT * FROM live_account_snapshots ORDER BY id DESC LIMIT 1")
 
     def dashboard_snapshot(self) -> dict[str, pd.DataFrame | Any]:
         return {
@@ -788,10 +1042,11 @@ class LiveStore:
             # it can become large and make the Dash page stay in "Updating".
             # Full audit rows are still included when generating the live report ZIP.
             "candidate_audit": pd.DataFrame(),
+            "symbol_monitor": self.latest_symbol_monitor(250),
             "open_positions": self.open_positions(),
             "closed_positions": self.closed_positions(100),
-            "orders": self.recent_orders(100),
-            "plans": self.recent_signal_plans(100),
+            "orders": self.recent_orders(500),
+            "plans": self.recent_signal_plans(500),
             "account": self.latest_account(),
             "heartbeat": self.get_state("heartbeat", {}),
             "settings": self.get_state("settings", {}),

@@ -881,6 +881,303 @@ class LivePaperTradingEngine:
             records.append(self._audit_record_from_signal(row, run_id, status, reason=reason, stage=stage, rank_before=int(idx) + 1))
         self.store.upsert_candidate_audits(records)
 
+
+    def _monitor_gate_prefix(self) -> str:
+        if bool(getattr(self.params, "enable_v358_live_quality_filter", False)):
+            return "v358"
+        if bool(getattr(self.params, "enable_v359_live_hunter_filter", False)):
+            return "v359"
+        if bool(getattr(self.params, "enable_v364_professional_momentum_filter", False)):
+            return "v364"
+        return ""
+
+    def _monitor_quality_gate_label(self) -> str:
+        return str(getattr(self.params, "live_quality_gate", "off") or "off")
+
+    def _monitor_bool(self, value: Any, default: bool = False) -> bool:
+        try:
+            if value is None or (isinstance(value, float) and math.isnan(value)):
+                return default
+            if isinstance(value, str):
+                return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+            return bool(value)
+        except Exception:
+            return default
+
+    def _monitor_num(self, row: pd.Series | dict[str, Any], key: str, default: float = 0.0) -> float:
+        try:
+            if isinstance(row, pd.Series):
+                return _safe_float(row.get(key), default)
+            return _safe_float(row.get(key), default)
+        except Exception:
+            return default
+
+    def _monitor_text(self, row: pd.Series | dict[str, Any], key: str, default: str = "") -> str:
+        try:
+            value = row.get(key) if isinstance(row, (pd.Series, dict)) else ""
+            if value is None or (isinstance(value, float) and math.isnan(value)):
+                return default
+            return str(value)
+        except Exception:
+            return default
+
+    def _monitor_check(self, name: str, value: Any, threshold: str, passed: bool | None, weight: str = "") -> dict[str, Any]:
+        return {"name": name, "value": value, "threshold": threshold, "passed": passed, "weight": weight}
+
+    def _symbol_monitor_base_config(self, symbol: str, run_id: str, status: str, reason: str = "") -> dict[str, Any]:
+        now = utc_now_iso()
+        return {
+            "symbol": str(symbol or "").upper(),
+            "run_id": run_id,
+            "updated_at_utc": now,
+            "strategy_variant": getattr(self.params, "live_strategy_variant", getattr(self.live, "strategy_variant", "best_report_153601")),
+            "strategy_preset": getattr(self.params, "live_strategy_preset", "env"),
+            "strategy_profile": str(getattr(self.params, "strategy_profile", "symbol_playbook_v25")),
+            "quality_gate": self._monitor_quality_gate_label(),
+            "pattern_mode": str(getattr(self.params, "v379_pattern_mode", "")),
+            "selection_mode": str(getattr(self.live, "selection_mode", "seen_so_far_top_n")),
+            "feed": str(getattr(self.live, "feed", "iex")),
+            "monitor_status": status,
+            "decision_status": "idle" if status.lower().startswith("paused") else "waiting",
+            "reject_reason": reason,
+            "setup_signal": 0,
+            "selected_signal": 0,
+            "in_entry_window": 0,
+            "checks_passed": 0,
+            "checks_total": 0,
+            "check_summary": reason or status,
+            "payload": {"reason": reason, "symbols_configured": len(self.live.symbols or [])},
+        }
+
+    def _idle_symbol_monitor_records(self, run_id: str, status: str, reason: str) -> list[dict[str, Any]]:
+        return [self._symbol_monitor_base_config(sym, run_id, status, reason) for sym in list(dict.fromkeys([s.upper() for s in (self.live.symbols or []) if s]))]
+
+    def _monitor_record_from_latest_row(self, row: pd.Series, run_id: str, closed_ts: pd.Timestamp) -> dict[str, Any]:
+        symbol = self._monitor_text(row, "symbol").upper()
+        ts = pd.to_datetime(row.get("timestamp"), utc=True, errors="coerce")
+        if pd.isna(ts):
+            ts = pd.Timestamp(closed_ts)
+        ts_et = ts.tz_convert("America/New_York")
+        side = self._monitor_text(row, "side").lower()
+        side_short = side == "short"
+        score = self._monitor_num(row, "score", self._monitor_num(row, "candidate_score", 0.0))
+        candidate_score = self._monitor_num(row, "candidate_score", score)
+        close_px = self._monitor_num(row, "close", 0.0)
+        rvol = self._monitor_num(row, "rvol_time_of_day", self._monitor_num(row, "rvol_tod", 0.0))
+        daily_atr = self._monitor_num(row, "daily_atr14_percent", 0.0)
+        gap_pct = self._monitor_num(row, "gap_percent", self._monitor_num(row, "gap_pct", 0.0))
+        rs = self._monitor_num(row, "day_relative_strength", 0.0)
+        ors = self._monitor_num(row, "open_relative_strength", 0.0)
+        vwap = self._monitor_num(row, "vwap_extension_atr", 0.0)
+        dir_rs = -rs if side_short else rs
+        dir_ors = -ors if side_short else ors
+        dir_vwap = -vwap if side_short else vwap
+        abs_vwap = abs(vwap)
+        trigger = self._monitor_text(row, "trigger_type")
+        setup_signal = bool(trigger) or self._monitor_bool(row.get("buy_alert"), False)
+        raw_alert = self._monitor_bool(row.get("buy_alert"), False)
+        in_window = _time_in_window(ts_et, getattr(self.live, "entry_start_time_et", "09:35"), getattr(self.live, "entry_end_time_et", "15:55"))
+        if not bool(getattr(self.live, "allow_extended_hours_entries", False)):
+            in_window = in_window and _time_in_window(ts_et, "09:30", "16:00")
+
+        liquidity_ok = self._monitor_bool(row.get("liquidity_filter"), True)
+        if "liquidity_filter" not in row.index:
+            avg20 = self._monitor_num(row, "avg_20d_dollar_volume", 0.0)
+            cur5 = self._monitor_num(row, "current_5m_dollar_volume", 0.0)
+            atr5 = self._monitor_num(row, "atr5m14", 0.0)
+            liquidity_ok = (
+                close_px >= float(getattr(self.params, "min_price", 0.0) or 0.0)
+                and avg20 >= float(getattr(self.params, "min_avg_20d_dollar_volume", 0.0) or 0.0)
+                and cur5 >= float(getattr(self.params, "min_current_5m_dollar_volume", 0.0) or 0.0)
+                and daily_atr >= float(getattr(self.params, "min_daily_atr_pct", 0.0) or 0.0)
+                and daily_atr <= float(getattr(self.params, "max_daily_atr_pct", 999.0) or 999.0)
+                and atr5 > 0
+            )
+        min_score = float(getattr(self.params, "min_candidate_score", 2.0) or 2.0)
+        score_ok = score >= min_score if setup_signal else False
+        candle_mode = str(getattr(self.params, "candle_pattern_mode", "selective") or "selective").lower()
+        if candle_mode == "off" or not setup_signal:
+            candle_ok = True
+        else:
+            candle_ok = self._monitor_bool(row.get("entry_candle_ok"), False)
+
+        gate = self._monitor_quality_gate_label()
+        prefix = self._monitor_gate_prefix()
+        quality_gate_ok = True
+        if prefix:
+            output_col = {"v358": "v358_live_quality_ok", "v359": "v359_live_hunter_ok", "v364": "v364_professional_momentum_ok"}.get(prefix, "")
+            quality_gate_ok = self._monitor_bool(row.get(output_col), False) if output_col else True
+        elif gate == "v377":
+            quality_gate_ok = self._monitor_bool(row.get("positive_context_profile_match"), False) if setup_signal else False
+        elif gate.startswith("v379") or gate.startswith("v38"):
+            quality_gate_ok = self._monitor_bool(row.get("v379_pattern_match"), False) if setup_signal else False
+
+        def rng(prefix_name: str, suffix: str, default: float) -> float:
+            return float(getattr(self.params, f"{prefix_name}_{suffix}", default) or default)
+
+        checks: list[dict[str, Any]] = []
+        checks.append(self._monitor_check("Setup", trigger or "none", "latest bar has strategy setup", setup_signal, "required"))
+        checks.append(self._monitor_check("Entry window", ts_et.strftime("%H:%M"), f"{self.live.entry_start_time_et}-{self.live.entry_end_time_et} ET", in_window, "required"))
+        checks.append(self._monitor_check("Liquidity", "ok" if liquidity_ok else "blocked", "price/volume/ATR floor", liquidity_ok, "required"))
+        checks.append(self._monitor_check("Candidate score", round(score, 3), f">= {min_score:g}", score_ok if setup_signal else None, "ranking"))
+        checks.append(self._monitor_check("RVOL", round(rvol, 3), f">= {float(getattr(self.params, 'v25_min_rvol', 0.75) or 0.75):g}", rvol >= float(getattr(self.params, "v25_min_rvol", 0.75) or 0.75), "setup"))
+        checks.append(self._monitor_check("Daily ATR %", round(daily_atr, 3), f"{float(getattr(self.params, 'min_daily_atr_pct', 0.0) or 0.0):g}..{float(getattr(self.params, 'max_daily_atr_pct', 999.0) or 999.0):g}", daily_atr >= float(getattr(self.params, "min_daily_atr_pct", 0.0) or 0.0) and daily_atr <= float(getattr(self.params, "max_daily_atr_pct", 999.0) or 999.0), "setup"))
+        if prefix:
+            checks.append(self._monitor_check("Gate RVOL", round(rvol, 3), f">= {rng(prefix, 'min_rvol', 1.0):g}", rvol >= rng(prefix, "min_rvol", 1.0), "gate"))
+            checks.append(self._monitor_check("Gate daily ATR %", round(daily_atr, 3), f">= {rng(prefix, 'min_daily_atr_pct', 0.0):g}", daily_atr >= rng(prefix, "min_daily_atr_pct", 0.0), "gate"))
+            checks.append(self._monitor_check("Directional RS", round(dir_rs, 3), f"{rng(prefix, 'min_directional_rs', -999.0):g}..{rng(prefix, 'max_directional_rs', 999.0):g}", dir_rs >= rng(prefix, "min_directional_rs", -999.0) and dir_rs <= rng(prefix, "max_directional_rs", 999.0), "gate"))
+            checks.append(self._monitor_check("Directional open RS", round(dir_ors, 3), f"{rng(prefix, 'min_directional_open_rs', -999.0):g}..{rng(prefix, 'max_directional_open_rs', 999.0):g}", dir_ors >= rng(prefix, "min_directional_open_rs", -999.0) and dir_ors <= rng(prefix, "max_directional_open_rs", 999.0), "gate"))
+            checks.append(self._monitor_check("Directional VWAP ATR", round(dir_vwap, 3), f"{rng(prefix, 'min_directional_vwap_extension_atr', -999.0):g}..{rng(prefix, 'max_directional_vwap_extension_atr', 999.0):g}", dir_vwap >= rng(prefix, "min_directional_vwap_extension_atr", -999.0) and dir_vwap <= rng(prefix, "max_directional_vwap_extension_atr", 999.0), "gate"))
+            checks.append(self._monitor_check("Abs VWAP ATR", round(abs_vwap, 3), f"<= {rng(prefix, 'max_abs_vwap_extension_atr', 999.0):g}", abs_vwap <= rng(prefix, "max_abs_vwap_extension_atr", 999.0), "gate"))
+        if gate == "v377":
+            checks.append(self._monitor_check("Positive profile", self._monitor_text(row, "positive_context_profile_name", "none"), "must match mined profile", quality_gate_ok, "gate"))
+        elif gate.startswith("v379") or gate.startswith("v38"):
+            checks.append(self._monitor_check("Pattern match", self._monitor_text(row, "v379_pattern_mode", gate), "must match decision pattern", quality_gate_ok, "gate"))
+        checks.append(self._monitor_check("Quality gate", gate, "selected gate passes", quality_gate_ok if setup_signal else None, "gate"))
+        checks.append(self._monitor_check("Candle", candle_mode, "candle filter passes", candle_ok if setup_signal else None, "gate"))
+
+        counted = [c for c in checks if c.get("passed") is not None]
+        passed = sum(1 for c in counted if bool(c.get("passed")))
+        total = len(counted)
+        if not in_window:
+            status = "Paused - outside entry window"
+            decision = "idle"
+            reason = f"Dashboard entry window is {self.live.entry_start_time_et}-{self.live.entry_end_time_et} ET."
+        elif not setup_signal:
+            status = "Watching - no setup"
+            decision = "watching"
+            reason = "Latest closed bar has no strategy setup."
+        elif not liquidity_ok:
+            status = "Blocked - liquidity"
+            decision = "rejected"
+            reason = "Price, volume, ATR, or dollar-volume floor failed."
+        elif not score_ok:
+            status = "Blocked - score"
+            decision = "rejected"
+            reason = f"Score {score:.2f} below minimum {min_score:g}."
+        elif not quality_gate_ok:
+            status = "Blocked - quality gate"
+            decision = "rejected"
+            reason = f"{gate} gate failed."
+        elif not candle_ok:
+            status = "Blocked - candle"
+            decision = "rejected"
+            reason = "Candlestick filter failed."
+        elif raw_alert:
+            status = "Candidate - passed latest-bar checks"
+            decision = "candidate"
+            reason = "Latest closed bar is eligible before top-N/capacity selection."
+        else:
+            status = "Watching - no setup"
+            decision = "watching"
+            reason = "Latest closed bar did not remain an active setup after strategy filters."
+
+        bias = "long-bias" if rs > 0.15 else ("short-bias" if rs < -0.15 else "neutral")
+        summary = f"{passed}/{total} checks passed"
+        if reason:
+            summary = f"{summary}; {reason}"
+        return {
+            "symbol": symbol,
+            "run_id": run_id,
+            "updated_at_utc": utc_now_iso(),
+            "latest_bar_time_utc": ts.isoformat(),
+            "latest_bar_time_et": ts_et.strftime("%Y-%m-%d %H:%M"),
+            "session_date": ts_et.date().isoformat(),
+            "strategy_variant": getattr(self.params, "live_strategy_variant", getattr(self.live, "strategy_variant", "best_report_153601")),
+            "strategy_preset": getattr(self.params, "live_strategy_preset", "env"),
+            "strategy_profile": str(getattr(self.params, "strategy_profile", "symbol_playbook_v25")),
+            "quality_gate": gate,
+            "pattern_mode": str(getattr(self.params, "v379_pattern_mode", "")),
+            "selection_mode": str(getattr(self.live, "selection_mode", "seen_so_far_top_n")),
+            "feed": str(getattr(self.live, "feed", "iex")),
+            "monitor_status": status,
+            "decision_status": decision,
+            "reject_reason": reason,
+            "setup_signal": setup_signal,
+            "selected_signal": False,
+            "in_entry_window": in_window,
+            "liquidity_ok": liquidity_ok,
+            "score_ok": score_ok if setup_signal else False,
+            "quality_gate_ok": quality_gate_ok if setup_signal else False,
+            "candle_ok": candle_ok if setup_signal else False,
+            "checks_passed": passed,
+            "checks_total": total,
+            "check_summary": summary,
+            "symbol_side_bias": bias,
+            "strategy_side": side,
+            "trigger_type": trigger,
+            "candidate_score": candidate_score,
+            "final_rank_score": score,
+            "close_price": close_px,
+            "volume": self._monitor_num(row, "volume", 0.0),
+            "rvol_time_of_day": rvol,
+            "daily_atr14_percent": daily_atr,
+            "gap_percent": gap_pct,
+            "day_relative_strength": rs,
+            "open_relative_strength": ors,
+            "vwap_extension_atr": vwap,
+            "qqq_change_from_open": self._monitor_num(row, "qqq_change_from_open", self._monitor_num(row, "qqq_chg_open", 0.0)),
+            "qqq_day_change_percent": self._monitor_num(row, "qqq_day_change_percent", 0.0),
+            "atr5m14": self._monitor_num(row, "atr5m14", 0.0),
+            "ema9": self._monitor_num(row, "ema9", 0.0),
+            "ema20": self._monitor_num(row, "ema20", 0.0),
+            "session_vwap": self._monitor_num(row, "session_vwap", 0.0),
+            "payload": {
+                "checks": checks,
+                "raw_buy_alert": raw_alert,
+                "gate_prefix": prefix,
+                "directional_rs": dir_rs,
+                "directional_open_rs": dir_ors,
+                "directional_vwap_atr": dir_vwap,
+                "abs_vwap_atr": abs_vwap,
+                "strategy_fields": {k: self._monitor_text(row, k) for k in ["quality", "v379_reason", "positive_context_profile_reason"] if k in row.index},
+            },
+        }
+
+    def _monitor_record_for_missing_symbol(self, symbol: str, run_id: str, closed_ts: pd.Timestamp, status: str, reason: str) -> dict[str, Any]:
+        rec = self._symbol_monitor_base_config(symbol, run_id, status, reason)
+        try:
+            ts_et = pd.Timestamp(closed_ts).tz_convert("America/New_York")
+            rec.update({"latest_bar_time_utc": pd.Timestamp(closed_ts).isoformat(), "latest_bar_time_et": ts_et.strftime("%Y-%m-%d %H:%M"), "session_date": ts_et.date().isoformat()})
+        except Exception:
+            pass
+        return rec
+
+    def _mark_selected_symbol_monitors(self, records: list[dict[str, Any]], selected: pd.DataFrame) -> list[dict[str, Any]]:
+        if selected is None or selected.empty or not records:
+            return records
+        keys: set[tuple[str, str]] = set()
+        for _, row in selected.iterrows():
+            try:
+                ts = pd.to_datetime(row.get("timestamp"), utc=True, errors="coerce")
+                keys.add((str(row.get("symbol", "")).upper(), ts.isoformat()))
+            except Exception:
+                keys.add((str(row.get("symbol", "")).upper(), ""))
+        out = []
+        for rec in records:
+            key = (str(rec.get("symbol", "")).upper(), str(rec.get("latest_bar_time_utc") or ""))
+            if key in keys or (str(rec.get("symbol", "")).upper(), "") in keys:
+                updated = dict(rec)
+                updated.update({
+                    "selected_signal": True,
+                    "monitor_status": "Selected - order planning",
+                    "decision_status": "accepted",
+                    "reject_reason": "Selected by latest-bar/top-N/capacity logic.",
+                    "check_summary": f"{updated.get('checks_passed', 0)}/{updated.get('checks_total', 0)} checks passed; selected for order planning.",
+                })
+                out.append(updated)
+            else:
+                out.append(rec)
+        return out
+
+    def _write_symbol_monitor_records(self, records: list[dict[str, Any]]) -> None:
+        if not records:
+            return
+        try:
+            self.store.upsert_symbol_monitor_snapshots(records)
+        except Exception as exc:
+            self.store.insert_event("symbol_monitor_write_error", {"message": str(exc)}, status="warning")
+
     def _within_live_entry_window(self, ts: pd.Timestamp | datetime | None = None) -> bool:
         ts = pd.Timestamp(ts or datetime.now(NY))
         if ts.tzinfo is None:
@@ -897,13 +1194,18 @@ class LivePaperTradingEngine:
         closed_ts = latest_closed_5m_start(now)
         today_ny = closed_ts.tz_convert("America/New_York").date()
         symbols = list(dict.fromkeys([s.upper() for s in (self.live.symbols or []) if s]))
+        monitor_records: list[dict[str, Any]] = []
         bars_5m, daily = self._update_bar_cache()
         if bars_5m.empty or daily.empty:
+            monitor_records = [self._monitor_record_for_missing_symbol(s, run_id, closed_ts, "Waiting - market data", "No 5-minute or daily bars were returned.") for s in symbols]
+            self._write_symbol_monitor_records(monitor_records)
             return pd.DataFrame()
         bars_5m = bars_5m[pd.to_datetime(bars_5m["timestamp"], utc=True) <= closed_ts].copy()
         qqq_5m = bars_5m[bars_5m["symbol"] == "QQQ"].copy()
         qqq_daily = daily[daily["symbol"] == "QQQ"].copy()
         if qqq_5m.empty or qqq_daily.empty:
+            monitor_records = [self._monitor_record_for_missing_symbol(s, run_id, closed_ts, "Waiting - QQQ context", "QQQ context is required for relative-strength indicators.") for s in symbols]
+            self._write_symbol_monitor_records(monitor_records)
             return pd.DataFrame()
         qqq_context = build_qqq_context(qqq_5m, qqq_daily)
         frames: list[pd.DataFrame] = []
@@ -911,15 +1213,27 @@ class LivePaperTradingEngine:
             sym_5m = bars_5m[bars_5m["symbol"] == symbol].copy()
             sym_daily = daily[daily["symbol"] == symbol].copy()
             if sym_5m.empty or sym_daily.empty:
+                monitor_records.append(self._monitor_record_for_missing_symbol(symbol, run_id, closed_ts, "Waiting - symbol data", "No recent 5-minute or daily bars for this symbol."))
                 continue
-            intraday = add_intraday_features(sym_5m)
-            intraday = add_daily_features(intraday, sym_daily)
-            merged = merge_market_context(intraday, qqq_context)
-            signals = compute_signals(merged, self.params)
+            try:
+                intraday = add_intraday_features(sym_5m)
+                intraday = add_daily_features(intraday, sym_daily)
+                merged = merge_market_context(intraday, qqq_context)
+                signals = compute_signals(merged, self.params)
+            except Exception as exc:
+                monitor_records.append(self._monitor_record_for_missing_symbol(symbol, run_id, closed_ts, "Error - indicator calculation", str(exc)[:220]))
+                continue
             if signals.empty:
+                monitor_records.append(self._monitor_record_for_missing_symbol(symbol, run_id, closed_ts, "Waiting - no indicator frame", "Indicator pipeline returned no rows."))
                 continue
             signals["timestamp"] = pd.to_datetime(signals["timestamp"], utc=True, errors="coerce")
             same_day = signals["timestamp"].dt.tz_convert("America/New_York").dt.date.eq(today_ny)
+            latest_frame = signals[same_day & (signals["timestamp"] <= closed_ts)].copy()
+            if not latest_frame.empty:
+                latest_row = latest_frame.sort_values("timestamp").iloc[-1]
+                monitor_records.append(self._monitor_record_from_latest_row(latest_row, run_id, closed_ts))
+            else:
+                monitor_records.append(self._monitor_record_for_missing_symbol(symbol, run_id, closed_ts, "Waiting - no latest bar", "No same-day indicator row at the latest closed bar."))
             if "buy_alert" not in signals.columns:
                 continue
             alert_mask = signals["buy_alert"].fillna(False).astype(bool)
@@ -927,6 +1241,7 @@ class LivePaperTradingEngine:
             if alerts.empty:
                 continue
             frames.append(alerts)
+        self._write_symbol_monitor_records(monitor_records)
         if not frames:
             return pd.DataFrame()
         alerts_all = pd.concat(frames, ignore_index=True)
@@ -1044,6 +1359,8 @@ class LivePaperTradingEngine:
             return out
         out["session_date"] = out["timestamp"].dt.tz_convert("America/New_York").dt.date.astype(str)
         out = out.sort_values(["score", "timestamp"], ascending=[False, True]).reset_index(drop=True)
+        monitor_records = self._mark_selected_symbol_monitors(monitor_records, out)
+        self._write_symbol_monitor_records(monitor_records)
         records = []
         for idx, row in out.iterrows():
             records.append(self._audit_record_from_signal(row, run_id, "accepted", "selected_for_order_planning", stage="selected", rank_after=int(idx) + 1))
@@ -1213,6 +1530,8 @@ class LivePaperTradingEngine:
             row = {"timestamp": timestamp, "event": "market_closed", "message": "No scan/order because market is closed."}
             rows.append(row)
             self.store.insert_event("market_closed", row, status="idle")
+            run_id = pd.Timestamp(_now_utc()).strftime("%Y%m%dT%H%M%SZ")
+            self._write_symbol_monitor_records(self._idle_symbol_monitor_records(run_id, "Paused - market closed", "Market is closed; indicator snapshots update on market-open scans."))
             _append_log(self.live.log_path, rows)
             self._heartbeat("idle", "Market is closed.", {"open_positions": len(positions)})
             self._save_engine_state()
