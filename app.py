@@ -15,7 +15,7 @@ from src.backtest import run_backtest
 from src.config import AlpacaSettings, StrategyParams
 from src.live_dashboard import load_live_paper_snapshot, generate_live_report_zip
 from src.live_store import LiveStore
-from src.live_engine import live_variant_from_dashboard
+from src.live_engine import live_variant_from_dashboard, all_live_strategy_specs
 from src.symbols import WATCHLISTS, parse_symbols
 
 app = Dash(__name__, suppress_callback_exceptions=True, title="Alpaca Momentum Dashboard V38.8", update_title=None)
@@ -80,6 +80,9 @@ def _settings_snapshot_from_cfg(cfg: dict, existing_settings: dict | None = None
         "feed": cfg.get("feed", live_existing.get("feed", os.getenv("ALPACA_FEED", "iex"))),
         "symbols": cfg.get("symbols", live_existing.get("symbols", [])),
         "strategy_variant": cfg.get("strategy_variant", live_existing.get("strategy_variant", "best_report_153601")),
+        "strategy_run_mode": cfg.get("live_strategy_run_mode", live_existing.get("strategy_run_mode", "single")),
+        "active_strategy_count": cfg.get("active_strategy_count", live_existing.get("active_strategy_count", 1)),
+        "active_strategy_variants": cfg.get("active_strategy_variants", live_existing.get("active_strategy_variants", [])),
         "live_config_source": "dashboard_db",
         "entry_start_time_et": cfg.get("live_entry_start_time_et", live_existing.get("entry_start_time_et", "09:35")),
         "entry_end_time_et": cfg.get("live_entry_end_time_et", live_existing.get("entry_end_time_et", "15:55")),
@@ -140,7 +143,7 @@ def debug_live_state():
             out[key] = {"updated_at_utc": updated_at, "value": _safe_diag_value(value)}
         out["table_counts"] = {
             name: store.table_count(name)
-            for name in ["live_account_snapshots", "live_positions", "live_orders", "live_signal_plans", "live_events", "live_candidate_audit", "live_symbol_monitor"]
+            for name in ["live_account_snapshots", "live_positions", "live_orders", "live_signal_plans", "live_events", "live_candidate_audit", "live_symbol_monitor", "live_strategy_symbol_monitor"]
         }
         out["ok"] = True
     except Exception as exc:
@@ -162,6 +165,24 @@ def debug_db_ping():
     return jsonify(out)
 
 
+@server.route("/debug/live-strategies")
+def debug_live_strategies():
+    """List deterministic strategies available to all-strategies experiment mode."""
+    try:
+        specs = all_live_strategy_specs()
+        return jsonify({
+            "ok": True,
+            "count": len(specs),
+            "strategies": specs,
+            "notes": [
+                "Set Live strategy mode to all_strategies and click Apply current settings to live worker.",
+                "The worker tags each signal plan, order client id, candidate audit row, symbol monitor row, and report row with strategy_variant/strategy_preset/quality_gate.",
+            ],
+        })
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc), "traceback": traceback.format_exc()}), 500
+
+
 @server.route("/debug/live-data")
 @server.route("/debug/live-tables")
 @server.route("/debug/live-snapshot")
@@ -178,7 +199,7 @@ def debug_live_data():
         closed_positions = store.closed_positions(50)
         account = store.latest_account()
         trade_report = build_live_trade_report(days=3650)
-        symbol_monitor = store.latest_symbol_monitor(250)
+        symbol_monitor = store.latest_symbol_monitor(1000)
         out.update({
             "ok": True,
             "store": {"is_postgres": store.is_postgres},
@@ -212,13 +233,13 @@ def debug_live_symbol_monitor():
         store = LiveStore(initialize_schema=False)
         cfg = store.get_state("live_config_override", {}) or {}
         heartbeat = store.get_state("heartbeat", {}) or {}
-        monitor = store.latest_symbol_monitor(250)
+        monitor = store.latest_symbol_monitor(1000)
         out.update({
             "ok": True,
             "store": {"is_postgres": store.is_postgres},
             "configured_symbols": cfg.get("symbols") or heartbeat.get("symbols"),
             "heartbeat": _safe_diag_value(heartbeat),
-            "symbol_monitor": _df_preview(monitor, 250),
+            "symbol_monitor": _df_preview(monitor, 1000),
         })
     except Exception as exc:
         out.update({"ok": False, "error": str(exc), "traceback": traceback.format_exc()})
@@ -269,6 +290,15 @@ def download_live_report_direct():
 
 DEFAULT_END = date.today()
 DEFAULT_START = DEFAULT_END - timedelta(days=90)
+
+
+def live_strategy_run_mode_options():
+    specs = all_live_strategy_specs()
+    label = f"All live strategies in parallel ({len(specs)} strategies)"
+    return [
+        {"label": "Single selected strategy", "value": "single"},
+        {"label": label, "value": "all_strategies"},
+    ]
 
 
 def metric_card(label: str, value: str, help_text: str = "") -> html.Div:
@@ -748,11 +778,13 @@ def strategy_controls():
         "Shared by backtest and live worker",
         [
             html.Div(style={"display": "none"}, children=[dcc.Dropdown(id="strategy-profile", options=[{"label": "Symbol/Event Playbook", "value": "symbol_playbook_v25"}], value="symbol_playbook_v25")]),
-            html.Div(className="form-grid three", children=[
+            html.Div(className="form-grid four", children=[
                 field("Strategy preset", dcc.Dropdown(id="settings-preset", options=STRATEGY_PRESET_OPTIONS, value="best_qqq_news", clearable=False)),
+                field("Live strategy mode", dcc.Dropdown(id="live-strategy-run-mode", options=live_strategy_run_mode_options(), value="single", clearable=False)),
                 field("Watchlist", dcc.Dropdown(id="preset", options=[{"label": k.replace("_", " ").title(), "value": k} for k in WATCHLISTS.keys()], value="v25_playbook", clearable=False)),
                 field("Feed", dcc.Dropdown(id="feed", options=[{"label": "IEX - free plan", "value": "iex"}, {"label": "SIP - paid/unlimited", "value": "sip"}], value=os.getenv("ALPACA_FEED", "iex"), clearable=False)),
             ]),
+            html.Div(className="subtle-note", children="Live strategy mode is saved to Postgres with the rest of the live settings. Single mode trades only the selected preset. All-strategies mode runs every live preset in parallel, tags each signal/order/report row by strategy, and still respects the global risk/capacity controls."),
             field("Custom symbols - optional, overrides watchlist", dcc.Textarea(id="custom-symbols", placeholder="Example: AAPL, TSLA, MU, AMD", value="", className="textarea compact-textarea")),
             html.Div(className="form-grid three", children=[
                 field("Max trades/day", dcc.Dropdown(id="max-trades", options=[{"label": f"Top {x}", "value": x} for x in [1,2,3,5,7,10,15]], value=2, clearable=False)),
@@ -983,6 +1015,7 @@ def _normalize_time_et(value, default: str) -> str:
 
 @app.callback(
     Output("settings-preset", "value", allow_duplicate=True),
+    Output("live-strategy-run-mode", "value", allow_duplicate=True),
     Output("preset", "value", allow_duplicate=True),
     Output("custom-symbols", "value", allow_duplicate=True),
     Output("feed", "value", allow_duplicate=True),
@@ -1051,10 +1084,11 @@ def load_saved_live_settings(n_intervals, store_data=None):
             cfg = store_data
     if not isinstance(cfg, dict) or not cfg:
         print("[dashboard] load_saved_live_settings no saved config", flush=True)
-        return tuple([no_update] * 44)
+        return tuple([no_update] * 45)
     print(f"[dashboard] load_saved_live_settings loaded preset={cfg.get('settings_preset')} variant={cfg.get('strategy_variant')}", flush=True)
     values = (
         _cfg_value(cfg, "settings_preset", "best_qqq_news"),
+        _cfg_value(cfg, "live_strategy_run_mode", "single"),
         _cfg_value(cfg, "watchlist_preset", "v25_playbook"),
         _cfg_value(cfg, "custom_symbols", ""),
         _cfg_value(cfg, "feed", os.getenv("ALPACA_FEED", "iex")),
@@ -1142,7 +1176,10 @@ def refresh_live_paper_monitor(active_tab, refresh_clicks, n_intervals):
         live_trade_data, live_trade_cols = table_payload(snapshot.get("trade_report", pd.DataFrame()))
         event_data, event_cols = table_payload(snapshot.get("events", pd.DataFrame()))
         print(f"[dashboard] refresh_live_paper_monitor ok monitor={len(monitor_data)} plans={len(plan_data)} orders={len(order_data)} trades={len(live_trade_data)} events={len(event_data)}", flush=True)
-        status_text = snapshot.get("status", "Live paper monitor refreshed.") + f" Loaded symbols={len(monitor_data)}, trades={len(live_trade_data)}, plans={len(plan_data)}, orders={len(order_data)}, events={len(event_data)}."
+        monitor_symbols = len({str(r.get("symbol", "")).upper() for r in monitor_data if r.get("symbol")}) if isinstance(monitor_data, list) else len(monitor_data)
+        monitor_strategies = len({str(r.get("strategy", r.get("strategy_variant", ""))) for r in monitor_data if r.get("strategy") or r.get("strategy_variant")}) if isinstance(monitor_data, list) else 0
+        strategy_suffix = f", strategies={monitor_strategies}" if monitor_strategies > 1 else ""
+        status_text = snapshot.get("status", "Live paper monitor refreshed.") + f" Loaded symbols={monitor_symbols}{strategy_suffix}, strategy-symbol rows={len(monitor_data)}, trades={len(live_trade_data)}, plans={len(plan_data)}, orders={len(order_data)}, events={len(event_data)}."
         return metrics, monitor_summary, monitor_data, monitor_cols, pos_data, pos_cols, plan_data, plan_cols, order_data, order_cols, closed_data, closed_cols, live_trade_data, live_trade_cols, event_data, event_cols, status_text
     except Exception as exc:
         print(f"[dashboard] refresh_live_paper_monitor error: {exc}", flush=True)
@@ -1155,7 +1192,7 @@ def _bool_from_dropdown(value) -> bool:
     return str(value).lower() in {"1", "true", "yes", "on"}
 
 
-def _live_config_from_controls(strategy_profile, settings_preset, preset, custom_symbols, feed, backtest_session_mode, live_quality_gate,
+def _live_config_from_controls(strategy_profile, settings_preset, live_strategy_run_mode, preset, custom_symbols, feed, backtest_session_mode, live_quality_gate,
                                quality_start_time, quality_end_time, quality_min_rvol, quality_min_daily_atr, quality_min_dir_rs, quality_max_dir_rs,
                                quality_min_dir_open_rs, quality_max_dir_open_rs, quality_min_dir_vwap, quality_max_dir_vwap, quality_max_abs_vwap,
                                account_value, risk_dollars, risk_mode, base_risk_pct, min_risk_dollars, max_risk_dollars, dd1_risk_pct, dd2_risk_pct, pause_dd_pct,
@@ -1166,12 +1203,20 @@ def _live_config_from_controls(strategy_profile, settings_preset, preset, custom
     if not symbols:
         symbols = WATCHLISTS.get("v25_playbook", [])
     variant = live_variant_from_dashboard(settings_preset, live_quality_gate)
+    run_mode = str(live_strategy_run_mode or "single").strip().lower()
+    if run_mode not in {"single", "all_strategies"}:
+        run_mode = "single"
+    active_specs = all_live_strategy_specs() if run_mode == "all_strategies" else []
     return {
         "enabled": True,
         "applied_at_utc": pd.Timestamp.now(tz="UTC").isoformat(),
         "strategy_profile": strategy_profile or "symbol_playbook_v25",
         "settings_preset": settings_preset or "manual",
         "strategy_variant": variant,
+        "live_strategy_run_mode": run_mode,
+        "active_strategy_count": len(active_specs) if active_specs else 1,
+        "active_strategy_variants": [spec.get("variant") for spec in active_specs] if active_specs else [variant],
+        "active_strategy_presets": [spec.get("preset") for spec in active_specs] if active_specs else [settings_preset or "manual"],
         "watchlist_preset": preset or "v25_playbook",
         "custom_symbols": custom_symbols or "",
         "custom_symbols_active": custom_symbols_active,
@@ -1257,7 +1302,7 @@ def _save_live_config_to_shared_db(cfg: dict) -> str:
     Output("live-settings-store", "data", allow_duplicate=True),
     Input("apply-live-settings-btn", "n_clicks"),
     Input("generate-live-report-btn", "n_clicks"),
-    State("strategy-profile", "value"), State("settings-preset", "value"), State("preset", "value"), State("custom-symbols", "value"), State("feed", "value"), State("backtest-session-mode", "value"),
+    State("strategy-profile", "value"), State("settings-preset", "value"), State("live-strategy-run-mode", "value"), State("preset", "value"), State("custom-symbols", "value"), State("feed", "value"), State("backtest-session-mode", "value"),
     State("live-quality-gate", "value"), State("quality-start-time", "value"), State("quality-end-time", "value"),
     State("quality-min-rvol", "value"), State("quality-min-daily-atr", "value"), State("quality-min-dir-rs", "value"), State("quality-max-dir-rs", "value"),
     State("quality-min-dir-open-rs", "value"), State("quality-max-dir-open-rs", "value"),
@@ -1268,7 +1313,7 @@ def _save_live_config_to_shared_db(cfg: dict) -> str:
     State("live-entry-start-time", "value"), State("live-entry-end-time", "value"), State("live-require-market-open", "value"), State("live-allow-extended-hours", "value"), State("live-enable-max-hold-exit", "value"),
     prevent_initial_call=True,
 )
-def live_actions(apply_clicks, report_clicks, strategy_profile, settings_preset, preset, custom_symbols, feed, backtest_session_mode, live_quality_gate, quality_start_time, quality_end_time, quality_min_rvol, quality_min_daily_atr, quality_min_dir_rs, quality_max_dir_rs, quality_min_dir_open_rs, quality_max_dir_open_rs, quality_min_dir_vwap, quality_max_dir_vwap, quality_max_abs_vwap, account_value, risk_dollars, risk_mode, base_risk_pct, min_risk_dollars, max_risk_dollars, dd1_risk_pct, dd2_risk_pct, pause_dd_pct, min_score, max_trades, slippage_bps, use_news, candle_mode, macro_filter, stress_filter, news_filter, qqq_stress_threshold, kill_switch, enable_mr, enable_or, direction_mode, live_entry_start_time, live_entry_end_time, live_require_market_open, live_allow_extended_hours, live_enable_max_hold_exit):
+def live_actions(apply_clicks, report_clicks, strategy_profile, settings_preset, live_strategy_run_mode, preset, custom_symbols, feed, backtest_session_mode, live_quality_gate, quality_start_time, quality_end_time, quality_min_rvol, quality_min_daily_atr, quality_min_dir_rs, quality_max_dir_rs, quality_min_dir_open_rs, quality_max_dir_open_rs, quality_min_dir_vwap, quality_max_dir_vwap, quality_max_abs_vwap, account_value, risk_dollars, risk_mode, base_risk_pct, min_risk_dollars, max_risk_dollars, dd1_risk_pct, dd2_risk_pct, pause_dd_pct, min_score, max_trades, slippage_bps, use_news, candle_mode, macro_filter, stress_filter, news_filter, qqq_stress_threshold, kill_switch, enable_mr, enable_or, direction_mode, live_entry_start_time, live_entry_end_time, live_require_market_open, live_allow_extended_hours, live_enable_max_hold_exit):
     trigger = ctx.triggered_id
     print(f"[dashboard] live_actions trigger={trigger}", flush=True)
     if trigger == "generate-live-report-btn":
@@ -1278,13 +1323,13 @@ def live_actions(apply_clicks, report_clicks, strategy_profile, settings_preset,
         except Exception as exc:
             return f"Live report generation failed: {exc}", no_update, no_update
     if trigger == "apply-live-settings-btn":
-        cfg = _live_config_from_controls(strategy_profile, settings_preset, preset, custom_symbols, feed, backtest_session_mode, live_quality_gate, quality_start_time, quality_end_time, quality_min_rvol, quality_min_daily_atr, quality_min_dir_rs, quality_max_dir_rs, quality_min_dir_open_rs, quality_max_dir_open_rs, quality_min_dir_vwap, quality_max_dir_vwap, quality_max_abs_vwap, account_value, risk_dollars, risk_mode, base_risk_pct, min_risk_dollars, max_risk_dollars, dd1_risk_pct, dd2_risk_pct, pause_dd_pct, min_score, max_trades, slippage_bps, use_news, candle_mode, macro_filter, stress_filter, news_filter, qqq_stress_threshold, kill_switch, enable_mr, enable_or, direction_mode, live_entry_start_time, live_entry_end_time, live_require_market_open, live_allow_extended_hours, live_enable_max_hold_exit)
+        cfg = _live_config_from_controls(strategy_profile, settings_preset, live_strategy_run_mode, preset, custom_symbols, feed, backtest_session_mode, live_quality_gate, quality_start_time, quality_end_time, quality_min_rvol, quality_min_daily_atr, quality_min_dir_rs, quality_max_dir_rs, quality_min_dir_open_rs, quality_max_dir_open_rs, quality_min_dir_vwap, quality_max_dir_vwap, quality_max_abs_vwap, account_value, risk_dollars, risk_mode, base_risk_pct, min_risk_dollars, max_risk_dollars, dd1_risk_pct, dd2_risk_pct, pause_dd_pct, min_score, max_trades, slippage_bps, use_news, candle_mode, macro_filter, stress_filter, news_filter, qqq_stress_threshold, kill_switch, enable_mr, enable_or, direction_mode, live_entry_start_time, live_entry_end_time, live_require_market_open, live_allow_extended_hours, live_enable_max_hold_exit)
         try:
             saved_at = _save_live_config_to_shared_db(cfg)
             print(f"[dashboard] live_actions saved verified at {saved_at}", flush=True)
             hb = LiveStore(initialize_schema=False).get_state("heartbeat", {}) or {}
             worker_note = f" Worker heartbeat: {hb.get('status', 'unknown')} / source={hb.get('config_source', 'unknown')}." if isinstance(hb, dict) else ""
-            return f"✅ Verified database save at {saved_at}. Saved and read back from Postgres: strategy_variant={cfg['strategy_variant']}, gate={cfg['live_quality_gate']}, symbols={len(cfg['symbols'])}, max daily trades={cfg['max_daily_trades']}, live entries {cfg['live_entry_start_time_et']}-{cfg['live_entry_end_time_et']} ET.{worker_note}", no_update, cfg
+            return f"✅ Verified database save at {saved_at}. Saved and read back from Postgres: live_strategy_mode={cfg.get('live_strategy_run_mode', 'single')}, strategies={cfg.get('active_strategy_count', 1)}, strategy_variant={cfg['strategy_variant']}, gate={cfg['live_quality_gate']}, symbols={len(cfg['symbols'])}, max daily trades={cfg['max_daily_trades']}, live entries {cfg['live_entry_start_time_et']}-{cfg['live_entry_end_time_et']} ET.{worker_note}", no_update, cfg
         except Exception as exc:
             # Still persist in this browser so a database issue does not make the UI forget values on refresh.
             print(f"[dashboard] live_actions save error: {exc}", flush=True)

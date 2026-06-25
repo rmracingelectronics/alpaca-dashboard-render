@@ -84,13 +84,86 @@ signals as it already does, writes a compact monitor snapshot, and the dashboard
 only reads the latest rows.  This keeps the Live tab mobile-friendly and avoids
 another heavy Dash refresh loop.
 
-Commit commands after copying files to `C:ender_appslpaca_dashboard_v33`:
+Commit commands after copying files to `C:\render_apps\alpaca_dashboard_v33`:
 
 ```powershell
-cd C:ender_appslpaca_dashboard_v33
+cd C:\render_apps\alpaca_dashboard_v33
 git status --short
-git add app.py src/live_store.py src/live_engine.py src/live_dashboard.py assets/styles.css README_FIX_LIVE_SETTINGS.md
+git add app.py src/live_store.py src/live_engine.py src/live_dashboard.py assets/styles.css render.yaml README_FIX_LIVE_SETTINGS.md
 git commit -m "Add live symbol intelligence monitor"
+git push origin master --verbose --progress
+```
+
+If Render watches `main` instead of `master`:
+
+```powershell
+git push origin master:main --verbose --progress
+```
+
+## V8 - All-strategies paper experiment mode
+
+This build adds a saved Live strategy mode dropdown:
+
+- `Single selected strategy` keeps the existing behavior.
+- `All live strategies in parallel` runs every deterministic live preset/gate combination in the worker on the same symbol universe.
+
+The setting is persisted with the rest of the live configuration in:
+
+```text
+live_worker_state.key = 'live_config_override'
+```
+
+### Strategy attribution
+
+Every candidate, selected signal, signal plan, client order id, Live Symbol Intelligence row and report row now carries strategy metadata where available:
+
+- `strategy_variant`
+- `strategy_preset`
+- `quality_gate`
+- `pattern_mode`
+- short client-order strategy code, for new orders such as `rmv33-v385-AAPL-YYYYMMDDHHMM-l`
+
+### Reports for multi-day experiments
+
+Generated report ZIPs now include the existing raw tables plus strategy-level summaries:
+
+- `live_trade_report.csv` - trade/order-level paper performance with strategy metadata.
+- `live_signal_plans.csv` - submitted/planned paper orders with strategy metadata.
+- `live_candidate_audit.csv` - accepted/rejected candidates tagged by strategy and reject reason.
+- `live_symbol_monitor.csv` - latest per-symbol, per-strategy indicator/gate snapshot.
+- `strategy_performance_summary.csv` - P/L, R, win/loss counts by strategy/gate.
+- `candidate_strategy_summary.csv` - candidate/rejection counts by strategy/gate/reason.
+
+### Safety/capacity behavior
+
+All-strategies mode is designed for Alpaca paper research. It runs every strategy's signal logic, but still respects global safety/capacity controls:
+
+- max trades/day
+- max open positions
+- max orders per symbol/day
+- account risk mode and risk budget
+- duplicate-signal protection
+- existing open Alpaca position checks
+
+This avoids accidental order floods while still giving enough tagged candidate/report data to compare strategy behavior over days or weeks.
+
+### Local validation performed for V8
+
+- `python -m py_compile app.py trading_worker.py src/live_engine.py src/live_store.py src/live_dashboard.py`
+- Flask test client for `/healthz`, `/debug/db-ping`, `/debug/live-state`, `/debug/live-symbol-monitor`, `/debug/live-data`
+- SQLite live-store test showing two strategies can keep separate monitor rows for the same symbol
+- Direct config save/readback test for `live_strategy_run_mode = all_strategies`
+- Direct order-plan/audit test confirming new strategy-coded `client_order_id` and strategy metadata
+
+### Commit commands
+
+After copying the V8 files into your local repo:
+
+```powershell
+cd C:\render_apps\alpaca_dashboard_v33
+git status --short
+git add app.py src/live_store.py src/live_engine.py src/live_dashboard.py assets/styles.css render.yaml README_FIX_LIVE_SETTINGS.md
+git commit -m "Add all-strategies paper experiment mode"
 git push origin master --verbose --progress
 ```
 

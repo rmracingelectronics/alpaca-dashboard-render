@@ -74,6 +74,9 @@ class LiveSettings:
     ml_ranker_min_win_prob: float = 0.0
     selection_mode: str = "seen_so_far_top_n"
     strategy_variant: str = "best_report_153601"
+    strategy_run_mode: str = "single"
+    active_strategy_count: int = 1
+    active_strategy_variants: list[str] | None = None
     live_config_source: str = "env"
     log_path: Path = LIVE_DIR / "paper_trading_log.csv"
     state_path: Path = LIVE_DIR / "paper_trading_state.json"
@@ -135,6 +138,9 @@ def load_live_settings_from_env() -> tuple[LiveSettings, LiveRiskConfig]:
         ml_ranker_min_win_prob=_env_float("LIVE_ML_RANKER_MIN_WIN_PROB", 0.0),
         selection_mode=os.getenv("LIVE_SELECTION_MODE", "seen_so_far_top_n"),
         strategy_variant=os.getenv("LIVE_STRATEGY_VARIANT", "best_report_153601").strip().lower(),
+        strategy_run_mode=os.getenv("LIVE_STRATEGY_RUN_MODE", "single").strip().lower(),
+        active_strategy_count=1,
+        active_strategy_variants=None,
         live_config_source="env",
     )
     risk = LiveRiskConfig(
@@ -281,6 +287,72 @@ GATE_TO_LIVE_VARIANT = {
     "v384_failure_reversal": "v384_failure_reversal",
     "v385_adaptive_plus": "v385_adaptive_plus",
 }
+
+
+LIVE_STRATEGY_EXPERIMENT_SPECS: tuple[dict[str, str], ...] = (
+    {"preset": "best_qqq_news", "label": "Best Report 153601 baseline", "variant": "best_report_153601", "quality_gate": "off", "code": "base"},
+    {"preset": "live_raw_optimized_v358", "label": "V35.8 Raw quality gate", "variant": "live_raw_optimized_v358", "quality_gate": "v358", "code": "v358"},
+    {"preset": "live_hunter_v359", "label": "V35.9 Live Hunter", "variant": "live_hunter_v359", "quality_gate": "v359", "code": "v359"},
+    {"preset": "live_grid_robust_v363", "label": "V36.3 Grid-tested robust", "variant": "v363_grid_robust", "quality_gate": "v359", "code": "v363"},
+    {"preset": "live_professional_momentum_v364", "label": "V36.4 Pro momentum hybrid", "variant": "live_professional_momentum_v364", "quality_gate": "v364", "code": "v364"},
+    {"preset": "live_positive_context_v377", "label": "V37.8 Mined pattern matcher", "variant": "live_positive_context_v377", "quality_gate": "v377", "code": "v377"},
+    {"preset": "live_indicator_pattern_v379", "label": "V37.9 Indicator pattern scorer", "variant": "live_indicator_pattern_v379", "quality_gate": "v379", "code": "v379"},
+    {"preset": "live_active_pattern_v38", "label": "V38 Active pattern scorer", "variant": "v38_active_pattern", "quality_gate": "v38_active", "code": "v38a"},
+    {"preset": "live_stable_pattern_v38", "label": "V38 Stable pattern scorer", "variant": "v38_stable_pattern", "quality_gate": "v38_stable", "code": "v38s"},
+    {"preset": "live_active_plus_v382", "label": "V38.2 Active Plus", "variant": "v382_active_plus", "quality_gate": "v382_active_plus", "code": "v382a"},
+    {"preset": "live_more_trades_v382", "label": "V38.2 More Trades Research", "variant": "v382_more_trades", "quality_gate": "v382_more_trades", "code": "v382m"},
+    {"preset": "live_adaptive_composite_v383", "label": "V38.3 Adaptive Composite", "variant": "v383_adaptive", "quality_gate": "v383_adaptive", "code": "v383"},
+    {"preset": "live_failure_reversal_v384", "label": "V38.4 Failure-aware reversal router", "variant": "v384_failure_reversal", "quality_gate": "v384_failure_reversal", "code": "v384"},
+    {"preset": "live_adaptive_plus_v385", "label": "V38.5 Adaptive Plus", "variant": "v385_adaptive_plus", "quality_gate": "v385_adaptive_plus", "code": "v385"},
+)
+
+
+def all_live_strategy_specs() -> list[dict[str, str]]:
+    """Every deterministic live strategy preset used by all-strategies paper mode."""
+    return [dict(spec) for spec in LIVE_STRATEGY_EXPERIMENT_SPECS]
+
+
+def _spec_for_preset_or_variant(preset: str | None = None, variant: str | None = None, quality_gate: str | None = None) -> dict[str, str]:
+    preset_l = str(preset or "").strip().lower()
+    variant_l = str(variant or "").strip().lower()
+    for spec in LIVE_STRATEGY_EXPERIMENT_SPECS:
+        if preset_l and preset_l == spec["preset"]:
+            return dict(spec)
+        if variant_l and variant_l == spec["variant"]:
+            return dict(spec)
+    v = variant_l or live_variant_from_dashboard(preset_l or "manual", quality_gate or "off")
+    return {"preset": preset_l or "manual", "label": preset_l or v or "Manual", "variant": v, "quality_gate": str(quality_gate or "off").strip().lower(), "code": _strategy_code(v)}
+
+
+def _strategy_code(value: str | None) -> str:
+    raw = str(value or "strat").strip().lower()
+    mapping = {spec["variant"]: spec["code"] for spec in LIVE_STRATEGY_EXPERIMENT_SPECS}
+    if raw in mapping:
+        return mapping[raw]
+    raw = raw.replace("live_", "").replace("strategy_", "").replace("adaptive_plus", "v385")
+    raw = re.sub(r"[^a-z0-9]", "", raw)
+    return (raw or "strat")[:7]
+
+
+def _strategy_variant_from_code(code: str | None) -> str:
+    code_l = str(code or "").strip().lower()
+    for spec in LIVE_STRATEGY_EXPERIMENT_SPECS:
+        if code_l and code_l == str(spec.get("code", "")).lower():
+            return str(spec.get("variant") or "")
+    return ""
+
+
+def _strategy_spec_from_signal_values(variant: str | None = None, preset: str | None = None, gate: str | None = None, code: str | None = None) -> dict[str, str]:
+    code_variant = _strategy_variant_from_code(code) if code else ""
+    return _spec_for_preset_or_variant(preset or None, variant or code_variant or None, gate or None)
+
+
+def _client_order_strategy_code(client_order_id: str) -> str:
+    parts = str(client_order_id or "").split("-")
+    # New V8 order id shape: rmv33-v385-AAPL-YYYYMMDDHHMM-l
+    if len(parts) >= 5 and re.fullmatch(r"[a-z0-9]{2,8}", parts[1] or ""):
+        return parts[1]
+    return ""
 
 
 def live_variant_from_dashboard(settings_preset: str | None, quality_gate: str | None) -> str:
@@ -480,6 +552,48 @@ class LivePaperTradingEngine:
         data["state_path"] = str(self.live.state_path)
         return data
 
+    def _make_params_for_live_config(self, cfg: dict[str, Any], preset: str | None = None, variant: str | None = None, quality_gate: str | None = None) -> StrategyParams:
+        """Build one live StrategyParams object from DB config plus a strategy spec.
+
+        Global risk/schedule/user controls remain shared; the strategy-specific
+        preset/variant/gate is injected per strategy for all-strategies mode.
+        """
+        cfg = cfg if isinstance(cfg, dict) else {}
+        spec = _spec_for_preset_or_variant(preset or cfg.get("settings_preset"), variant or cfg.get("strategy_variant"), quality_gate or cfg.get("live_quality_gate"))
+        params = make_best_report_153601_params(self.risk, variant=spec.get("variant"))
+        params.direction_mode = str(cfg.get("direction_mode") or params.direction_mode)
+        params.backtest_session_mode = str(cfg.get("backtest_session_mode") or params.backtest_session_mode)
+        params.min_candidate_score = _safe_float(cfg.get("min_score"), params.min_candidate_score)
+        params.max_trades_per_day = max(1, int(_safe_float(cfg.get("max_trades"), params.max_trades_per_day)))
+        params.max_open_positions = max(1, int(_safe_float(cfg.get("max_open_positions"), self.live.max_open_positions)))
+        params.slippage_bps = _safe_float(cfg.get("slippage_bps"), params.slippage_bps)
+        params.candle_pattern_mode = str(cfg.get("candle_mode") or params.candle_pattern_mode)
+        params.enable_mean_reversion = str(cfg.get("enable_mr", params.enable_mean_reversion)).lower() in {"1", "true", "yes", "on"}
+        params.enable_or_retest = str(cfg.get("enable_or", params.enable_or_retest)).lower() in {"1", "true", "yes", "on"}
+        params.v27_macro_filter_mode = str(cfg.get("macro_filter") or params.v27_macro_filter_mode)
+        params.v27_market_stress_mode = str(cfg.get("stress_filter") or params.v27_market_stress_mode)
+        params.v27_news_filter_mode = str(cfg.get("news_filter") or params.v27_news_filter_mode)
+        params.v27_symbol_kill_switch_mode = str(cfg.get("kill_switch") or params.v27_symbol_kill_switch_mode)
+        params.v27_qqq_stress_abs_change_pct = _safe_float(cfg.get("qqq_stress_threshold"), params.v27_qqq_stress_abs_change_pct)
+        gate_cfg = dict(cfg)
+        gate_cfg["live_quality_gate"] = spec.get("quality_gate") or cfg.get("live_quality_gate") or "off"
+        _apply_quality_gate_to_params(params, gate_cfg)
+        if bool(cfg.get("custom_symbols_active", False)):
+            params.v25_allow_generic_symbols = True
+            params.min_price = 0.01
+            params.min_avg_20d_dollar_volume = 0.0
+            params.min_current_5m_dollar_volume = 0.0
+            params.min_daily_atr_pct = 0.0
+            params.max_daily_atr_pct = 999.0
+            params.v25_min_rvol = 0.0
+        setattr(params, "live_config_source", getattr(self.live, "live_config_source", "dashboard_db"))
+        setattr(params, "live_strategy_variant", spec.get("variant") or "best_report_153601")
+        setattr(params, "live_strategy_preset", spec.get("preset") or "manual")
+        setattr(params, "live_strategy_label", spec.get("label") or spec.get("preset") or spec.get("variant"))
+        setattr(params, "live_strategy_code", spec.get("code") or _strategy_code(spec.get("variant")))
+        setattr(params, "live_quality_gate", spec.get("quality_gate") or gate_cfg.get("live_quality_gate") or "off")
+        return params
+
 
 
     def _apply_runtime_config_override(self) -> None:
@@ -504,8 +618,12 @@ class LivePaperTradingEngine:
             setattr(self.params, "live_quality_gate", "env")
             return
 
+        self._runtime_config = dict(cfg)
         self.live.live_config_source = "dashboard_db"
         self.live.strategy_variant = str(cfg.get("strategy_variant") or live_variant_from_dashboard(cfg.get("settings_preset"), cfg.get("live_quality_gate"))).strip().lower()
+        self.live.strategy_run_mode = str(cfg.get("live_strategy_run_mode") or "single").strip().lower()
+        if self.live.strategy_run_mode not in {"single", "all_strategies"}:
+            self.live.strategy_run_mode = "single"
         self.live.feed = str(cfg.get("feed") or self.live.feed or "iex")
         if isinstance(cfg.get("symbols"), list) and cfg.get("symbols"):
             self.live.symbols = [str(s).upper() for s in cfg.get("symbols") if str(s).strip()]
@@ -530,36 +648,14 @@ class LivePaperTradingEngine:
         self.risk.dd2_risk_pct = _safe_float(cfg.get("dd2_risk_pct"), self.risk.dd2_risk_pct)
         self.risk.pause_dd_pct = _safe_float(cfg.get("pause_dd_pct"), self.risk.pause_dd_pct)
 
-        self.params = make_best_report_153601_params(self.risk, variant=self.live.strategy_variant)
-        self.params.direction_mode = str(cfg.get("direction_mode") or self.params.direction_mode)
-        self.params.backtest_session_mode = str(cfg.get("backtest_session_mode") or self.params.backtest_session_mode)
-        self.params.min_candidate_score = _safe_float(cfg.get("min_score"), self.params.min_candidate_score)
-        self.params.max_trades_per_day = max(1, int(_safe_float(cfg.get("max_trades"), self.params.max_trades_per_day)))
-        self.params.max_open_positions = max(1, int(_safe_float(cfg.get("max_open_positions"), self.live.max_open_positions)))
-        self.params.slippage_bps = _safe_float(cfg.get("slippage_bps"), self.params.slippage_bps)
-        self.params.candle_pattern_mode = str(cfg.get("candle_mode") or self.params.candle_pattern_mode)
-        self.params.enable_mean_reversion = str(cfg.get("enable_mr", self.params.enable_mean_reversion)).lower() in {"1", "true", "yes", "on"}
-        self.params.enable_or_retest = str(cfg.get("enable_or", self.params.enable_or_retest)).lower() in {"1", "true", "yes", "on"}
-        self.params.v27_macro_filter_mode = str(cfg.get("macro_filter") or self.params.v27_macro_filter_mode)
-        self.params.v27_market_stress_mode = str(cfg.get("stress_filter") or self.params.v27_market_stress_mode)
-        self.params.v27_news_filter_mode = str(cfg.get("news_filter") or self.params.v27_news_filter_mode)
-        self.params.v27_symbol_kill_switch_mode = str(cfg.get("kill_switch") or self.params.v27_symbol_kill_switch_mode)
-        self.params.v27_qqq_stress_abs_change_pct = _safe_float(cfg.get("qqq_stress_threshold"), self.params.v27_qqq_stress_abs_change_pct)
-        _apply_quality_gate_to_params(self.params, cfg)
-
-        if bool(cfg.get("custom_symbols_active", False)):
-            self.params.v25_allow_generic_symbols = True
-            self.params.min_price = 0.01
-            self.params.min_avg_20d_dollar_volume = 0.0
-            self.params.min_current_5m_dollar_volume = 0.0
-            self.params.min_daily_atr_pct = 0.0
-            self.params.max_daily_atr_pct = 999.0
-            self.params.v25_min_rvol = 0.0
-
-        setattr(self.params, "live_config_source", "dashboard_db")
-        setattr(self.params, "live_strategy_variant", self.live.strategy_variant)
-        setattr(self.params, "live_strategy_preset", str(cfg.get("settings_preset") or "manual"))
-        setattr(self.params, "live_quality_gate", str(cfg.get("live_quality_gate") or "off"))
+        self.params = self._make_params_for_live_config(cfg, cfg.get("settings_preset"), self.live.strategy_variant, cfg.get("live_quality_gate"))
+        if self.live.strategy_run_mode == "all_strategies":
+            specs = all_live_strategy_specs()
+            self.live.active_strategy_count = len(specs)
+            self.live.active_strategy_variants = [spec["variant"] for spec in specs]
+        else:
+            self.live.active_strategy_count = 1
+            self.live.active_strategy_variants = [self.live.strategy_variant]
 
     def _heartbeat(self, status: str, message: str = "", extra: dict[str, Any] | None = None) -> None:
         payload = {
@@ -572,6 +668,9 @@ class LivePaperTradingEngine:
             "feed": self.live.feed,
             "strategy_preset": getattr(self.params, "live_strategy_preset", getattr(self.live, "strategy_variant", "best_report_153601")),
             "strategy_variant": getattr(self.params, "live_strategy_variant", getattr(self.live, "strategy_variant", "best_report_153601")),
+            "strategy_run_mode": getattr(self.live, "strategy_run_mode", "single"),
+            "active_strategy_count": getattr(self.live, "active_strategy_count", 1),
+            "active_strategy_variants": getattr(self.live, "active_strategy_variants", None) or [getattr(self.live, "strategy_variant", "best_report_153601")],
             "quality_gate": getattr(self.params, "live_quality_gate", "env"),
             "config_source": getattr(self.live, "live_config_source", "env"),
             "entry_start_time_et": getattr(self.live, "entry_start_time_et", "09:35"),
@@ -621,10 +720,13 @@ class LivePaperTradingEngine:
             return None
         # Expected V33 shape: rmv33-SYMBOL-YYYYMMDDHHMM-l/s. Keep the parser
         # tolerant so older V32/V33 test IDs do not break dashboard/state recovery.
-        match = re.match(r"^(rmv\d+|rm\d+)-([A-Z0-9.]+)-(\d{12})-([ls])", cid, flags=re.IGNORECASE)
+        match = re.match(r"^(rmv\d+|rm\d+)-(?:(?P<strategy_code>[a-z0-9]{2,8})-)?(?P<symbol>[A-Z0-9.]+)-(?P<stamp>\d{12})-(?P<side>[ls])", cid, flags=re.IGNORECASE)
         if not match:
             return {"client_order_id": cid}
-        _, symbol, stamp, side_code = match.groups()
+        symbol = match.group("symbol")
+        stamp = match.group("stamp")
+        side_code = match.group("side")
+        strategy_code = match.group("strategy_code") or ""
         try:
             ts_et = datetime.strptime(stamp, "%Y%m%d%H%M").replace(tzinfo=NY)
             session_date = ts_et.date().isoformat()
@@ -634,6 +736,7 @@ class LivePaperTradingEngine:
             signal_time_et = ""
         return {
             "client_order_id": cid,
+            "strategy_code": strategy_code,
             "symbol": symbol.upper(),
             "session_date": session_date,
             "signal_time_et": signal_time_et,
@@ -657,6 +760,14 @@ class LivePaperTradingEngine:
                     })
                     if not rec.get("symbol"):
                         rec["symbol"] = str(order.get("symbol", "")).upper()
+                    if rec.get("strategy_code"):
+                        rec.setdefault("strategy_code", rec.get("strategy_code"))
+                        variant = _strategy_variant_from_code(rec.get("strategy_code"))
+                        if variant:
+                            rec.setdefault("strategy_variant", variant)
+                            spec = _spec_for_preset_or_variant(variant=variant)
+                            rec.setdefault("strategy_preset", spec.get("preset"))
+                            rec.setdefault("quality_gate", spec.get("quality_gate"))
                     records[str(cid)] = rec
             for leg in order.get("legs", []) or []:
                 if isinstance(leg, dict):
@@ -732,8 +843,10 @@ class LivePaperTradingEngine:
         return max(key_count, order_count)
 
     def _symbol_daily_count(self, symbol: str, session_date: str) -> int:
-        prefix = f"{symbol.upper()}|{session_date}|"
-        key_count = len({str(k) for k in self.state.get("submitted_signal_keys", []) if str(k).startswith(prefix)})
+        key_count = len({
+            str(k) for k in self.state.get("submitted_signal_keys", [])
+            if f"|{symbol.upper()}|{session_date}|" in str(k) or str(k).startswith(f"{symbol.upper()}|{session_date}|")
+        })
         order_count = len({
             str(r.get("client_order_id", ""))
             for r in self.state.get("submitted_strategy_order_records", []) or []
@@ -813,11 +926,13 @@ class LivePaperTradingEngine:
             ts = ts.tz_localize("UTC")
         else:
             ts = ts.tz_convert("UTC")
+        variant = str(get("strategy_variant", getattr(self.params, "live_strategy_variant", getattr(self.live, "strategy_variant", ""))) or "").lower()
         return "|".join([
             str(ts.isoformat()),
             str(get("symbol", "")).upper(),
             str(get("side", get("strategy_side", ""))).lower(),
             str(get("trigger_type", "")),
+            variant,
         ])
 
     def _audit_record_from_signal(self, signal: pd.Series | dict[str, Any], run_id: str, status: str, reason: str = "", stage: str = "candidate", rank_before: int | None = None, rank_after: int | None = None, plan: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -828,6 +943,16 @@ class LivePaperTradingEngine:
         else:
             ts = ts.tz_convert("UTC")
         ts_et = ts.tz_convert(NY)
+        plan = plan or {}
+        raw_code = data.get("strategy_code") or plan.get("strategy_code") or ""
+        raw_variant = data.get("strategy_variant") or plan.get("strategy_variant") or _strategy_variant_from_code(raw_code) or getattr(self.params, "live_strategy_variant", getattr(self.live, "strategy_variant", "best_report_153601"))
+        raw_preset = data.get("strategy_preset") or plan.get("strategy_preset") or getattr(self.params, "live_strategy_preset", "env")
+        raw_gate = data.get("quality_gate") or plan.get("quality_gate") or getattr(self.params, "live_quality_gate", "env")
+        spec = _strategy_spec_from_signal_values(raw_variant, raw_preset, raw_gate, raw_code)
+        strategy_variant = str(raw_variant or spec.get("variant") or "best_report_153601").strip().lower()
+        strategy_code = str(raw_code or spec.get("code") or _strategy_code(strategy_variant)).strip().lower()
+        strategy_preset = str(raw_preset or spec.get("preset") or "manual")
+        quality_gate = str(raw_gate or spec.get("quality_gate") or "off")
         ctx_payload = self._signal_context_payload(pd.Series(data)) if not isinstance(signal, pd.Series) else self._signal_context_payload(signal)
         record = {
             "audit_key": self._candidate_audit_key(data),
@@ -838,11 +963,12 @@ class LivePaperTradingEngine:
             "symbol": str(data.get("symbol", "")).upper(),
             "strategy_side": str(data.get("side", data.get("strategy_side", ""))).lower(),
             "trigger_type": str(data.get("trigger_type", "")),
-            "strategy_variant": getattr(self.params, "live_strategy_variant", getattr(self.live, "strategy_variant", "best_report_153601")),
-            "strategy_preset": getattr(self.params, "live_strategy_preset", "env"),
-            "strategy_profile": str(getattr(self.params, "strategy_profile", "symbol_playbook_v25")),
-            "quality_gate": getattr(self.params, "live_quality_gate", "env"),
-            "pattern_mode": str(getattr(self.params, "v379_pattern_mode", "")),
+            "strategy_variant": strategy_variant,
+            "strategy_code": strategy_code,
+            "strategy_preset": strategy_preset,
+            "strategy_profile": str(data.get("strategy_profile") or plan.get("strategy_profile") or getattr(self.params, "strategy_profile", "symbol_playbook_v25")),
+            "quality_gate": quality_gate,
+            "pattern_mode": str(data.get("pattern_mode") or plan.get("pattern_mode") or getattr(self.params, "v379_pattern_mode", "")),
             "selection_mode": str(getattr(self.live, "selection_mode", "seen_so_far_top_n")),
             "audit_stage": stage,
             "decision_status": status,
@@ -931,6 +1057,8 @@ class LivePaperTradingEngine:
             "run_id": run_id,
             "updated_at_utc": now,
             "strategy_variant": getattr(self.params, "live_strategy_variant", getattr(self.live, "strategy_variant", "best_report_153601")),
+            "strategy_code": getattr(self.params, "live_strategy_code", _strategy_code(getattr(self.params, "live_strategy_variant", getattr(self.live, "strategy_variant", "best_report_153601")))),
+            "strategy_label": getattr(self.params, "live_strategy_label", getattr(self.params, "live_strategy_preset", "env")),
             "strategy_preset": getattr(self.params, "live_strategy_preset", "env"),
             "strategy_profile": str(getattr(self.params, "strategy_profile", "symbol_playbook_v25")),
             "quality_gate": self._monitor_quality_gate_label(),
@@ -950,7 +1078,16 @@ class LivePaperTradingEngine:
         }
 
     def _idle_symbol_monitor_records(self, run_id: str, status: str, reason: str) -> list[dict[str, Any]]:
-        return [self._symbol_monitor_base_config(sym, run_id, status, reason) for sym in list(dict.fromkeys([s.upper() for s in (self.live.symbols or []) if s]))]
+        symbols = list(dict.fromkeys([s.upper() for s in (self.live.symbols or []) if s]))
+        records: list[dict[str, Any]] = []
+        original_params = self.params
+        try:
+            for spec in self._strategy_specs_for_current_run():
+                self.params = self._make_params_for_live_config(getattr(self, "_runtime_config", {}), spec.get("preset"), spec.get("variant"), spec.get("quality_gate"))
+                records.extend([self._symbol_monitor_base_config(sym, run_id, status, reason) for sym in symbols])
+        finally:
+            self.params = original_params
+        return records
 
     def _monitor_record_from_latest_row(self, row: pd.Series, run_id: str, closed_ts: pd.Timestamp) -> dict[str, Any]:
         symbol = self._monitor_text(row, "symbol").upper()
@@ -1084,6 +1221,8 @@ class LivePaperTradingEngine:
             "latest_bar_time_et": ts_et.strftime("%Y-%m-%d %H:%M"),
             "session_date": ts_et.date().isoformat(),
             "strategy_variant": getattr(self.params, "live_strategy_variant", getattr(self.live, "strategy_variant", "best_report_153601")),
+            "strategy_code": getattr(self.params, "live_strategy_code", _strategy_code(getattr(self.params, "live_strategy_variant", getattr(self.live, "strategy_variant", "best_report_153601")))),
+            "strategy_label": getattr(self.params, "live_strategy_label", getattr(self.params, "live_strategy_preset", "env")),
             "strategy_preset": getattr(self.params, "live_strategy_preset", "env"),
             "strategy_profile": str(getattr(self.params, "strategy_profile", "symbol_playbook_v25")),
             "quality_gate": gate,
@@ -1146,17 +1285,19 @@ class LivePaperTradingEngine:
     def _mark_selected_symbol_monitors(self, records: list[dict[str, Any]], selected: pd.DataFrame) -> list[dict[str, Any]]:
         if selected is None or selected.empty or not records:
             return records
-        keys: set[tuple[str, str]] = set()
+        keys: set[tuple[str, str, str]] = set()
         for _, row in selected.iterrows():
+            variant = str(row.get("strategy_variant") or getattr(self.params, "live_strategy_variant", "")).lower()
             try:
                 ts = pd.to_datetime(row.get("timestamp"), utc=True, errors="coerce")
-                keys.add((str(row.get("symbol", "")).upper(), ts.isoformat()))
+                keys.add((str(row.get("symbol", "")).upper(), ts.isoformat(), variant))
             except Exception:
-                keys.add((str(row.get("symbol", "")).upper(), ""))
+                keys.add((str(row.get("symbol", "")).upper(), "", variant))
         out = []
         for rec in records:
-            key = (str(rec.get("symbol", "")).upper(), str(rec.get("latest_bar_time_utc") or ""))
-            if key in keys or (str(rec.get("symbol", "")).upper(), "") in keys:
+            rec_variant = str(rec.get("strategy_variant") or "").lower()
+            key = (str(rec.get("symbol", "")).upper(), str(rec.get("latest_bar_time_utc") or ""), rec_variant)
+            if key in keys or (str(rec.get("symbol", "")).upper(), "", rec_variant) in keys:
                 updated = dict(rec)
                 updated.update({
                     "selected_signal": True,
@@ -1188,184 +1329,224 @@ class LivePaperTradingEngine:
             return False
         return _time_in_window(ts, getattr(self.live, "entry_start_time_et", "09:35"), getattr(self.live, "entry_end_time_et", "15:55"))
 
+    def _strategy_specs_for_current_run(self) -> list[dict[str, str]]:
+        if str(getattr(self.live, "strategy_run_mode", "single")).lower() == "all_strategies":
+            return all_live_strategy_specs()
+        return [_spec_for_preset_or_variant(getattr(self.params, "live_strategy_preset", "manual"), getattr(self.params, "live_strategy_variant", getattr(self.live, "strategy_variant", "best_report_153601")), getattr(self.params, "live_quality_gate", "off"))]
+
+    def _fetch_recent_signals_for_params(self, run_id: str, closed_ts: pd.Timestamp, today_ny: Any, symbols: list[str], bars_5m: pd.DataFrame, daily: pd.DataFrame, qqq_context: pd.DataFrame, params: StrategyParams) -> pd.DataFrame:
+        monitor_records: list[dict[str, Any]] = []
+        frames: list[pd.DataFrame] = []
+        original_params = self.params
+        self.params = params
+        strategy_variant = str(getattr(params, "live_strategy_variant", getattr(self.live, "strategy_variant", "best_report_153601")))
+        strategy_preset = str(getattr(params, "live_strategy_preset", "manual"))
+        try:
+            for symbol in symbols:
+                sym_5m = bars_5m[bars_5m["symbol"] == symbol].copy()
+                sym_daily = daily[daily["symbol"] == symbol].copy()
+                if sym_5m.empty or sym_daily.empty:
+                    monitor_records.append(self._monitor_record_for_missing_symbol(symbol, run_id, closed_ts, "Waiting - symbol data", "No recent 5-minute or daily bars for this symbol."))
+                    continue
+                try:
+                    intraday = add_intraday_features(sym_5m)
+                    intraday = add_daily_features(intraday, sym_daily)
+                    merged = merge_market_context(intraday, qqq_context)
+                    signals = compute_signals(merged, params)
+                except Exception as exc:
+                    monitor_records.append(self._monitor_record_for_missing_symbol(symbol, run_id, closed_ts, "Error - indicator calculation", str(exc)[:220]))
+                    continue
+                if signals.empty:
+                    monitor_records.append(self._monitor_record_for_missing_symbol(symbol, run_id, closed_ts, "Waiting - no indicator frame", "Indicator pipeline returned no rows."))
+                    continue
+                signals["timestamp"] = pd.to_datetime(signals["timestamp"], utc=True, errors="coerce")
+                signals["strategy_variant"] = strategy_variant
+                signals["strategy_preset"] = strategy_preset
+                signals["quality_gate"] = str(getattr(params, "live_quality_gate", "off"))
+                signals["pattern_mode"] = str(getattr(params, "v379_pattern_mode", ""))
+                same_day = signals["timestamp"].dt.tz_convert("America/New_York").dt.date.eq(today_ny)
+                latest_frame = signals[same_day & (signals["timestamp"] <= closed_ts)].copy()
+                if not latest_frame.empty:
+                    latest_row = latest_frame.sort_values("timestamp").iloc[-1]
+                    monitor_records.append(self._monitor_record_from_latest_row(latest_row, run_id, closed_ts))
+                else:
+                    monitor_records.append(self._monitor_record_for_missing_symbol(symbol, run_id, closed_ts, "Waiting - no latest bar", "No same-day indicator row at the latest closed bar."))
+                if "buy_alert" not in signals.columns:
+                    continue
+                alert_mask = signals["buy_alert"].fillna(False).astype(bool)
+                alerts = signals[same_day & (signals["timestamp"] <= closed_ts) & alert_mask].copy()
+                if alerts.empty:
+                    continue
+                frames.append(alerts)
+            if not frames:
+                self._write_symbol_monitor_records(monitor_records)
+                return pd.DataFrame()
+            alerts_all = pd.concat(frames, ignore_index=True)
+            alerts_all = self._add_live_v25_filter_aliases(alerts_all)
+            alerts_all["strategy_variant"] = strategy_variant
+            alerts_all["strategy_preset"] = strategy_preset
+            alerts_all["quality_gate"] = str(getattr(params, "live_quality_gate", "off"))
+            alerts_all["pattern_mode"] = str(getattr(params, "v379_pattern_mode", ""))
+            self._audit_candidates(alerts_all, run_id, "seen", "raw_signal_seen", stage="raw_signal", rank_col="score")
+
+            ts_et = pd.to_datetime(alerts_all["timestamp"], utc=True, errors="coerce").dt.tz_convert("America/New_York")
+            in_window = ts_et.map(lambda x: _time_in_window(x, getattr(self.live, "entry_start_time_et", "09:35"), getattr(self.live, "entry_end_time_et", "15:55")))
+            if not bool(getattr(self.live, "allow_extended_hours_entries", False)):
+                regular = ts_et.map(lambda x: _time_in_window(x, "09:30", "16:00"))
+                in_window = in_window & regular
+            rejected_schedule = alerts_all[~in_window].copy()
+            self._audit_candidates(rejected_schedule, run_id, "rejected", "outside_dashboard_live_entry_window", stage="global_schedule", rank_col="score")
+            alerts_all = alerts_all[in_window].copy()
+            if alerts_all.empty:
+                self._write_symbol_monitor_records(monitor_records)
+                return alerts_all
+
+            min_score = float(getattr(params, "min_candidate_score", 2.0) or 2.0)
+            score_ok = pd.to_numeric(alerts_all["score"], errors="coerce").fillna(-9999.0) >= min_score
+            self._audit_candidates(alerts_all[~score_ok].copy(), run_id, "rejected", f"score_below_min_{min_score:g}", stage="min_score", rank_col="score")
+            alerts_all = alerts_all[score_ok].copy()
+            if alerts_all.empty:
+                self._write_symbol_monitor_records(monitor_records)
+                return alerts_all
+
+            before_candle = alerts_all.copy()
+            alerts_all = _apply_v25_candlestick_filter(alerts_all, str(getattr(params, "candle_pattern_mode", "selective")))
+            removed_keys = set(before_candle.apply(lambda r: self._candidate_audit_key(r), axis=1)) - set(alerts_all.apply(lambda r: self._candidate_audit_key(r), axis=1)) if not before_candle.empty else set()
+            if removed_keys:
+                removed = before_candle[before_candle.apply(lambda r: self._candidate_audit_key(r) in removed_keys, axis=1)].copy()
+                self._audit_candidates(removed, run_id, "rejected", "candlestick_filter", stage="candlestick", rank_col="score")
+            if alerts_all.empty:
+                self._write_symbol_monitor_records(monitor_records)
+                return alerts_all
+
+            before_pre = alerts_all.copy()
+            alerts_all, stats = _v27_apply_preselection_filters(alerts_all, params, use_news=bool(self.live.use_news_proxy))
+            removed_keys = set(before_pre.apply(lambda r: self._candidate_audit_key(r), axis=1)) - set(alerts_all.apply(lambda r: self._candidate_audit_key(r), axis=1)) if not before_pre.empty else set()
+            if removed_keys:
+                removed = before_pre[before_pre.apply(lambda r: self._candidate_audit_key(r) in removed_keys, axis=1)].copy()
+                self._audit_candidates(removed, run_id, "rejected", "preselection_or_quality_gate_filter", stage="preselection", rank_col="score")
+
+            # Q/ML filters remain global experimental gates. They are applied to
+            # each strategy's candidate set independently if enabled.
+            if bool(getattr(self.live, "q_learning_filter_enabled", False)) and not alerts_all.empty:
+                try:
+                    policy_path = str(getattr(self.live, "q_learning_policy_path", "") or getattr(params, "q_learning_policy_path", "") or "").strip()
+                    if policy_path:
+                        q_model = load_q_model(policy_path)
+                        q_reviewed = apply_q_policy(alerts_all, q_model, min_edge=float(getattr(self.live, "q_learning_min_edge", 0.0) or 0.0), min_state_count=int(getattr(self.live, "q_learning_min_state_count", 8) or 8))
+                        approved = q_reviewed["q_policy_approved"].fillna(False).astype(bool)
+                        self._audit_candidates(q_reviewed[~approved].copy(), run_id, "rejected", "q_policy_rejected", stage="q_policy", rank_col="score")
+                        alerts_all = q_reviewed[approved].copy()
+                    else:
+                        self.store.set_state("last_q_policy_stats", {"enabled": True, "error": "LIVE_Q_POLICY_PATH is blank"})
+                        alerts_all = pd.DataFrame()
+                except Exception as exc:
+                    self.store.insert_event("q_policy_filter_error", {"message": str(exc), "strategy_variant": strategy_variant}, status="error")
+                    alerts_all = pd.DataFrame()
+            if bool(getattr(self.live, "ml_ranker_filter_enabled", False)) and not alerts_all.empty:
+                try:
+                    ml_path = str(getattr(self.live, "ml_ranker_model_path", "") or getattr(params, "ml_ranker_model_path", "") or "").strip()
+                    if ml_path:
+                        ml_model = load_ranker_model(ml_path)
+                        ml_reviewed = score_ml_ranker_candidates(alerts_all, ml_model)
+                        min_pred = float(getattr(self.live, "ml_ranker_min_pred_r", getattr(params, "ml_ranker_min_pred_r", 0.05)) or 0.05)
+                        min_win = float(getattr(self.live, "ml_ranker_min_win_prob", getattr(params, "ml_ranker_min_win_prob", 0.0)) or 0.0)
+                        approved = pd.to_numeric(ml_reviewed.get("ml_pred_r", -9999.0), errors="coerce").fillna(-9999.0) >= min_pred
+                        if min_win > 0 and "ml_pred_win_prob" in ml_reviewed.columns:
+                            approved = approved & (pd.to_numeric(ml_reviewed["ml_pred_win_prob"], errors="coerce").fillna(0.0) >= min_win)
+                        self._audit_candidates(ml_reviewed[~approved].copy(), run_id, "rejected", "ml_ranker_rejected", stage="ml_ranker", rank_col="score")
+                        alerts_all = ml_reviewed[approved].copy()
+                    else:
+                        self.store.set_state("last_ml_ranker_stats", {"enabled": True, "error": "LIVE_ML_RANKER_MODEL_PATH is blank"})
+                        alerts_all = pd.DataFrame()
+                except Exception as exc:
+                    self.store.insert_event("ml_ranker_filter_error", {"message": str(exc), "strategy_variant": strategy_variant}, status="error")
+                    alerts_all = pd.DataFrame()
+
+            self.store.set_state(f"last_filter_stats_{strategy_variant}", stats if 'stats' in locals() else {})
+            if alerts_all.empty:
+                self._write_symbol_monitor_records(monitor_records)
+                return alerts_all
+            selected_so_far = _v27_select_top_n_with_caps(alerts_all, int(getattr(params, "max_trades_per_day", 2) or 2), params)
+            if selected_so_far.empty:
+                self._audit_candidates(alerts_all, run_id, "rejected", "topn_caps_selected_none", stage="topn", rank_col="score")
+                self._write_symbol_monitor_records(monitor_records)
+                return selected_so_far
+            selected_so_far["timestamp"] = pd.to_datetime(selected_so_far["timestamp"], utc=True, errors="coerce")
+            if str(self.live.selection_mode).lower() == "latest_bar_only":
+                out = alerts_all[alerts_all["timestamp"] == closed_ts].copy()
+                selected_keys = set(out.apply(lambda r: self._candidate_audit_key(r), axis=1)) if not out.empty else set()
+            else:
+                out = selected_so_far[selected_so_far["timestamp"] == closed_ts].copy()
+                selected_keys = set(out.apply(lambda r: self._candidate_audit_key(r), axis=1)) if not out.empty else set()
+            not_selected = alerts_all[~alerts_all.apply(lambda r: self._candidate_audit_key(r) in selected_keys, axis=1)].copy()
+            self._audit_candidates(not_selected, run_id, "rejected", "not_latest_selected_candidate_or_topn_cap", stage="topn_latest", rank_col="score")
+            if out.empty:
+                self._write_symbol_monitor_records(monitor_records)
+                return out
+            out["session_date"] = out["timestamp"].dt.tz_convert("America/New_York").dt.date.astype(str)
+            out = out.sort_values(["score", "timestamp"], ascending=[False, True]).reset_index(drop=True)
+            out["strategy_variant"] = strategy_variant
+            out["strategy_code"] = getattr(params, "live_strategy_code", _strategy_code(strategy_variant))
+            out["strategy_label"] = getattr(params, "live_strategy_label", strategy_preset)
+            out["strategy_preset"] = strategy_preset
+            out["quality_gate"] = str(getattr(params, "live_quality_gate", "off"))
+            out["pattern_mode"] = str(getattr(params, "v379_pattern_mode", ""))
+            monitor_records = self._mark_selected_symbol_monitors(monitor_records, out)
+            self._write_symbol_monitor_records(monitor_records)
+            records = []
+            for idx, row in out.iterrows():
+                records.append(self._audit_record_from_signal(row, run_id, "accepted", "selected_for_order_planning", stage="selected", rank_after=int(idx) + 1))
+            self.store.upsert_candidate_audits(records)
+            return out
+        finally:
+            self.params = original_params
+
     def fetch_recent_signals(self) -> pd.DataFrame:
         now = _now_utc()
         run_id = pd.Timestamp(now).strftime("%Y%m%dT%H%M%SZ")
         closed_ts = latest_closed_5m_start(now)
         today_ny = closed_ts.tz_convert("America/New_York").date()
         symbols = list(dict.fromkeys([s.upper() for s in (self.live.symbols or []) if s]))
-        monitor_records: list[dict[str, Any]] = []
         bars_5m, daily = self._update_bar_cache()
+        specs = self._strategy_specs_for_current_run()
         if bars_5m.empty or daily.empty:
-            monitor_records = [self._monitor_record_for_missing_symbol(s, run_id, closed_ts, "Waiting - market data", "No 5-minute or daily bars were returned.") for s in symbols]
-            self._write_symbol_monitor_records(monitor_records)
+            records = []
+            for spec in specs:
+                params = self._make_params_for_live_config(getattr(self, "_runtime_config", {}), spec.get("preset"), spec.get("variant"), spec.get("quality_gate"))
+                original_params = self.params
+                self.params = params
+                records.extend([self._monitor_record_for_missing_symbol(s, run_id, closed_ts, "Waiting - market data", "No 5-minute or daily bars were returned.") for s in symbols])
+                self.params = original_params
+            self._write_symbol_monitor_records(records)
             return pd.DataFrame()
         bars_5m = bars_5m[pd.to_datetime(bars_5m["timestamp"], utc=True) <= closed_ts].copy()
         qqq_5m = bars_5m[bars_5m["symbol"] == "QQQ"].copy()
         qqq_daily = daily[daily["symbol"] == "QQQ"].copy()
         if qqq_5m.empty or qqq_daily.empty:
-            monitor_records = [self._monitor_record_for_missing_symbol(s, run_id, closed_ts, "Waiting - QQQ context", "QQQ context is required for relative-strength indicators.") for s in symbols]
-            self._write_symbol_monitor_records(monitor_records)
+            records = []
+            for spec in specs:
+                params = self._make_params_for_live_config(getattr(self, "_runtime_config", {}), spec.get("preset"), spec.get("variant"), spec.get("quality_gate"))
+                original_params = self.params
+                self.params = params
+                records.extend([self._monitor_record_for_missing_symbol(s, run_id, closed_ts, "Waiting - QQQ context", "QQQ context is required for relative-strength indicators.") for s in symbols])
+                self.params = original_params
+            self._write_symbol_monitor_records(records)
             return pd.DataFrame()
         qqq_context = build_qqq_context(qqq_5m, qqq_daily)
-        frames: list[pd.DataFrame] = []
-        for symbol in symbols:
-            sym_5m = bars_5m[bars_5m["symbol"] == symbol].copy()
-            sym_daily = daily[daily["symbol"] == symbol].copy()
-            if sym_5m.empty or sym_daily.empty:
-                monitor_records.append(self._monitor_record_for_missing_symbol(symbol, run_id, closed_ts, "Waiting - symbol data", "No recent 5-minute or daily bars for this symbol."))
-                continue
-            try:
-                intraday = add_intraday_features(sym_5m)
-                intraday = add_daily_features(intraday, sym_daily)
-                merged = merge_market_context(intraday, qqq_context)
-                signals = compute_signals(merged, self.params)
-            except Exception as exc:
-                monitor_records.append(self._monitor_record_for_missing_symbol(symbol, run_id, closed_ts, "Error - indicator calculation", str(exc)[:220]))
-                continue
-            if signals.empty:
-                monitor_records.append(self._monitor_record_for_missing_symbol(symbol, run_id, closed_ts, "Waiting - no indicator frame", "Indicator pipeline returned no rows."))
-                continue
-            signals["timestamp"] = pd.to_datetime(signals["timestamp"], utc=True, errors="coerce")
-            same_day = signals["timestamp"].dt.tz_convert("America/New_York").dt.date.eq(today_ny)
-            latest_frame = signals[same_day & (signals["timestamp"] <= closed_ts)].copy()
-            if not latest_frame.empty:
-                latest_row = latest_frame.sort_values("timestamp").iloc[-1]
-                monitor_records.append(self._monitor_record_from_latest_row(latest_row, run_id, closed_ts))
-            else:
-                monitor_records.append(self._monitor_record_for_missing_symbol(symbol, run_id, closed_ts, "Waiting - no latest bar", "No same-day indicator row at the latest closed bar."))
-            if "buy_alert" not in signals.columns:
-                continue
-            alert_mask = signals["buy_alert"].fillna(False).astype(bool)
-            alerts = signals[same_day & (signals["timestamp"] <= closed_ts) & alert_mask].copy()
-            if alerts.empty:
-                continue
-            frames.append(alerts)
-        self._write_symbol_monitor_records(monitor_records)
-        if not frames:
+        selected_frames: list[pd.DataFrame] = []
+        for spec in specs:
+            params = self._make_params_for_live_config(getattr(self, "_runtime_config", {}), spec.get("preset"), spec.get("variant"), spec.get("quality_gate"))
+            selected = self._fetch_recent_signals_for_params(run_id, closed_ts, today_ny, symbols, bars_5m, daily, qqq_context, params)
+            if selected is not None and not selected.empty:
+                selected_frames.append(selected)
+        if not selected_frames:
             return pd.DataFrame()
-        alerts_all = pd.concat(frames, ignore_index=True)
-        alerts_all = self._add_live_v25_filter_aliases(alerts_all)
-        self._audit_candidates(alerts_all, run_id, "seen", "raw_signal_seen", stage="raw_signal", rank_col="score")
-
-        # Global live-entry schedule applies to every strategy and every gate.
-        # Strategy-internal windows can still be stricter, but they cannot bypass this dashboard schedule.
-        ts_et = pd.to_datetime(alerts_all["timestamp"], utc=True, errors="coerce").dt.tz_convert("America/New_York")
-        in_window = ts_et.map(lambda x: _time_in_window(x, getattr(self.live, "entry_start_time_et", "09:35"), getattr(self.live, "entry_end_time_et", "15:55")))
-        if not bool(getattr(self.live, "allow_extended_hours_entries", False)):
-            regular = ts_et.map(lambda x: _time_in_window(x, "09:30", "16:00"))
-            in_window = in_window & regular
-        rejected_schedule = alerts_all[~in_window].copy()
-        self._audit_candidates(rejected_schedule, run_id, "rejected", "outside_dashboard_live_entry_window", stage="global_schedule", rank_col="score")
-        alerts_all = alerts_all[in_window].copy()
-        if alerts_all.empty:
-            return alerts_all
-
-        min_score = float(getattr(self.params, "min_candidate_score", 2.0) or 2.0)
-        score_ok = pd.to_numeric(alerts_all["score"], errors="coerce").fillna(-9999.0) >= min_score
-        self._audit_candidates(alerts_all[~score_ok].copy(), run_id, "rejected", f"score_below_min_{min_score:g}", stage="min_score", rank_col="score")
-        alerts_all = alerts_all[score_ok].copy()
-        if alerts_all.empty:
-            return alerts_all
-
-        before_candle = alerts_all.copy()
-        alerts_all = _apply_v25_candlestick_filter(alerts_all, str(getattr(self.params, "candle_pattern_mode", "selective")))
-        removed_keys = set(before_candle.apply(lambda r: self._candidate_audit_key(r), axis=1)) - set(alerts_all.apply(lambda r: self._candidate_audit_key(r), axis=1)) if not before_candle.empty else set()
-        if removed_keys:
-            removed = before_candle[before_candle.apply(lambda r: self._candidate_audit_key(r) in removed_keys, axis=1)].copy()
-            self._audit_candidates(removed, run_id, "rejected", "candlestick_filter", stage="candlestick", rank_col="score")
-        if alerts_all.empty:
-            return alerts_all
-
-        before_pre = alerts_all.copy()
-        alerts_all, stats = _v27_apply_preselection_filters(alerts_all, self.params, use_news=bool(self.live.use_news_proxy))
-        removed_keys = set(before_pre.apply(lambda r: self._candidate_audit_key(r), axis=1)) - set(alerts_all.apply(lambda r: self._candidate_audit_key(r), axis=1)) if not before_pre.empty else set()
-        if removed_keys:
-            removed = before_pre[before_pre.apply(lambda r: self._candidate_audit_key(r) in removed_keys, axis=1)].copy()
-            self._audit_candidates(removed, run_id, "rejected", "preselection_or_quality_gate_filter", stage="preselection", rank_col="score")
-        if bool(getattr(self.live, "q_learning_filter_enabled", False)) and not alerts_all.empty:
-            try:
-                policy_path = str(getattr(self.live, "q_learning_policy_path", "") or getattr(self.params, "q_learning_policy_path", "") or "").strip()
-                if policy_path:
-                    q_model = load_q_model(policy_path)
-                    q_reviewed = apply_q_policy(
-                        alerts_all,
-                        q_model,
-                        min_edge=float(getattr(self.live, "q_learning_min_edge", 0.0) or 0.0),
-                        min_state_count=int(getattr(self.live, "q_learning_min_state_count", 8) or 8),
-                    )
-                    approved = q_reviewed["q_policy_approved"].fillna(False).astype(bool)
-                    self._audit_candidates(q_reviewed[~approved].copy(), run_id, "rejected", "q_policy_rejected", stage="q_policy", rank_col="score")
-                    self.store.set_state("last_q_policy_stats", {
-                        "enabled": True,
-                        "policy_path": policy_path,
-                        "reviewed": int(len(q_reviewed)),
-                        "approved": int(approved.sum()),
-                        "rejected": int(len(q_reviewed) - int(approved.sum())),
-                    })
-                    alerts_all = q_reviewed[approved].copy()
-                else:
-                    self.store.set_state("last_q_policy_stats", {"enabled": True, "error": "LIVE_Q_POLICY_PATH is blank"})
-                    return pd.DataFrame()
-            except Exception as exc:
-                self.store.insert_event("q_policy_filter_error", {"message": str(exc)}, status="error")
-                return pd.DataFrame()
-        if bool(getattr(self.live, "ml_ranker_filter_enabled", False)) and not alerts_all.empty:
-            try:
-                ml_path = str(getattr(self.live, "ml_ranker_model_path", "") or getattr(self.params, "ml_ranker_model_path", "") or "").strip()
-                if ml_path:
-                    ml_model = load_ranker_model(ml_path)
-                    ml_reviewed = score_ml_ranker_candidates(alerts_all, ml_model)
-                    min_pred = float(getattr(self.live, "ml_ranker_min_pred_r", getattr(self.params, "ml_ranker_min_pred_r", 0.05)) or 0.05)
-                    min_win = float(getattr(self.live, "ml_ranker_min_win_prob", getattr(self.params, "ml_ranker_min_win_prob", 0.0)) or 0.0)
-                    approved = pd.to_numeric(ml_reviewed.get("ml_pred_r", -9999.0), errors="coerce").fillna(-9999.0) >= min_pred
-                    if min_win > 0 and "ml_pred_win_prob" in ml_reviewed.columns:
-                        approved = approved & (pd.to_numeric(ml_reviewed["ml_pred_win_prob"], errors="coerce").fillna(0.0) >= min_win)
-                    self._audit_candidates(ml_reviewed[~approved].copy(), run_id, "rejected", "ml_ranker_rejected", stage="ml_ranker", rank_col="score")
-                    self.store.set_state("last_ml_ranker_stats", {
-                        "enabled": True,
-                        "model_path": ml_path,
-                        "reviewed": int(len(ml_reviewed)),
-                        "approved": int(approved.sum()),
-                        "rejected": int(len(ml_reviewed) - int(approved.sum())),
-                        "min_pred_r": min_pred,
-                        "min_win_prob": min_win,
-                    })
-                    alerts_all = ml_reviewed[approved].copy()
-                else:
-                    self.store.set_state("last_ml_ranker_stats", {"enabled": True, "error": "LIVE_ML_RANKER_MODEL_PATH is blank"})
-                    return pd.DataFrame()
-            except Exception as exc:
-                self.store.insert_event("ml_ranker_filter_error", {"message": str(exc)}, status="error")
-                return pd.DataFrame()
-
-        self.store.set_state("last_filter_stats", stats)
-        if alerts_all.empty:
-            return alerts_all
-        selected_so_far = _v27_select_top_n_with_caps(alerts_all, int(getattr(self.params, "max_trades_per_day", 2) or 2), self.params)
-        if selected_so_far.empty:
-            self._audit_candidates(alerts_all, run_id, "rejected", "topn_caps_selected_none", stage="topn", rank_col="score")
-            return selected_so_far
-        selected_so_far["timestamp"] = pd.to_datetime(selected_so_far["timestamp"], utc=True, errors="coerce")
-        if str(self.live.selection_mode).lower() == "latest_bar_only":
-            out = alerts_all[alerts_all["timestamp"] == closed_ts].copy()
-            selected_keys = set(out.apply(lambda r: self._candidate_audit_key(r), axis=1)) if not out.empty else set()
-        else:
-            out = selected_so_far[selected_so_far["timestamp"] == closed_ts].copy()
-            selected_keys = set(out.apply(lambda r: self._candidate_audit_key(r), axis=1)) if not out.empty else set()
-        not_selected = alerts_all[~alerts_all.apply(lambda r: self._candidate_audit_key(r) in selected_keys, axis=1)].copy()
-        self._audit_candidates(not_selected, run_id, "rejected", "not_latest_selected_candidate_or_topn_cap", stage="topn_latest", rank_col="score")
-        if out.empty:
-            return out
-        out["session_date"] = out["timestamp"].dt.tz_convert("America/New_York").dt.date.astype(str)
-        out = out.sort_values(["score", "timestamp"], ascending=[False, True]).reset_index(drop=True)
-        monitor_records = self._mark_selected_symbol_monitors(monitor_records, out)
-        self._write_symbol_monitor_records(monitor_records)
-        records = []
-        for idx, row in out.iterrows():
-            records.append(self._audit_record_from_signal(row, run_id, "accepted", "selected_for_order_planning", stage="selected", rank_after=int(idx) + 1))
-        self.store.upsert_candidate_audits(records)
-        return out
+        out = pd.concat(selected_frames, ignore_index=True)
+        if "score" in out.columns:
+            out["score"] = pd.to_numeric(out["score"], errors="coerce").fillna(0.0)
+            out = out.sort_values(["score", "timestamp", "strategy_variant"], ascending=[False, True, True])
+        return out.reset_index(drop=True)
 
     def _latest_reference_prices(self, symbols: list[str]) -> dict[str, float]:
         out: dict[str, float] = {}
@@ -1387,6 +1568,7 @@ class LivePaperTradingEngine:
         keep_prefixes = ("v379_", "v383_", "v384_", "v385_", "positive_context_", "q_", "ml_")
         keep_names = {
             "symbol", "timestamp", "side", "trigger_type", "candidate_score", "score", "quality",
+            "strategy_variant", "strategy_preset", "quality_gate", "pattern_mode",
             "rvol_time_of_day", "daily_atr14_percent", "gap_percent", "day_relative_strength",
             "open_relative_strength", "vwap_extension_atr", "qqq_change_from_open",
             "qqq_day_change_percent", "atr5m14", "close", "open", "high", "low", "volume",
@@ -1409,7 +1591,18 @@ class LivePaperTradingEngine:
                     out[str(key)] = value
         return out
 
-    def build_order_plan(self, signal: pd.Series, equity: float, high_watermark: float, reference_price: float | None = None) -> dict[str, Any] | None:
+    def _params_for_signal(self, signal: pd.Series | dict[str, Any]) -> StrategyParams:
+        data = signal.to_dict() if hasattr(signal, "to_dict") else dict(signal or {})
+        spec = _strategy_spec_from_signal_values(
+            data.get("strategy_variant"),
+            data.get("strategy_preset"),
+            data.get("quality_gate"),
+            data.get("strategy_code"),
+        )
+        return self._make_params_for_live_config(getattr(self, "_runtime_config", {}), spec.get("preset"), spec.get("variant"), spec.get("quality_gate"))
+
+    def build_order_plan(self, signal: pd.Series, equity: float, high_watermark: float, reference_price: float | None = None, params: StrategyParams | None = None) -> dict[str, Any] | None:
+        params = params or self._params_for_signal(signal)
         side = str(signal.get("side", "")).lower()
         if side not in {"long", "short"}:
             return None
@@ -1418,17 +1611,17 @@ class LivePaperTradingEngine:
         atr_value = _safe_float(signal.get("atr5m14"), 0.0)
         if entry_price <= 0 or atr_value <= 0:
             return None
-        risk_per_share = max(entry_price * float(getattr(self.params, "v25_min_stop_pct", 0.0015)), float(getattr(self.params, "v25_stop_atr_mult", 0.60)) * atr_value)
+        risk_per_share = max(entry_price * float(getattr(params, "v25_min_stop_pct", 0.0015)), float(getattr(params, "v25_stop_atr_mult", 0.60)) * atr_value)
         if risk_per_share <= 0:
             return None
-        target_r = float(getattr(self.params, "v25_target_r", 0.75))
+        target_r = float(getattr(params, "v25_target_r", 0.75))
         if side == "long":
             stop_price = entry_price - risk_per_share
             target_price = entry_price + target_r * risk_per_share
         else:
             stop_price = entry_price + risk_per_share
             target_price = entry_price - target_r * risk_per_share
-        risk_budget, effective_pct, dd_pct, paused = _v28_calculate_risk_budget(equity, high_watermark, self.params)
+        risk_budget, effective_pct, dd_pct, paused = _v28_calculate_risk_budget(equity, high_watermark, params)
         if paused or risk_budget <= 0:
             return None
         raw_qty = risk_budget / risk_per_share
@@ -1438,8 +1631,10 @@ class LivePaperTradingEngine:
         sig_ts = pd.Timestamp(signal.get("timestamp")).tz_convert("UTC")
         ts_et = sig_ts.tz_convert("America/New_York")
         symbol = str(signal.get("symbol", "")).upper()
-        client_order_id = f"rmv33-{symbol}-{ts_et.strftime('%Y%m%d%H%M')}-{side[0]}"[:48]
-        max_hold_until = sig_ts + pd.Timedelta(minutes=5 * int(getattr(self.params, "v25_max_hold_bars", 12)))
+        strategy_variant = str(signal.get("strategy_variant") or getattr(params, "live_strategy_variant", getattr(self.live, "strategy_variant", "best_report_153601"))).strip().lower()
+        strategy_code = str(signal.get("strategy_code") or getattr(params, "live_strategy_code", _strategy_code(strategy_variant))).strip().lower()
+        client_order_id = f"rmv33-{strategy_code}-{symbol}-{ts_et.strftime('%Y%m%d%H%M')}-{side[0]}"[:48]
+        max_hold_until = sig_ts + pd.Timedelta(minutes=5 * int(getattr(params, "v25_max_hold_bars", 12)))
         return {
             "symbol": symbol,
             "strategy_side": side,
@@ -1461,11 +1656,12 @@ class LivePaperTradingEngine:
             "max_hold_until_utc": max_hold_until.isoformat(),
             "client_order_id": client_order_id,
             "submitted_at_utc": utc_now_iso(),
-            "strategy_variant": getattr(self.params, "live_strategy_variant", getattr(self.live, "strategy_variant", "best_report_153601")),
-            "strategy_preset": getattr(self.params, "live_strategy_preset", "env"),
-            "strategy_profile": str(getattr(self.params, "strategy_profile", "symbol_playbook_v25")),
-            "quality_gate": getattr(self.params, "live_quality_gate", "env"),
-            "pattern_mode": str(getattr(self.params, "v379_pattern_mode", "")),
+            "strategy_variant": strategy_variant,
+            "strategy_code": strategy_code,
+            "strategy_preset": str(signal.get("strategy_preset") or getattr(params, "live_strategy_preset", "env")),
+            "strategy_profile": str(getattr(params, "strategy_profile", "symbol_playbook_v25")),
+            "quality_gate": str(signal.get("quality_gate") or getattr(params, "live_quality_gate", "env")),
+            "pattern_mode": str(signal.get("pattern_mode") or getattr(params, "v379_pattern_mode", "")),
             "selection_mode": str(getattr(self.live, "selection_mode", "seen_so_far_top_n")),
             "signal_context": self._signal_context_payload(signal),
         }
@@ -1563,7 +1759,7 @@ class LivePaperTradingEngine:
             return rows
         signals = self.fetch_recent_signals()
         if signals.empty:
-            row = {"timestamp": timestamp, "event": "no_signal", "message": f"No signal on latest eligible closed 5-minute bar for strategy {getattr(self.params, 'live_strategy_variant', getattr(self.live, 'strategy_variant', 'best_report_153601'))}."}
+            row = {"timestamp": timestamp, "event": "no_signal", "message": f"No signal on latest eligible closed 5-minute bar for strategy mode {getattr(self.live, 'strategy_run_mode', 'single')} ({getattr(self.live, 'active_strategy_count', 1)} active strategy/strategies)."}
             rows.append(row)
             self.store.insert_event("no_signal", row, status="idle")
             _append_log(self.live.log_path, rows)
@@ -1572,26 +1768,30 @@ class LivePaperTradingEngine:
             return rows
         submitted = list(self.state.get("submitted_signal_keys", []))
         today = datetime.now(NY).date().isoformat()
-        remaining_daily = max(0, int(self.live.max_daily_trades) - self._daily_order_count(today))
-        available_slots = max(0, int(self.live.max_open_positions) - len(existing))
+        strategy_multiplier = max(1, int(getattr(self.live, "active_strategy_count", 1) or 1)) if str(getattr(self.live, "strategy_run_mode", "single")).lower() == "all_strategies" else 1
+        effective_daily_limit = max(1, int(self.live.max_daily_trades)) * strategy_multiplier
+        effective_open_limit = max(1, int(self.live.max_open_positions)) * strategy_multiplier
+        remaining_daily = max(0, effective_daily_limit - self._daily_order_count(today))
+        available_slots = max(0, effective_open_limit - len(existing))
         capacity = min(remaining_daily, available_slots)
         if capacity <= 0:
-            row = {"timestamp": timestamp, "event": "capacity_full", "message": "Daily/open-position limits reached.", "signals_seen": len(signals)}
+            row = {"timestamp": timestamp, "event": "capacity_full", "message": "Daily/open-position limits reached.", "signals_seen": len(signals), "strategy_run_mode": getattr(self.live, "strategy_run_mode", "single"), "effective_daily_limit": effective_daily_limit, "effective_open_limit": effective_open_limit}
             rows.append(row)
             self.store.insert_event("capacity_full", row, status="blocked")
             _append_log(self.live.log_path, rows)
-            self._heartbeat("blocked", "Capacity full.", {"signals_seen": len(signals), "open_positions": len(existing)})
+            self._heartbeat("blocked", "Capacity full.", {"signals_seen": len(signals), "open_positions": len(existing), "effective_daily_limit": effective_daily_limit, "effective_open_limit": effective_open_limit})
             self._save_engine_state()
             return rows
         quote_lookup = self._latest_reference_prices([str(s).upper() for s in signals["symbol"].dropna().unique().tolist()])
         taken = 0
         for _, signal in signals.iterrows():
             sym = str(signal.get("symbol", "")).upper()
-            plan = self.build_order_plan(signal, equity, high_watermark, reference_price=quote_lookup.get(sym))
+            signal_params = self._params_for_signal(signal)
+            plan = self.build_order_plan(signal, equity, high_watermark, reference_price=quote_lookup.get(sym), params=signal_params)
             if not plan:
                 self.store.upsert_candidate_audit(self._audit_record_from_signal(signal, timestamp, "rejected", "sizing_or_invalid_order_plan", stage="order_plan"))
                 continue
-            key = f"{plan['symbol']}|{plan['session_date']}|{plan['signal_time_et']}|{plan['strategy_side']}|{plan['trigger_type']}"
+            key = f"{plan.get('strategy_variant','')}|{plan['symbol']}|{plan['session_date']}|{plan['signal_time_et']}|{plan['strategy_side']}|{plan['trigger_type']}"
             if key in submitted:
                 self.store.upsert_candidate_audit(self._audit_record_from_signal(signal, timestamp, "rejected", "duplicate_signal_already_submitted", stage="submit_checks", plan=plan))
                 continue
@@ -1634,6 +1834,10 @@ class LivePaperTradingEngine:
             self.state["submitted_strategy_order_records"] = self._merge_strategy_order_records([
                 {
                     "client_order_id": plan["client_order_id"],
+                    "strategy_variant": plan.get("strategy_variant"),
+                    "strategy_preset": plan.get("strategy_preset"),
+                    "strategy_code": plan.get("strategy_code"),
+                    "quality_gate": plan.get("quality_gate"),
                     "symbol": plan["symbol"],
                     "session_date": plan["session_date"],
                     "signal_time_et": plan["signal_time_et"],

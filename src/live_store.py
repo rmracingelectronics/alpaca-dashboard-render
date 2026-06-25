@@ -193,6 +193,15 @@ class LiveStore:
                 status TEXT,
                 alpaca_order_id TEXT,
                 dry_run INTEGER,
+                strategy_variant TEXT,
+                strategy_code TEXT,
+                strategy_preset TEXT,
+                strategy_profile TEXT,
+                quality_gate TEXT,
+                pattern_mode TEXT,
+                selection_mode TEXT,
+                realized_pl REAL,
+                realized_r REAL,
                 payload_json TEXT
             )
             """,
@@ -209,6 +218,7 @@ class LiveStore:
                 strategy_side TEXT,
                 trigger_type TEXT,
                 strategy_variant TEXT,
+                strategy_code TEXT,
                 strategy_preset TEXT,
                 strategy_profile TEXT,
                 quality_gate TEXT,
@@ -249,6 +259,61 @@ class LiveStore:
                 latest_bar_time_et TEXT,
                 session_date TEXT,
                 strategy_variant TEXT,
+                strategy_code TEXT,
+                strategy_label TEXT,
+                strategy_preset TEXT,
+                strategy_profile TEXT,
+                quality_gate TEXT,
+                pattern_mode TEXT,
+                selection_mode TEXT,
+                feed TEXT,
+                monitor_status TEXT,
+                decision_status TEXT,
+                reject_reason TEXT,
+                setup_signal INTEGER,
+                selected_signal INTEGER,
+                in_entry_window INTEGER,
+                liquidity_ok INTEGER,
+                score_ok INTEGER,
+                quality_gate_ok INTEGER,
+                candle_ok INTEGER,
+                checks_passed INTEGER,
+                checks_total INTEGER,
+                check_summary TEXT,
+                symbol_side_bias TEXT,
+                strategy_side TEXT,
+                trigger_type TEXT,
+                candidate_score REAL,
+                final_rank_score REAL,
+                close_price REAL,
+                volume REAL,
+                rvol_time_of_day REAL,
+                daily_atr14_percent REAL,
+                gap_percent REAL,
+                day_relative_strength REAL,
+                open_relative_strength REAL,
+                vwap_extension_atr REAL,
+                qqq_change_from_open REAL,
+                qqq_day_change_percent REAL,
+                atr5m14 REAL,
+                ema9 REAL,
+                ema20 REAL,
+                session_vwap REAL,
+                payload_json TEXT
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS live_strategy_symbol_monitor (
+                monitor_key TEXT PRIMARY KEY,
+                symbol TEXT,
+                run_id TEXT,
+                updated_at_utc TEXT,
+                latest_bar_time_utc TEXT,
+                latest_bar_time_et TEXT,
+                session_date TEXT,
+                strategy_variant TEXT,
+                strategy_code TEXT,
+                strategy_label TEXT,
                 strategy_preset TEXT,
                 strategy_profile TEXT,
                 quality_gate TEXT,
@@ -313,6 +378,10 @@ class LiveStore:
         ]
         for stmt in statements:
             self._execute(stmt)
+        # Migrate older Render/local tables before creating indexes that reference
+        # newly added columns.  This keeps redeploys safe even if an older build
+        # created a partial live_* schema.
+        self._ensure_schema_migrations()
         indexes = [
             "CREATE INDEX IF NOT EXISTS idx_live_events_created ON live_events(created_at_utc)",
             "CREATE INDEX IF NOT EXISTS idx_live_events_symbol ON live_events(symbol)",
@@ -327,10 +396,12 @@ class LiveStore:
             "CREATE INDEX IF NOT EXISTS idx_live_symbol_monitor_updated ON live_symbol_monitor(updated_at_utc)",
             "CREATE INDEX IF NOT EXISTS idx_live_symbol_monitor_status ON live_symbol_monitor(monitor_status)",
             "CREATE INDEX IF NOT EXISTS idx_live_symbol_monitor_strategy ON live_symbol_monitor(strategy_variant, quality_gate)",
+            "CREATE INDEX IF NOT EXISTS idx_live_strategy_symbol_monitor_symbol ON live_strategy_symbol_monitor(symbol)",
+            "CREATE INDEX IF NOT EXISTS idx_live_strategy_symbol_monitor_strategy ON live_strategy_symbol_monitor(strategy_variant, quality_gate)",
+            "CREATE INDEX IF NOT EXISTS idx_live_strategy_symbol_monitor_updated ON live_strategy_symbol_monitor(updated_at_utc)",
         ]
         for stmt in indexes:
             self._execute(stmt)
-        self._ensure_schema_migrations()
 
     def _column_exists(self, table: str, column: str) -> bool:
         try:
@@ -380,6 +451,7 @@ class LiveStore:
                 ("risk_per_share", "REAL"),
                 ("dry_run", "INTEGER"),
                 ("strategy_variant", "TEXT"),
+                ("strategy_code", "TEXT"),
                 ("strategy_preset", "TEXT"),
                 ("strategy_profile", "TEXT"),
                 ("quality_gate", "TEXT"),
@@ -438,6 +510,59 @@ class LiveStore:
                 ("ema9", "REAL"),
                 ("ema20", "REAL"),
                 ("session_vwap", "REAL"),
+                ("strategy_code", "TEXT"),
+                ("strategy_label", "TEXT"),
+                ("payload_json", "TEXT"),
+            ],
+            "live_strategy_symbol_monitor": [
+                ("monitor_key", "TEXT"),
+                ("symbol", "TEXT"),
+                ("run_id", "TEXT"),
+                ("updated_at_utc", "TEXT"),
+                ("latest_bar_time_utc", "TEXT"),
+                ("latest_bar_time_et", "TEXT"),
+                ("session_date", "TEXT"),
+                ("strategy_variant", "TEXT"),
+                ("strategy_code", "TEXT"),
+                ("strategy_label", "TEXT"),
+                ("strategy_preset", "TEXT"),
+                ("strategy_profile", "TEXT"),
+                ("quality_gate", "TEXT"),
+                ("pattern_mode", "TEXT"),
+                ("selection_mode", "TEXT"),
+                ("feed", "TEXT"),
+                ("monitor_status", "TEXT"),
+                ("decision_status", "TEXT"),
+                ("reject_reason", "TEXT"),
+                ("setup_signal", "INTEGER"),
+                ("selected_signal", "INTEGER"),
+                ("in_entry_window", "INTEGER"),
+                ("liquidity_ok", "INTEGER"),
+                ("score_ok", "INTEGER"),
+                ("quality_gate_ok", "INTEGER"),
+                ("candle_ok", "INTEGER"),
+                ("checks_passed", "INTEGER"),
+                ("checks_total", "INTEGER"),
+                ("check_summary", "TEXT"),
+                ("symbol_side_bias", "TEXT"),
+                ("strategy_side", "TEXT"),
+                ("trigger_type", "TEXT"),
+                ("candidate_score", "REAL"),
+                ("final_rank_score", "REAL"),
+                ("close_price", "REAL"),
+                ("volume", "REAL"),
+                ("rvol_time_of_day", "REAL"),
+                ("daily_atr14_percent", "REAL"),
+                ("gap_percent", "REAL"),
+                ("day_relative_strength", "REAL"),
+                ("open_relative_strength", "REAL"),
+                ("vwap_extension_atr", "REAL"),
+                ("qqq_change_from_open", "REAL"),
+                ("qqq_day_change_percent", "REAL"),
+                ("atr5m14", "REAL"),
+                ("ema9", "REAL"),
+                ("ema20", "REAL"),
+                ("session_vwap", "REAL"),
                 ("payload_json", "TEXT"),
             ],
             "live_candidate_audit": [
@@ -451,6 +576,7 @@ class LiveStore:
                 ("strategy_side", "TEXT"),
                 ("trigger_type", "TEXT"),
                 ("strategy_variant", "TEXT"),
+                ("strategy_code", "TEXT"),
                 ("strategy_preset", "TEXT"),
                 ("strategy_profile", "TEXT"),
                 ("quality_gate", "TEXT"),
@@ -500,6 +626,9 @@ class LiveStore:
             "CREATE INDEX IF NOT EXISTS idx_live_symbol_monitor_updated_desc ON live_symbol_monitor (updated_at_utc DESC)",
             "CREATE INDEX IF NOT EXISTS idx_live_symbol_monitor_status_idx ON live_symbol_monitor (monitor_status)",
             "CREATE INDEX IF NOT EXISTS idx_live_symbol_monitor_strategy_idx ON live_symbol_monitor (strategy_variant, quality_gate)",
+            "CREATE INDEX IF NOT EXISTS idx_live_strategy_symbol_monitor_updated_desc ON live_strategy_symbol_monitor (updated_at_utc DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_live_strategy_symbol_monitor_strategy_idx ON live_strategy_symbol_monitor (strategy_variant, quality_gate)",
+            "CREATE INDEX IF NOT EXISTS idx_live_strategy_symbol_monitor_symbol_idx ON live_strategy_symbol_monitor (symbol)",
         ]
         for sql in index_statements:
             try:
@@ -541,6 +670,7 @@ class LiveStore:
             "alpaca_order_id": plan.get("alpaca_order_id"),
             "dry_run": 1 if bool(plan.get("dry_run", False)) else 0,
             "strategy_variant": plan.get("strategy_variant"),
+            "strategy_code": plan.get("strategy_code"),
             "strategy_preset": plan.get("strategy_preset"),
             "strategy_profile": plan.get("strategy_profile"),
             "quality_gate": plan.get("quality_gate"),
@@ -834,6 +964,7 @@ class LiveStore:
             "strategy_side": record.get("strategy_side"),
             "trigger_type": record.get("trigger_type"),
             "strategy_variant": record.get("strategy_variant"),
+            "strategy_code": record.get("strategy_code"),
             "strategy_preset": record.get("strategy_preset"),
             "strategy_profile": record.get("strategy_profile"),
             "quality_gate": record.get("quality_gate"),
@@ -879,6 +1010,116 @@ class LiveStore:
             except Exception:
                 pass
 
+    def _ensure_strategy_symbol_monitor_table(self) -> None:
+        """Create/lightly migrate the per-strategy symbol monitor table.
+
+        The dashboard diagnostic endpoints use LiveStore(initialize_schema=False), so
+        this helper must be safe and fast: it creates the table when missing and
+        adds any missing additive columns without running the full live schema.
+        """
+        self._execute(
+            """
+            CREATE TABLE IF NOT EXISTS live_strategy_symbol_monitor (
+                monitor_key TEXT PRIMARY KEY,
+                symbol TEXT, run_id TEXT, updated_at_utc TEXT, latest_bar_time_utc TEXT, latest_bar_time_et TEXT, session_date TEXT,
+                strategy_variant TEXT, strategy_code TEXT, strategy_label TEXT, strategy_preset TEXT, strategy_profile TEXT, quality_gate TEXT, pattern_mode TEXT, selection_mode TEXT, feed TEXT,
+                monitor_status TEXT, decision_status TEXT, reject_reason TEXT, setup_signal INTEGER, selected_signal INTEGER, in_entry_window INTEGER,
+                liquidity_ok INTEGER, score_ok INTEGER, quality_gate_ok INTEGER, candle_ok INTEGER, checks_passed INTEGER, checks_total INTEGER,
+                check_summary TEXT, symbol_side_bias TEXT, strategy_side TEXT, trigger_type TEXT, candidate_score REAL, final_rank_score REAL, close_price REAL,
+                volume REAL, rvol_time_of_day REAL, daily_atr14_percent REAL, gap_percent REAL, day_relative_strength REAL, open_relative_strength REAL,
+                vwap_extension_atr REAL, qqq_change_from_open REAL, qqq_day_change_percent REAL, atr5m14 REAL, ema9 REAL, ema20 REAL, session_vwap REAL, payload_json TEXT
+            )
+            """
+        )
+        for column, definition in [
+            ("strategy_code", "TEXT"),
+            ("strategy_label", "TEXT"),
+            ("strategy_preset", "TEXT"),
+            ("strategy_profile", "TEXT"),
+            ("quality_gate", "TEXT"),
+            ("pattern_mode", "TEXT"),
+            ("selection_mode", "TEXT"),
+            ("payload_json", "TEXT"),
+        ]:
+            self._add_column_if_missing("live_strategy_symbol_monitor", column, definition)
+
+    def upsert_strategy_symbol_monitor_snapshot(self, record: dict[str, Any], prepared: dict[str, Any] | None = None) -> None:
+        if not record:
+            return
+        data = dict(prepared or {})
+        if not data:
+            # Reuse the main normalizer by building only the fields needed here.
+            symbol = str(record.get("symbol") or "").upper().strip()
+            if not symbol:
+                return
+            data = {
+                "symbol": symbol,
+                "run_id": record.get("run_id"),
+                "updated_at_utc": record.get("updated_at_utc") or utc_now_iso(),
+                "latest_bar_time_utc": record.get("latest_bar_time_utc"),
+                "latest_bar_time_et": record.get("latest_bar_time_et"),
+                "session_date": record.get("session_date"),
+                "strategy_variant": record.get("strategy_variant"),
+                "strategy_code": record.get("strategy_code"),
+                "strategy_label": record.get("strategy_label"),
+                "strategy_preset": record.get("strategy_preset"),
+                "strategy_profile": record.get("strategy_profile"),
+                "quality_gate": record.get("quality_gate"),
+                "pattern_mode": record.get("pattern_mode"),
+                "selection_mode": record.get("selection_mode"),
+                "feed": record.get("feed"),
+                "monitor_status": record.get("monitor_status"),
+                "decision_status": record.get("decision_status"),
+                "reject_reason": record.get("reject_reason"),
+                "setup_signal": int(bool(record.get("setup_signal"))) if record.get("setup_signal") is not None else None,
+                "selected_signal": int(bool(record.get("selected_signal"))) if record.get("selected_signal") is not None else None,
+                "in_entry_window": int(bool(record.get("in_entry_window"))) if record.get("in_entry_window") is not None else None,
+                "liquidity_ok": int(bool(record.get("liquidity_ok"))) if record.get("liquidity_ok") is not None else None,
+                "score_ok": int(bool(record.get("score_ok"))) if record.get("score_ok") is not None else None,
+                "quality_gate_ok": int(bool(record.get("quality_gate_ok"))) if record.get("quality_gate_ok") is not None else None,
+                "candle_ok": int(bool(record.get("candle_ok"))) if record.get("candle_ok") is not None else None,
+                "checks_passed": record.get("checks_passed"),
+                "checks_total": record.get("checks_total"),
+                "check_summary": record.get("check_summary"),
+                "symbol_side_bias": record.get("symbol_side_bias"),
+                "strategy_side": record.get("strategy_side"),
+                "trigger_type": record.get("trigger_type"),
+                "candidate_score": self._float_or_none(record.get("candidate_score")),
+                "final_rank_score": self._float_or_none(record.get("final_rank_score")),
+                "close_price": self._float_or_none(record.get("close_price")),
+                "volume": self._float_or_none(record.get("volume")),
+                "rvol_time_of_day": self._float_or_none(record.get("rvol_time_of_day")),
+                "daily_atr14_percent": self._float_or_none(record.get("daily_atr14_percent")),
+                "gap_percent": self._float_or_none(record.get("gap_percent")),
+                "day_relative_strength": self._float_or_none(record.get("day_relative_strength")),
+                "open_relative_strength": self._float_or_none(record.get("open_relative_strength")),
+                "vwap_extension_atr": self._float_or_none(record.get("vwap_extension_atr")),
+                "qqq_change_from_open": self._float_or_none(record.get("qqq_change_from_open")),
+                "qqq_day_change_percent": self._float_or_none(record.get("qqq_day_change_percent")),
+                "atr5m14": self._float_or_none(record.get("atr5m14")),
+                "ema9": self._float_or_none(record.get("ema9")),
+                "ema20": self._float_or_none(record.get("ema20")),
+                "session_vwap": self._float_or_none(record.get("session_vwap")),
+                "payload_json": _json_dumps(record.get("payload", record)),
+            }
+        symbol = str(data.get("symbol") or "").upper().strip()
+        if not symbol:
+            return
+        variant = str(data.get("strategy_variant") or "unknown").strip().lower() or "unknown"
+        code = str(data.get("strategy_code") or "").strip().lower()
+        gate = str(data.get("quality_gate") or "off").strip().lower() or "off"
+        data["monitor_key"] = str(record.get("monitor_key") or f"{symbol}|{code or variant}|{gate}")
+        cols = ["monitor_key"] + [c for c in data.keys() if c != "monitor_key"]
+        ph = self._ph()
+        self._ensure_strategy_symbol_monitor_table()
+        placeholders = ",".join([ph] * len(cols))
+        update_cols = [c for c in cols if c != "monitor_key"]
+        sql = f"""
+            INSERT INTO live_strategy_symbol_monitor ({','.join(cols)}) VALUES ({placeholders})
+            ON CONFLICT(monitor_key) DO UPDATE SET {','.join([f'{c}=excluded.{c}' for c in update_cols])}
+        """
+        self._execute(sql, [data.get(c) for c in cols])
+
 
     def upsert_symbol_monitor_snapshot(self, record: dict[str, Any]) -> None:
         """Persist one lightweight per-symbol live indicator/decision snapshot.
@@ -901,6 +1142,8 @@ class LiveStore:
             "latest_bar_time_et": record.get("latest_bar_time_et"),
             "session_date": record.get("session_date"),
             "strategy_variant": record.get("strategy_variant"),
+            "strategy_code": record.get("strategy_code"),
+            "strategy_label": record.get("strategy_label"),
             "strategy_preset": record.get("strategy_preset"),
             "strategy_profile": record.get("strategy_profile"),
             "quality_gate": record.get("quality_gate"),
@@ -949,9 +1192,26 @@ class LiveStore:
             ON CONFLICT(symbol) DO UPDATE SET {','.join([f'{c}=excluded.{c}' for c in update_cols])}
         """
         self._execute(sql, [data[c] for c in cols])
+        try:
+            self.upsert_strategy_symbol_monitor_snapshot(record, data)
+        except Exception:
+            pass
 
     def upsert_symbol_monitor_snapshots(self, records: Iterable[dict[str, Any]]) -> None:
-        for rec in records or []:
+        rows = list(records or [])
+        if not rows:
+            return
+        # Keep the per-strategy monitor table representing the latest worker scan.
+        # The legacy live_symbol_monitor table remains one row per symbol for backward compatibility.
+        run_id = str(rows[0].get("run_id") or "").strip()
+        if run_id:
+            try:
+                self._ensure_strategy_symbol_monitor_table()
+                ph = self._ph()
+                self._execute(f"DELETE FROM live_strategy_symbol_monitor WHERE run_id IS NOT NULL AND run_id <> {ph}", [run_id])
+            except Exception:
+                pass
+        for rec in rows:
             try:
                 self.upsert_symbol_monitor_snapshot(rec)
             except Exception:
@@ -983,6 +1243,7 @@ class LiveStore:
             "live_worker_state",
             "live_candidate_audit",
             "live_symbol_monitor",
+            "live_strategy_symbol_monitor",
         }
         if table not in allowed:
             raise ValueError(f"Unsupported table for count: {table}")
@@ -1002,8 +1263,8 @@ class LiveStore:
 
     def latest_symbol_monitor(self, limit: int = 250) -> pd.DataFrame:
         cols = [
-            "symbol", "updated_at_utc", "latest_bar_time_utc", "latest_bar_time_et", "session_date",
-            "strategy_variant", "strategy_preset", "strategy_profile", "quality_gate", "pattern_mode",
+            "monitor_key", "symbol", "updated_at_utc", "latest_bar_time_utc", "latest_bar_time_et", "session_date",
+            "strategy_variant", "strategy_code", "strategy_label", "strategy_preset", "strategy_profile", "quality_gate", "pattern_mode",
             "selection_mode", "feed", "monitor_status", "decision_status", "reject_reason",
             "setup_signal", "selected_signal", "in_entry_window", "liquidity_ok", "score_ok",
             "quality_gate_ok", "candle_ok", "checks_passed", "checks_total", "check_summary",
@@ -1012,9 +1273,19 @@ class LiveStore:
             "day_relative_strength", "open_relative_strength", "vwap_extension_atr", "qqq_change_from_open",
             "qqq_day_change_percent", "atr5m14", "ema9", "ema20", "session_vwap", "payload_json",
         ]
+        try:
+            df = self._fetch_df(
+                f"SELECT * FROM live_strategy_symbol_monitor ORDER BY strategy_variant ASC, symbol ASC LIMIT {int(limit)}",
+                columns=cols,
+            )
+            if df is not None and not df.empty:
+                return df
+        except Exception:
+            pass
+        old_cols = [c for c in cols if c != "monitor_key"]
         return self._fetch_df(
             f"SELECT * FROM live_symbol_monitor ORDER BY symbol ASC LIMIT {int(limit)}",
-            columns=cols,
+            columns=old_cols,
         )
 
     def recent_events(self, limit: int = 100) -> pd.DataFrame:
@@ -1042,7 +1313,7 @@ class LiveStore:
             # it can become large and make the Dash page stay in "Updating".
             # Full audit rows are still included when generating the live report ZIP.
             "candidate_audit": pd.DataFrame(),
-            "symbol_monitor": self.latest_symbol_monitor(250),
+            "symbol_monitor": self.latest_symbol_monitor(1000),
             "open_positions": self.open_positions(),
             "closed_positions": self.closed_positions(100),
             "orders": self.recent_orders(500),

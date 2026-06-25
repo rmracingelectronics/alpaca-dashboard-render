@@ -76,6 +76,8 @@ services:
         value: "true"
       - key: LIVE_SELECTION_MODE
         value: "seen_so_far_top_n"
+      - key: LIVE_STRATEGY_RUN_MODE
+        value: "single"
       - key: LIVE_USE_NEWS_PROXY
         value: "true"
       - key: LIVE_MAX_DAILY_TRADES

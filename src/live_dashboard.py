@@ -11,6 +11,7 @@ import pandas as pd
 
 from .live_store import LiveStore
 from .config import REPORTS_DIR
+from .live_engine import all_live_strategy_specs
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -88,7 +89,15 @@ def _json_loads_safe(value: Any) -> dict[str, Any]:
         return {}
 
 
-_STRATEGY_CID_RE = re.compile(r"^(rmv\d+|rm\d+)-([A-Z0-9.]+)-(\d{12})-([ls])", flags=re.IGNORECASE)
+_STRATEGY_CID_RE = re.compile(r"^(rmv\d+|rm\d+)-(?:(?P<strategy_code>[a-z0-9]{2,8})-)?(?P<symbol>[A-Z0-9.]+)-(?P<stamp>\d{12})-(?P<side>[ls])", flags=re.IGNORECASE)
+
+
+def _strategy_spec_by_code(code: Any) -> dict[str, Any]:
+    code_l = str(code or "").strip().lower()
+    for spec in all_live_strategy_specs():
+        if code_l and code_l == str(spec.get("code", "")).lower():
+            return dict(spec)
+    return {}
 
 
 def _parse_strategy_client_order_id(client_order_id: Any) -> dict[str, Any] | None:
@@ -98,7 +107,11 @@ def _parse_strategy_client_order_id(client_order_id: Any) -> dict[str, Any] | No
     match = _STRATEGY_CID_RE.match(cid)
     if not match:
         return None
-    _prefix, symbol, stamp, side_code = match.groups()
+    symbol = match.group("symbol")
+    stamp = match.group("stamp")
+    side_code = match.group("side")
+    strategy_code = (match.group("strategy_code") or "").lower()
+    spec = _strategy_spec_by_code(strategy_code)
     try:
         ts_et = pd.Timestamp(datetime.strptime(stamp, "%Y%m%d%H%M"), tz="America/New_York")
         signal_time_utc = ts_et.tz_convert("UTC").isoformat()
@@ -108,6 +121,10 @@ def _parse_strategy_client_order_id(client_order_id: Any) -> dict[str, Any] | No
         signal_time_et = ""
     return {
         "client_order_id": cid,
+        "strategy_code": strategy_code,
+        "strategy_variant": spec.get("variant", ""),
+        "strategy_preset": spec.get("preset", ""),
+        "quality_gate": spec.get("quality_gate", ""),
         "symbol": symbol.upper(),
         "strategy_side": "long" if side_code.lower() == "l" else "short",
         "alpaca_side": "buy" if side_code.lower() == "l" else "sell",
@@ -224,10 +241,11 @@ def _plans_from_strategy_orders(orders: pd.DataFrame) -> pd.DataFrame:
             "alpaca_order_id": od.get("order_id"),
             "dry_run": 0,
             "payload_json": _json_dumps_for_diag({"derived_from": "live_orders", "order": od}),
-            "strategy_variant": "",
-            "strategy_preset": "",
+            "strategy_variant": parsed.get("strategy_variant", ""),
+            "strategy_code": parsed.get("strategy_code", ""),
+            "strategy_preset": parsed.get("strategy_preset", ""),
             "strategy_profile": "",
-            "quality_gate": "",
+            "quality_gate": parsed.get("quality_gate", ""),
             "pattern_mode": "",
             "selection_mode": "",
             "realized_pl": "",
@@ -549,6 +567,55 @@ def build_live_trade_report(days: int = 3650) -> pd.DataFrame:
         out = out.sort_values("submitted_at_utc", ascending=False)
     return out.reset_index(drop=True)
 
+
+def _strategy_performance_summary(trade_report: pd.DataFrame) -> pd.DataFrame:
+    if trade_report is None or trade_report.empty:
+        return pd.DataFrame(columns=["strategy_variant", "strategy_preset", "quality_gate", "trades", "closed_trades", "wins", "losses", "win_rate_pct", "total_pl", "avg_pl", "total_r", "avg_r"])
+    df = trade_report.copy()
+    for col in ["trade_pl_live", "realized_pl", "realized_r"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    rows = []
+    group_cols = [c for c in ["strategy_variant", "strategy_preset", "quality_gate"] if c in df.columns]
+    if not group_cols:
+        group_cols = ["strategy_variant"]
+        df["strategy_variant"] = "unknown"
+    for keys, grp in df.groupby(group_cols, dropna=False):
+        if not isinstance(keys, tuple):
+            keys = (keys,)
+        row = {col: val for col, val in zip(group_cols, keys)}
+        pl = pd.to_numeric(grp.get("trade_pl_live", grp.get("realized_pl", 0)), errors="coerce")
+        r = pd.to_numeric(grp.get("realized_r", 0), errors="coerce")
+        closed_mask = grp.get("status", pd.Series([""] * len(grp))).astype(str).str.contains("closed|filled_exit|approx", case=False, na=False)
+        closed = grp[closed_mask]
+        closed_pl = pd.to_numeric(closed.get("trade_pl_live", closed.get("realized_pl", 0)), errors="coerce") if not closed.empty else pd.Series(dtype="float64")
+        wins = int((closed_pl > 0).sum())
+        losses = int((closed_pl < 0).sum())
+        closed_n = int(len(closed))
+        row.update({
+            "trades": int(len(grp)),
+            "closed_trades": closed_n,
+            "wins": wins,
+            "losses": losses,
+            "win_rate_pct": round((wins / closed_n * 100.0), 2) if closed_n else "",
+            "total_pl": float(pl.fillna(0.0).sum()),
+            "avg_pl": float(pl.dropna().mean()) if pl.notna().any() else "",
+            "total_r": float(r.fillna(0.0).sum()),
+            "avg_r": float(r.dropna().mean()) if r.notna().any() else "",
+        })
+        rows.append(row)
+    return pd.DataFrame(rows).sort_values(["total_pl", "total_r"], ascending=[False, False], ignore_index=True) if rows else pd.DataFrame()
+
+
+def _candidate_strategy_summary(candidate_audit: pd.DataFrame) -> pd.DataFrame:
+    if candidate_audit is None or candidate_audit.empty:
+        return pd.DataFrame(columns=["strategy_variant", "quality_gate", "decision_status", "rows"])
+    df = candidate_audit.copy()
+    group_cols = [c for c in ["strategy_variant", "quality_gate", "decision_status", "reject_reason"] if c in df.columns]
+    if not group_cols:
+        return pd.DataFrame({"rows": [len(df)]})
+    return df.groupby(group_cols, dropna=False).size().reset_index(name="rows").sort_values("rows", ascending=False, ignore_index=True)
+
 def generate_live_report_zip(days: int = 3650) -> Path:
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -558,6 +625,8 @@ def generate_live_report_zip(days: int = 3650) -> Path:
     trade_report = build_live_trade_report(days=days)
     candidate_audit = store.recent_candidate_audit(20000)
     symbol_monitor = store.latest_symbol_monitor(1000)
+    strategy_summary = _strategy_performance_summary(trade_report)
+    candidate_strategy_summary = _candidate_strategy_summary(candidate_audit)
     summary_rows = []
     if isinstance(trade_report, pd.DataFrame) and not trade_report.empty:
         pl = pd.to_numeric(trade_report.get("trade_pl_live", 0), errors="coerce").fillna(0.0)
@@ -581,6 +650,8 @@ def generate_live_report_zip(days: int = 3650) -> Path:
         "live_candidate_audit.csv": candidate_audit,
         "live_symbol_monitor.csv": symbol_monitor,
         "live_report_summary.csv": pd.DataFrame(summary_rows),
+        "strategy_performance_summary.csv": strategy_summary,
+        "candidate_strategy_summary.csv": candidate_strategy_summary,
         "live_signal_plans.csv": store.recent_signal_plans(5000),
         "live_orders.csv": store.recent_orders(10000),
         "live_open_positions.csv": store.open_positions(),
@@ -602,7 +673,9 @@ def generate_live_report_zip(days: int = 3650) -> Path:
         "notes": [
             "live_trade_report.csv includes each paper/live strategy trade with strategy_variant, strategy_preset, quality_gate, realized/unrealized P/L, execution diagnostics, and signal-time indicators where captured.",
             "live_candidate_audit.csv includes accepted and rejected candidates with reject_reason and universal signal-time indicator fields for diagnosing any selected strategy.",
-            "live_symbol_monitor.csv is one row per configured live symbol with the latest indicator values, threshold checks, status and reason displayed in the Live Symbol Intelligence panel.",
+            "live_symbol_monitor.csv is one row per configured live symbol and strategy with latest indicator values, threshold checks, status and reason displayed in the Live Symbol Intelligence panel.",
+            "strategy_performance_summary.csv groups filled/planned paper performance by strategy_variant, strategy_preset and quality_gate for multi-day all-strategies experiments.",
+            "candidate_strategy_summary.csv groups accepted/rejected candidates by strategy and reject reason so weak filters can be improved even when no order was placed.",
             "This report is generated from the shared DATABASE_URL live store, so it works on Render when the web and worker use the same database.",
         ],
     }
@@ -659,8 +732,9 @@ def format_closed_positions(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def format_signal_plans(df: pd.DataFrame) -> pd.DataFrame:
+    cols = ["submitted_at_et", "symbol", "strategy_side", "strategy_variant", "strategy_preset", "quality_gate", "status", "dry_run", "qty", "entry_reference_price", "stop_price", "target_price", "risk_budget", "signal_time_et", "max_hold_until_et", "client_order_id"]
     if df is None or df.empty:
-        return pd.DataFrame(columns=["submitted_at_et", "symbol", "strategy_side", "status", "dry_run", "qty", "entry_reference_price", "stop_price", "target_price", "risk_budget", "signal_time_et", "max_hold_until_et", "client_order_id"])
+        return pd.DataFrame(columns=cols)
     out = _apply_time_columns(df, {"submitted_at_utc": "submitted_at_et", "max_hold_until_utc": "max_hold_until_et"})
     for col in ["entry_reference_price", "stop_price", "target_price", "risk_budget"]:
         if col in out.columns:
@@ -669,7 +743,10 @@ def format_signal_plans(df: pd.DataFrame) -> pd.DataFrame:
         out["qty"] = out["qty"].map(_format_qty)
     if "dry_run" in out.columns:
         out["dry_run"] = out["dry_run"].map(lambda x: "yes" if str(x).lower() in {"1", "true", "yes"} else "no")
-    return _ensure_columns(out, ["submitted_at_et", "symbol", "strategy_side", "status", "dry_run", "qty", "entry_reference_price", "stop_price", "target_price", "risk_budget", "signal_time_et", "max_hold_until_et", "client_order_id"])
+    for col in ["strategy_variant", "strategy_preset", "quality_gate"]:
+        if col in out.columns:
+            out[col] = out[col].map(lambda x: "" if x in (None, "None") or pd.isna(x) else str(x))
+    return _ensure_columns(out, cols)
 
 
 def format_orders(df: pd.DataFrame) -> pd.DataFrame:
@@ -698,16 +775,18 @@ def _format_decimal(value: Any, places: int = 2, suffix: str = "") -> str:
 
 
 def format_symbol_monitor(df: pd.DataFrame) -> pd.DataFrame:
+    cols = [
+        "symbol", "strategy", "status", "bar_et", "checks", "close", "rvol", "daily_atr_%",
+        "day_rs", "open_rs", "vwap_atr", "score", "side", "trigger", "gate", "reason"
+    ]
     if df is None or df.empty:
-        return pd.DataFrame(columns=[
-            "symbol", "status", "bar_et", "checks", "close", "rvol", "daily_atr_%",
-            "day_rs", "open_rs", "vwap_atr", "score", "side", "trigger", "reason"
-        ])
+        return pd.DataFrame(columns=cols)
     out = df.copy()
     if "latest_bar_time_et" in out.columns:
-        out["bar_et"] = out["latest_bar_time_et"].astype(str).str.replace("T", " ").str.slice(0, 16)
+        out["bar_et"] = out["latest_bar_time_et"].map(lambda x: "" if x in (None, "", "None") or pd.isna(x) else str(x).replace("T", " ")[:16])
     else:
         out = _apply_time_columns(out, {"latest_bar_time_utc": "bar_et"})
+    out["strategy"] = out.get("strategy_variant", "").map(lambda x: "" if x in (None, "None") or pd.isna(x) else str(x).replace("live_", "").replace("_", " ")) if "strategy_variant" in out.columns else ""
     out["status"] = out.get("monitor_status", "").astype(str)
     out["checks"] = out.apply(lambda r: f"{int(_safe_float(r.get('checks_passed'), 0))}/{int(_safe_float(r.get('checks_total'), 0))}" if str(r.get("checks_total", "")) not in {"", "nan", "None"} else "", axis=1)
     for src, dest, places, suffix in [
@@ -724,15 +803,16 @@ def format_symbol_monitor(df: pd.DataFrame) -> pd.DataFrame:
     out["trigger"] = out.get("trigger_type", "").map(lambda x: "" if x in (None, "None") or pd.isna(x) else str(x).replace("v25_", "")) if "trigger_type" in out.columns else ""
     out["gate"] = out.get("quality_gate", "").map(lambda x: "" if x in (None, "None") or pd.isna(x) else str(x)) if "quality_gate" in out.columns else ""
     out["reason"] = out.get("check_summary", out.get("reject_reason", "")).map(lambda x: "" if x in (None, "None") or pd.isna(x) else str(x)[:180]) if ("check_summary" in out.columns or "reject_reason" in out.columns) else ""
-    cols = ["symbol", "status", "bar_et", "checks", "close", "rvol", "daily_atr_%", "day_rs", "open_rs", "vwap_atr", "score", "side", "trigger", "gate", "reason"]
     return _ensure_columns(out, cols)
 
 
 def symbol_monitor_summary(df: pd.DataFrame, heartbeat: dict[str, Any] | None = None) -> str:
     heartbeat = heartbeat or {}
+    configured = int(heartbeat.get("symbols", 0) or 0)
+    run_mode = str(heartbeat.get("strategy_run_mode") or "single")
+    active_count = int(_safe_float(heartbeat.get("active_strategy_count"), 1) or 1)
     if df is None or df.empty:
-        symbols = int(heartbeat.get("symbols", 0) or 0)
-        return f"No symbol monitor snapshots yet. Worker is configured for {symbols} symbols; the table fills after the next worker scan."
+        return f"No symbol monitor snapshots yet. Worker is configured for {configured} symbols and {active_count} active strategy view(s); the table fills after the next worker scan."
     status = df.get("monitor_status", pd.Series([], dtype="object")).astype(str)
     selected = int(status.str.contains("selected", case=False, na=False).sum())
     candidates = int(status.str.contains("candidate", case=False, na=False).sum())
@@ -741,8 +821,10 @@ def symbol_monitor_summary(df: pd.DataFrame, heartbeat: dict[str, Any] | None = 
     paused = int(status.str.contains("paused|waiting", case=False, na=False).sum())
     updated = df.get("updated_at_utc", pd.Series([], dtype="object")).dropna()
     last = _age_text(updated.max()) if not updated.empty else "unknown age"
-    configured = int(heartbeat.get("symbols", len(df)) or len(df))
-    return f"Monitoring {len(df)}/{configured} symbols. Selected/candidate: {selected + candidates}; blocked: {blocked}; watching: {watching}; paused/waiting: {paused}. Last symbol snapshot {last}."
+    symbols_seen = int(df["symbol"].astype(str).str.upper().nunique()) if "symbol" in df.columns else len(df)
+    strategies_seen = int(df["strategy_variant"].astype(str).nunique()) if "strategy_variant" in df.columns else active_count
+    mode_text = "all strategies" if run_mode == "all_strategies" else "single strategy"
+    return f"Monitoring {symbols_seen}/{configured or symbols_seen} symbols across {strategies_seen} strategy view(s) ({mode_text}), {len(df)} rows. Selected/candidate: {selected + candidates}; blocked: {blocked}; watching: {watching}; paused/waiting: {paused}. Last symbol snapshot {last}."
 
 def format_events(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
@@ -779,9 +861,13 @@ def _metrics_from_snapshot(snapshot: dict[str, Any]) -> list[dict[str, str]]:
         live_pl = pd.to_numeric(trade_report["trade_pl_live"], errors="coerce").fillna(0.0).sum()
     current_variant = heartbeat.get("strategy_variant") or live.get("strategy_variant") or "--"
     current_gate = heartbeat.get("quality_gate") or "--"
+    run_mode = str(heartbeat.get("strategy_run_mode") or live.get("strategy_run_mode") or "single")
+    active_count = int(_safe_float(heartbeat.get("active_strategy_count"), 1) or 1)
+    strategy_value = "All strategies" if run_mode == "all_strategies" else str(current_variant)[:28]
+    strategy_help = f"{active_count} active; gate {current_gate}; source {heartbeat.get('config_source', live.get('live_config_source', '--'))}"
     return [
         {"label": "Worker", "value": status.title(), "help": f"Heartbeat {_age_text(updated_at)}; {dry_run_text}"},
-        {"label": "Live Strategy", "value": str(current_variant)[:28], "help": f"Gate {current_gate}; source {heartbeat.get('config_source', live.get('live_config_source', '--'))}"},
+        {"label": "Live Strategy", "value": strategy_value, "help": strategy_help},
         {"label": "Paper Equity", "value": _format_money(latest_account.get("equity")), "help": f"Buying power {_format_money(latest_account.get('buying_power'))}"},
         {"label": "Live Trade P/L", "value": _format_money(live_pl), "help": "Realized where exits are filled, otherwise open unrealized P/L"},
         {"label": "Open Positions", "value": str(open_count), "help": "Shared DB state from worker / Alpaca"},
