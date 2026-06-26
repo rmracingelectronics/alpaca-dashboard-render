@@ -805,6 +805,9 @@ class LivePaperTradingEngine:
             "enabled": self.live.enabled,
             "symbols": len(self.live.symbols or []),
             "feed": self.live.feed,
+            "realtime_feed_for_orders": self._live_realtime_feed(),
+            "live_data_policy": "real_time_only_for_order_decisions",
+            "delayed_data_used_for_orders": False,
             "strategy_preset": getattr(self.params, "live_strategy_preset", getattr(self.live, "strategy_variant", "best_report_153601")),
             "strategy_variant": getattr(self.params, "live_strategy_variant", getattr(self.live, "strategy_variant", "best_report_153601")),
             "strategy_run_mode": getattr(self.live, "strategy_run_mode", "single"),
@@ -864,6 +867,23 @@ class LivePaperTradingEngine:
         premarket symbol appears as 0/0 checks.
         """
         return "extended_hours" if bool(getattr(self.live, "allow_extended_hours_entries", False)) else "regular_only"
+
+
+    def _live_realtime_feed(self) -> str:
+        """Feed used by the LIVE trading decision path.
+
+        Live trading must never use delayed or historical fallback data to create
+        orders.  The free paper-account live feed is IEX.  If an old DB setting
+        still contains delayed_sip/sip_delayed from an earlier diagnostic build,
+        force the live decision path back to IEX and expose the conversion in
+        diagnostics instead of silently trading from delayed bars.
+        """
+        feed = str(getattr(self.live, "feed", "iex") or "iex").lower().strip()
+        if feed in {"delayed_sip", "free_delayed_sip", "sip_delayed"}:
+            return "iex"
+        if feed not in {"iex", "sip"}:
+            return "iex"
+        return feed
 
     def _max_bar_age_minutes(self) -> int:
         """Maximum age of a bar that may still be used for live decisions.
@@ -1084,19 +1104,11 @@ class LivePaperTradingEngine:
 
     def _update_bar_cache(self) -> tuple[pd.DataFrame, pd.DataFrame]:
         now = _now_utc()
-        configured_feed = str(getattr(self.live, "feed", "iex") or "iex").lower()
+        configured_feed = str(getattr(self.live, "feed", "iex") or "iex").lower().strip()
         session_mode = self._live_session_mode()
-
-        # Historical bars officially accept feed=iex/sip/otc/boats.  For a
-        # free/basic paper account, the useful broad-market fallback is SIP bars
-        # with an end time safely older than the recent-data entitlement window.
-        # The UI value "delayed_sip" therefore maps to API feed "sip" plus a
-        # 16-minute delayed end time.  We do not pass feed=delayed_sip to the
-        # bars endpoint because Alpaca documents delayed_sip primarily for
-        # latest/streaming feeds, while /v2/stocks/bars lists sip/iex/otc/boats.
+        primary_api_feed = self._live_realtime_feed()
         delayed_sip_mode = configured_feed in {"delayed_sip", "free_delayed_sip", "sip_delayed"}
-        primary_api_feed = "sip" if delayed_sip_mode else configured_feed
-        end_dt = now - timedelta(minutes=16) if delayed_sip_mode else now + timedelta(minutes=5)
+        end_dt = now + timedelta(minutes=5)
         keep_start = now - timedelta(days=max(35, int(self.live.lookback_days)))
         symbols = list(dict.fromkeys([s.upper() for s in (self.live.symbols or []) if s]))
         all_symbols = list(dict.fromkeys(["QQQ"] + symbols))
@@ -1114,37 +1126,12 @@ class LivePaperTradingEngine:
             pass
         bars_5m_new = self.data_client.get_stock_bars(all_symbols, "5Min", fetch_start_5m, end_dt, feed=primary_api_feed, adjustment="split", use_cache=False, session_mode=session_mode)
         daily_new = self.data_client.get_stock_bars(all_symbols, "1Day", fetch_start_daily, end_dt, feed=primary_api_feed, adjustment="split", use_cache=False, session_mode=session_mode)
-        effective_feed = "delayed_sip" if delayed_sip_mode else configured_feed
+        effective_feed = primary_api_feed
         fallback_rows = 0
         fallback_daily_rows = 0
         fallback_reason = ""
-
-        # If the user keeps IEX selected, make a best-effort broad-market SIP
-        # delayed request.  If Alpaca rejects it for the account, the diagnostic
-        # endpoint will show the error and the worker continues on IEX.
-        should_try_delayed_sip = (
-            configured_feed == "iex"
-            and bool(getattr(self.live, "allow_extended_hours_entries", False))
-            and str(getattr(self.live, "strategy_run_mode", "single")).lower() == "all_strategies"
-        )
-        if should_try_delayed_sip:
-            delayed_end = now - timedelta(minutes=16)
-            if pd.Timestamp(delayed_end) > pd.Timestamp(fetch_start_5m):
-                try:
-                    delayed_bars = self.data_client.get_stock_bars(all_symbols, "5Min", fetch_start_5m, delayed_end, feed="sip", adjustment="split", use_cache=False, session_mode=session_mode)
-                    delayed_daily = self.data_client.get_stock_bars(all_symbols, "1Day", fetch_start_daily, delayed_end, feed="sip", adjustment="split", use_cache=False, session_mode=session_mode)
-                    fallback_rows = int(0 if delayed_bars is None else len(delayed_bars))
-                    fallback_daily_rows = int(0 if delayed_daily is None else len(delayed_daily))
-                    if delayed_bars is not None and not delayed_bars.empty:
-                        bars_5m_new = pd.concat([bars_5m_new, delayed_bars], ignore_index=True) if bars_5m_new is not None and not bars_5m_new.empty else delayed_bars
-                        effective_feed = "iex+sip_16m_delay"
-                        fallback_reason = "IEX real-time plus SIP bars delayed by 16 minutes for broader free-plan diagnostics."
-                    elif not fallback_reason:
-                        fallback_reason = "Delayed SIP/SIP fallback returned no 5-minute bars; continuing with IEX only."
-                    if delayed_daily is not None and not delayed_daily.empty:
-                        daily_new = pd.concat([daily_new, delayed_daily], ignore_index=True) if daily_new is not None and not daily_new.empty else delayed_daily
-                except Exception as exc:
-                    fallback_reason = f"delayed SIP/SIP fallback failed: {str(exc)[:220]}"
+        if delayed_sip_mode:
+            fallback_reason = "Saved feed was delayed_sip, but live order decisions are real-time only; using IEX for live scans. Use debug endpoints/reports for delayed research, not live entries."
 
         try:
             latest_by_symbol = {}
@@ -1174,6 +1161,8 @@ class LivePaperTradingEngine:
                 "primary_api_feed": primary_api_feed,
                 "effective_feed": effective_feed,
                 "feed": effective_feed,
+                "live_data_policy": "real_time_only_for_order_decisions",
+                "delayed_data_used_for_orders": False,
                 "symbols_requested": len(all_symbols),
                 "bars_5m_rows": int(0 if bars_5m_new is None else len(bars_5m_new)),
                 "daily_rows": int(0 if daily_new is None else len(daily_new)),
@@ -1944,6 +1933,7 @@ class LivePaperTradingEngine:
             "closed_bar_utc": pd.Timestamp(closed_ts).isoformat(),
             "session_mode": session_mode,
             "feed": self.live.feed,
+            "realtime_feed_for_orders": self._live_realtime_feed(),
             "max_bar_age_minutes": self._max_bar_age_minutes(),
             "symbols": symbols,
             "strategy_run_mode": getattr(self.live, "strategy_run_mode", "single"),
@@ -2011,7 +2001,7 @@ class LivePaperTradingEngine:
     def _latest_reference_prices(self, symbols: list[str]) -> dict[str, float]:
         out: dict[str, float] = {}
         try:
-            quotes = self.data_client.latest_quotes(symbols, feed=self.live.feed)
+            quotes = self.data_client.latest_quotes(symbols, feed=self._live_realtime_feed())
             if not quotes.empty:
                 for _, r in quotes.iterrows():
                     sym = str(r.get("symbol", "")).upper()

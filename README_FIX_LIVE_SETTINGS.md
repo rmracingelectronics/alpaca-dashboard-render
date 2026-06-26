@@ -134,3 +134,14 @@ For free Alpaca paper experiments:
 - Use `SIP real-time` only if the account has the paid/unlimited data entitlement.
 
 For real-money trading, do not use the all-strategies extended-hours experiment without separate risk controls, spread checks, and dedicated extended-hours strategy validation.
+
+## V11 live-data safety correction
+
+V10 added free-feed diagnostics for Alpaca Basic/IEX accounts. V11 tightens the live trading path so order decisions always use a real-time feed only:
+
+- Live order decisions use `iex` or `sip` only.
+- If an old saved database config contains `delayed_sip`, the live worker automatically uses `iex` for live scans instead of trading from delayed bars.
+- The worker heartbeat and `last_bar_fetch` now expose `live_data_policy = real_time_only_for_order_decisions` and `delayed_data_used_for_orders = false`.
+- The delayed SIP idea is kept out of the live order path. Delayed/broad-market data is only appropriate for diagnostics/research/backtest, not for live entries.
+- Regular-session entries still submit market bracket paper orders.
+- Extended-hours entries still submit Alpaca-compatible marketable limit paper orders with `extended_hours=true`.
