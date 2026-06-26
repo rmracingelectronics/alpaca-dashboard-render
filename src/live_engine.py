@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from .alpaca_rest import AlpacaDataClient
-from .alpaca_trading import AlpacaTradingClient
+from .alpaca_trading import AlpacaTradingAPIError, AlpacaTradingClient
 from .backtest import _apply_v25_candlestick_filter, _v27_apply_preselection_filters, _v27_select_top_n_with_caps, _v28_calculate_risk_budget
 from .config import PROJECT_ROOT, AlpacaSettings, StrategyParams
 from .indicators import add_daily_features, add_intraday_features, build_qqq_context, merge_market_context
@@ -1042,6 +1042,206 @@ class LivePaperTradingEngine:
         side = str(plan.get("alpaca_side", "buy")).lower()
         price = ref * (1.0 + bps / 10000.0) if side == "buy" else ref * (1.0 - bps / 10000.0)
         return _round_price(price)
+
+    def _regular_bracket_price_buffer(self, base_price: float, buffer_multiplier: float = 1.0) -> float:
+        """Minimum separation used for Alpaca regular-session bracket legs.
+
+        Alpaca validates bracket child orders against a moving internal base price.
+        If a fast market moves a few cents between planning and submission, a
+        short stop can be rejected with messages such as
+        "stop_loss.stop_price must be >= base_price + 0.01".  This buffer is
+        an execution guard only; position size is reduced below if widening the
+        stop would otherwise increase dollar risk beyond the configured risk
+        budget.
+        """
+        cfg = getattr(self, "_runtime_config", {}) if isinstance(getattr(self, "_runtime_config", {}), dict) else {}
+        # Use the user-configured slippage bps as the primary live-order safety
+        # buffer.  This is intentionally automatic: the user should not need a
+        # second setting just to avoid Alpaca bracket validation rejects.
+        bps = max(0.0, _safe_float(cfg.get("slippage_bps", 3.0), 3.0))
+        multiplier = max(1.0, _safe_float(buffer_multiplier, 1.0))
+        return max(0.02, float(base_price or 0.0) * bps * multiplier / 10000.0)
+
+    def _prepare_regular_bracket_plan_for_submit(self, plan: dict[str, Any], current_reference_price: float | None = None, buffer_multiplier: float = 1.0) -> dict[str, Any] | None:
+        """Return a submit-ready regular-market bracket plan.
+
+        The strategy/risk model creates a target stop and quantity from the signal
+        bar or quote reference.  Immediately before submitting a market bracket,
+        refresh the base/reference price and make the child legs safely valid
+        relative to that base.  If this widens risk/share, reduce quantity so the
+        actual submitted risk remains inside the original risk budget and current
+        affordability guard.
+        """
+        out = dict(plan or {})
+        alpaca_side = str(out.get("alpaca_side", "")).lower().strip()
+        strategy_side = str(out.get("strategy_side", "")).lower().strip()
+        if alpaca_side not in {"buy", "sell"}:
+            return None
+        base = _safe_float(current_reference_price, 0.0)
+        if base <= 0:
+            base = _safe_float(out.get("entry_reference_price"), _safe_float(out.get("signal_close"), 0.0))
+        if base <= 0:
+            return None
+        old_stop = _safe_float(out.get("stop_price"), 0.0)
+        old_target = _safe_float(out.get("target_price"), 0.0)
+        if old_stop <= 0 or old_target <= 0:
+            return None
+        buffer = self._regular_bracket_price_buffer(base, buffer_multiplier=buffer_multiplier)
+        # Long entry = buy market bracket.  Stop must be below base, target above.
+        # Short entry = sell market bracket. Stop must be above base, target below.
+        if alpaca_side == "buy" or strategy_side == "long":
+            min_stop = base - buffer
+            min_target = base + buffer
+            new_stop = min(old_stop, min_stop)
+            new_target = max(old_target, min_target)
+            actual_risk_per_share = max(0.0, base - new_stop)
+        else:
+            min_stop = base + buffer
+            min_target = base - buffer
+            new_stop = max(old_stop, min_stop)
+            new_target = min(old_target, min_target)
+            actual_risk_per_share = max(0.0, new_stop - base)
+        if actual_risk_per_share <= 0:
+            return None
+        risk_budget = _safe_float(out.get("risk_budget"), 0.0)
+        qty = _safe_float(out.get("qty"), 0.0)
+        if risk_budget > 0:
+            max_qty_by_risk = risk_budget / actual_risk_per_share
+            if not self.risk.allow_fractional:
+                max_qty_by_risk = math.floor(max_qty_by_risk)
+            if max_qty_by_risk < qty:
+                qty = max_qty_by_risk
+        if qty <= 0:
+            return None
+        if not self.risk.allow_fractional:
+            qty = math.floor(qty)
+        if qty <= 0:
+            return None
+        old_qty = _safe_float(out.get("qty"), 0.0)
+        changed = (abs(new_stop - old_stop) >= 0.005) or (abs(new_target - old_target) >= 0.005) or (abs(qty - old_qty) >= 1e-9)
+        out.update({
+            "qty": qty,
+            "target_price": _round_price(new_target),
+            "stop_price": _round_price(new_stop),
+            "regular_bracket_base_reference_price": _round_price(base),
+            "regular_bracket_price_buffer": _round_price(buffer),
+            "regular_bracket_guard_adjusted": bool(changed),
+            "regular_bracket_guard_note": "regular_session_bracket_validated_against_latest_reference",
+            "actual_risk_dollars": float(qty) * float(actual_risk_per_share),
+            "risk_budget_shortfall": max(0.0, risk_budget - float(qty) * float(actual_risk_per_share)) if risk_budget > 0 else _safe_float(out.get("risk_budget_shortfall"), 0.0),
+            "estimated_notional": float(qty) * float(base),
+        })
+        return out
+
+
+    @staticmethod
+    def _retry_client_order_id(client_order_id: str, attempt: int) -> str:
+        base = str(client_order_id or "rmv33-retry")
+        suffix = f"-r{int(attempt)}"
+        return (base[: max(1, 48 - len(suffix))] + suffix)[:48]
+
+    @staticmethod
+    def _parse_alpaca_error_payload(exc: Exception) -> dict[str, Any]:
+        """Best-effort parse of Alpaca's JSON error body from our REST wrapper."""
+        text = str(exc or "")
+        # Typical wrapper text: Alpaca trading request failed 422: {"base_price":"521.2",...}
+        start = text.find("{")
+        end = text.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                payload = json.loads(text[start : end + 1])
+                return payload if isinstance(payload, dict) else {}
+            except Exception:
+                pass
+        return {}
+
+    @classmethod
+    def _is_repairable_bracket_rejection(cls, exc: Exception) -> bool:
+        payload = cls._parse_alpaca_error_payload(exc)
+        message = str(payload.get("message") or exc or "").lower()
+        code = str(payload.get("code") or "")
+        if code == "42210000":
+            return True
+        return any(token in message for token in ("stop_loss", "take_profit", "stop_price", "limit_price", "base_price"))
+
+    def _base_price_from_alpaca_error_or_quote(self, exc: Exception, symbol: str, fallback: float | None = None) -> float:
+        payload = self._parse_alpaca_error_payload(exc)
+        base = _safe_float(payload.get("base_price"), 0.0)
+        if base > 0:
+            return base
+        try:
+            latest = self._latest_reference_prices([symbol]).get(symbol)
+            if latest and latest > 0:
+                return float(latest)
+        except Exception:
+            pass
+        return _safe_float(fallback, 0.0)
+
+    def _submit_regular_market_bracket_with_auto_repair(self, plan: dict[str, Any], initial_reference_price: float | None = None) -> tuple[Any, dict[str, Any]]:
+        """Submit a regular-session bracket, automatically repairing Alpaca price rejects.
+
+        This keeps the strategy/risk model as the source of truth, but treats
+        Alpaca 422 bracket-leg validation as an execution-time race condition:
+        the order was planned from a signal/reference price, while Alpaca validates
+        children against its current base price at submit time.  On repairable
+        rejects we refresh/parse the base price, widen the child legs using the
+        configured slippage bps, reduce qty if needed so dollar risk does not
+        exceed the original budget, and retry with a fresh client_order_id.
+        """
+        symbol = str(plan.get("symbol") or "").upper()
+        if not symbol:
+            raise ValueError("Cannot submit bracket order without symbol.")
+        attempts: list[dict[str, Any]] = []
+        base_reference = _safe_float(initial_reference_price, _safe_float(plan.get("entry_reference_price"), 0.0))
+        working_plan = dict(plan)
+        base_client_order_id = str(plan.get("client_order_id") or "")
+        last_exc: Exception | None = None
+        # Attempt 1 uses the configured slippage buffer.  Repairs expand it
+        # automatically (2x, then 4x) only if Alpaca rejects the child prices.
+        for attempt in range(1, 4):
+            submit_plan = self._prepare_regular_bracket_plan_for_submit(
+                working_plan,
+                base_reference,
+                buffer_multiplier=(2 ** (attempt - 1)),
+            )
+            if not submit_plan:
+                raise ValueError("Regular-session bracket order became invalid after latest-price validation; order was not submitted.")
+            if attempt > 1:
+                submit_plan["client_order_id"] = self._retry_client_order_id(base_client_order_id, attempt - 1)
+            submit_plan["regular_bracket_submit_attempt"] = attempt
+            submit_plan["regular_bracket_auto_repair_attempts"] = attempts
+            try:
+                result = self.trading_client.submit_market_bracket_order(
+                    symbol=submit_plan["symbol"],
+                    side=submit_plan["alpaca_side"],
+                    qty=float(submit_plan["qty"]),
+                    take_profit_price=float(submit_plan["target_price"]),
+                    stop_price=float(submit_plan["stop_price"]),
+                    client_order_id=submit_plan["client_order_id"],
+                    fractional=self.risk.allow_fractional,
+                )
+                submit_plan["regular_bracket_auto_repaired"] = attempt > 1
+                submit_plan["regular_bracket_auto_repair_attempts"] = attempts
+                return result, submit_plan
+            except Exception as exc:
+                last_exc = exc
+                attempts.append({
+                    "attempt": attempt,
+                    "client_order_id": submit_plan.get("client_order_id"),
+                    "qty": submit_plan.get("qty"),
+                    "stop_price": submit_plan.get("stop_price"),
+                    "target_price": submit_plan.get("target_price"),
+                    "base_reference": submit_plan.get("regular_bracket_base_reference_price"),
+                    "buffer": submit_plan.get("regular_bracket_price_buffer"),
+                    "error": str(exc)[:700],
+                })
+                if attempt >= 3 or not self._is_repairable_bracket_rejection(exc):
+                    break
+                base_reference = self._base_price_from_alpaca_error_or_quote(exc, symbol, fallback=base_reference)
+                working_plan = submit_plan
+                continue
+        self._last_bracket_repair_attempts = attempts
+        raise last_exc or AlpacaTradingAPIError("Regular-session bracket order failed after automatic repair attempts.")
 
     def _parse_strategy_client_order_id(self, client_order_id: str) -> dict[str, Any] | None:
         cid = str(client_order_id or "").strip()
@@ -2450,15 +2650,17 @@ class LivePaperTradingEngine:
                         log_row["extended_hours"] = True
                         log_row["message"] = "Extended-hours entry submitted as simple limit order; bracket target/stop are recorded for reporting but Alpaca extended-hours API does not accept market bracket entries."
                     else:
-                        result = self.trading_client.submit_market_bracket_order(
-                            symbol=plan["symbol"],
-                            side=plan["alpaca_side"],
-                            qty=float(plan["qty"]),
-                            take_profit_price=float(plan["target_price"]),
-                            stop_price=float(plan["stop_price"]),
-                            client_order_id=plan["client_order_id"],
-                            fractional=self.risk.allow_fractional,
-                        )
+                        latest_ref = self._latest_reference_prices([plan["symbol"]]).get(plan["symbol"], quote_lookup.get(plan["symbol"], plan.get("entry_reference_price")))
+                        submit_plan = self._prepare_regular_bracket_plan_for_submit(plan, latest_ref)
+                        if not submit_plan:
+                            raise ValueError("Regular-session bracket order became invalid after latest-price validation; order was not submitted.")
+                        if submit_plan is not plan:
+                            plan.update(submit_plan)
+                            log_row.update(submit_plan)
+                        result, submit_plan = self._submit_regular_market_bracket_with_auto_repair(plan, latest_ref)
+                        if submit_plan:
+                            plan.update(submit_plan)
+                            log_row.update(submit_plan)
                         log_row["order_mode"] = "regular_market_bracket"
                         log_row["extended_hours"] = False
                     log_row["alpaca_status"] = result.status
@@ -2468,6 +2670,8 @@ class LivePaperTradingEngine:
                     existing.add(plan["symbol"])
                     reserved_notional += _safe_float(plan.get("estimated_notional"), 0.0)
                 except Exception as exc:
+                    if hasattr(self, "_last_bracket_repair_attempts"):
+                        log_row["regular_bracket_auto_repair_attempts"] = getattr(self, "_last_bracket_repair_attempts", [])
                     log_row["alpaca_status"] = "submit_error"
                     log_row["message"] = str(exc)
                     self.store.upsert_signal_plan(log_row, status="submit_error")

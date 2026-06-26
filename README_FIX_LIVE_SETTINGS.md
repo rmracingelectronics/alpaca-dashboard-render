@@ -221,3 +221,35 @@ Technical change:
 - Legacy one-row-per-symbol monitor snapshots are not overwritten by blank scaffold rows.
 
 This does not change trade selection, risk management, order sizing, order submission, or backtesting. It only fixes the monitor display/readiness layer.
+
+## V17 regular-session bracket guard
+
+Fixes Alpaca 422 bracket validation errors such as:
+
+`stop_loss.stop_price must be >= base_price + 0.01`
+
+These errors happen after the strategy has already found a signal and the worker has called Alpaca `/orders`. Alpaca validates bracket child order prices against its current internal base price, which can differ from the signal/quote price used when the order plan was built. V17 refreshes the reference price immediately before regular-session bracket submission, moves the stop/target to the correct side of that base with a configurable buffer, and reduces quantity if needed so the submitted risk remains inside the configured risk budget. Extended-hours limit-order behavior is unchanged.
+
+New plan/report fields include:
+
+- `regular_bracket_base_reference_price`
+- `regular_bracket_price_buffer`
+- `regular_bracket_guard_adjusted`
+- `regular_bracket_guard_note`
+
+This is an execution-layer validation guard only. It does not replace the existing fixed-risk / percent-equity / controlled-compounding sizing model.
+
+## V18 - Automatic Alpaca bracket repair/retry
+
+This version adds automatic execution repair for regular-session Alpaca bracket orders.
+
+When Alpaca rejects a bracket order because the child stop/target is invalid against Alpaca's current moving `base_price`, the worker now:
+
+1. Parses Alpaca's rejection payload and base price when available.
+2. Refreshes the latest reference quote when needed.
+3. Recalculates stop/target around the current base price using the configured `slippage_bps` as the execution buffer.
+4. Reduces quantity if widening the stop would otherwise exceed the configured risk budget.
+5. Retries the order with a fresh client order id.
+6. Records all repair attempts in the signal plan/event payload for audit/reporting.
+
+This does not add any new user setting and does not replace the configured risk mode. Fixed risk, percent-equity compounding, and controlled compounding remain the source of truth for risk sizing.
