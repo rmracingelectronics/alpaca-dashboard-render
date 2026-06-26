@@ -1245,24 +1245,16 @@ class LiveStore:
         rows = list(records or [])
         if not rows:
             return
-        # Keep the per-strategy monitor table representing the latest worker scan.
-        # The legacy live_symbol_monitor table remains one row per symbol for backward compatibility.
-        # Do not purge the previous completed run when the current batch is only
-        # a scaffold/queued batch; those queued rows intentionally carry forward
-        # previous indicator values until real results arrive.
+        # Keep every in-progress run until the worker has completed the full
+        # all-strategies scan.  Older versions deleted the previous completed
+        # run as soon as the first non-scaffold strategy batch arrived.  That made
+        # the dashboard show a partial run such as 3 strategies x 16 symbols while
+        # the worker was still scanning.  We now keep prior runs and let
+        # latest_symbol_monitor() choose the newest complete run when possible.
         def _is_scaffold_row(rec: dict[str, Any]) -> bool:
             payload_obj = rec.get("payload") if isinstance(rec.get("payload"), dict) else {}
             return bool(payload_obj.get("scaffold")) or str(rec.get("monitor_status") or "").lower().startswith("scanning - queued")
 
-        all_scaffold = all(_is_scaffold_row(rec) for rec in rows)
-        run_id = str(rows[0].get("run_id") or "").strip()
-        if run_id and not all_scaffold:
-            try:
-                self._ensure_strategy_symbol_monitor_table()
-                ph = self._ph()
-                self._execute(f"DELETE FROM live_strategy_symbol_monitor WHERE run_id IS NOT NULL AND run_id <> {ph}", [run_id])
-            except Exception:
-                pass
         for rec in rows:
             try:
                 payload_obj = rec.get("payload") if isinstance(rec.get("payload"), dict) else {}
@@ -1322,6 +1314,47 @@ class LiveStore:
             f"SELECT * FROM live_candidate_audit ORDER BY COALESCE(updated_at_utc, created_at_utc) DESC LIMIT {int(limit)}"
         )
 
+    def _expected_strategy_symbol_monitor_rows(self) -> int:
+        """Expected rows for a complete strategy-symbol monitor snapshot."""
+        try:
+            heartbeat = self.get_state("heartbeat", {}) or {}
+            active = int(float(heartbeat.get("active_strategy_count") or 0))
+            symbols = int(float(heartbeat.get("symbols") or 0))
+            if active > 0 and symbols > 0:
+                return active * symbols
+        except Exception:
+            pass
+        return 0
+
+    def _active_monitor_filter_values(self) -> tuple[list[str], list[str], int]:
+        """Return active strategy variants/symbols and expected monitor rows.
+
+        live_strategy_symbol_monitor is intentionally keyed by monitor_key
+        (symbol + strategy + gate), not by run_id, so it behaves like the latest
+        state for every strategy-symbol pair.  The dashboard should therefore
+        read the latest row for each active key, not the newest run_id group.
+        """
+        variants: list[str] = []
+        symbols: list[str] = []
+        try:
+            heartbeat = self.get_state("heartbeat", {}) or {}
+            cfg = self.get_state("live_config_override", {}) or {}
+            raw_variants = heartbeat.get("active_strategy_variants") or cfg.get("active_strategy_variants") or []
+            if isinstance(raw_variants, list):
+                variants = [str(v).strip().lower() for v in raw_variants if str(v).strip()]
+            raw_symbols = cfg.get("symbols") or []
+            if isinstance(raw_symbols, list):
+                symbols = [str(s).strip().upper() for s in raw_symbols if str(s).strip()]
+            if not symbols and heartbeat.get("symbols"):
+                # Heartbeat only has a count, so leave symbols empty rather than guessing.
+                symbols = []
+        except Exception:
+            pass
+        variants = list(dict.fromkeys(variants))
+        symbols = list(dict.fromkeys(symbols))
+        expected = (len(variants) * len(symbols)) if variants and symbols else self._expected_strategy_symbol_monitor_rows()
+        return variants, symbols, int(expected or 0)
+
     def latest_symbol_monitor(self, limit: int = 250) -> pd.DataFrame:
         cols = [
             "monitor_key", "symbol", "updated_at_utc", "latest_bar_time_utc", "latest_bar_time_et", "session_date",
@@ -1335,18 +1368,12 @@ class LiveStore:
             "qqq_day_change_percent", "atr5m14", "ema9", "ema20", "session_vwap", "payload_json",
         ]
         try:
+            # live_strategy_symbol_monitor is a current-state table keyed by
+            # monitor_key (symbol|strategy|gate), not a historical run table.
+            # Returning all current rows gives the dashboard the latest completed
+            # value for every strategy-symbol pair while a new scan progresses.
             df = self._fetch_df(
-                f"""
-                SELECT * FROM live_strategy_symbol_monitor
-                WHERE run_id = (
-                    SELECT run_id FROM live_strategy_symbol_monitor
-                    WHERE run_id IS NOT NULL AND run_id <> ''
-                    ORDER BY updated_at_utc DESC
-                    LIMIT 1
-                )
-                ORDER BY strategy_variant ASC, symbol ASC
-                LIMIT {int(limit)}
-                """,
+                f"SELECT * FROM live_strategy_symbol_monitor ORDER BY strategy_variant ASC, symbol ASC LIMIT {int(limit)}",
                 columns=cols,
             )
             if df is not None and not df.empty:
@@ -1358,6 +1385,27 @@ class LiveStore:
             f"SELECT * FROM live_symbol_monitor ORDER BY symbol ASC LIMIT {int(limit)}",
             columns=old_cols,
         )
+
+    def prune_strategy_symbol_monitor_runs(self, keep: int = 8) -> None:
+        """Delete old monitor runs after a scan completes, keeping recent history."""
+        try:
+            self._ensure_strategy_symbol_monitor_table()
+            rows = self._fetch(
+                """
+                SELECT run_id, MAX(updated_at_utc) AS max_updated
+                FROM live_strategy_symbol_monitor
+                WHERE run_id IS NOT NULL AND run_id <> ''
+                GROUP BY run_id
+                ORDER BY max_updated DESC
+                """
+            )
+            stale = [str(r.get("run_id") or "") for r in rows[int(max(1, keep)):] if str(r.get("run_id") or "")]
+            if not stale:
+                return
+            phs = ",".join([self._ph()] * len(stale))
+            self._execute(f"DELETE FROM live_strategy_symbol_monitor WHERE run_id IN ({phs})", stale)
+        except Exception:
+            pass
 
     def recent_events(self, limit: int = 100) -> pd.DataFrame:
         return self._fetch_df(f"SELECT * FROM live_events ORDER BY id DESC LIMIT {int(limit)}")

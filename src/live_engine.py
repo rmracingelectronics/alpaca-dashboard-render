@@ -1680,42 +1680,29 @@ class LivePaperTradingEngine:
         return records
 
     def _seed_full_strategy_symbol_monitor(self, run_id: str, closed_ts: pd.Timestamp, specs: list[dict[str, str]], symbols: list[str], reason: str = "Queued for this worker scan.") -> None:
-        """Publish a complete strategy x symbol scaffold before expensive scans run.
+        """Record scan expectations without overwriting monitor values.
 
-        Without this, all-strategies mode can look broken in the dashboard while
-        a scan is still running: the worker writes strategy monitor rows one
-        strategy at a time, and the reader naturally sees only the first 1-2
-        strategies until the scan finishes.  This scaffold makes the monitor
-        table immediately contain the expected active_strategy_count * symbols
-        rows for the current run_id; each strategy then replaces its own rows
-        with real indicator/check values as it completes.
+        Earlier builds wrote a full "Scanning - queued" scaffold into the same
+        current-state monitor table used by the dashboard. Because that table is
+        keyed by symbol|strategy, queued placeholders replaced the last useful
+        indicator values and made the panel look stale or empty during a scan.
+        Progress now lives in live_scan_progress; the monitor table is updated
+        only with real per-strategy indicator/check rows.
         """
         symbols = list(dict.fromkeys([str(s or "").upper() for s in (symbols or []) if s]))
-        if not specs or not symbols:
-            return
-        original_params = self.params
-        rows: list[dict[str, Any]] = []
         try:
-            for spec in specs:
-                self.params = self._make_params_for_live_config(getattr(self, "_runtime_config", {}), spec.get("preset"), spec.get("variant"), spec.get("quality_gate"))
-                for sym in symbols:
-                    rec = self._symbol_monitor_base_config(sym, run_id, "Scanning - queued", reason)
-                    rec["latest_bar_time_utc"] = pd.Timestamp(closed_ts).isoformat()
-                    rec["latest_bar_time_et"] = pd.Timestamp(closed_ts).tz_convert("America/New_York").strftime("%Y-%m-%d %H:%M")
-                    rec["decision_status"] = "waiting"
-                    rec["check_summary"] = reason
-                    rec["payload"] = {
-                        "reason": reason,
-                        "scaffold": True,
-                        "strategy_run_mode": getattr(self.live, "strategy_run_mode", "single"),
-                        "expected_strategy_count": len(specs),
-                        "expected_symbol_count": len(symbols),
-                        "bar_session_mode": self._live_session_mode(),
-                    }
-                    rows.append(rec)
-        finally:
-            self.params = original_params
-        self._write_symbol_monitor_records(rows)
+            self.store.set_state("live_scan_expected_monitor", {
+                "run_id": run_id,
+                "updated_at_utc": utc_now_iso(),
+                "closed_bar_utc": pd.Timestamp(closed_ts).isoformat(),
+                "expected_strategy_count": len(specs or []),
+                "expected_symbol_count": len(symbols),
+                "expected_rows": len(specs or []) * len(symbols),
+                "reason": reason,
+                "note": "Progress-only scaffold; current monitor values are not overwritten while a scan is running.",
+            })
+        except Exception:
+            pass
 
     def _monitor_record_from_latest_row(self, row: pd.Series, run_id: str, closed_ts: pd.Timestamp) -> dict[str, Any]:
         symbol = self._monitor_text(row, "symbol").upper()
@@ -2018,7 +2005,37 @@ class LivePaperTradingEngine:
             return all_live_strategy_specs()
         return [_spec_for_preset_or_variant(getattr(self.params, "live_strategy_preset", "manual"), getattr(self.params, "live_strategy_variant", getattr(self.live, "strategy_variant", "best_report_153601")), getattr(self.params, "live_quality_gate", "off"))]
 
-    def _fetch_recent_signals_for_params(self, run_id: str, closed_ts: pd.Timestamp, today_ny: Any, symbols: list[str], bars_5m: pd.DataFrame, daily: pd.DataFrame, qqq_context: pd.DataFrame, params: StrategyParams, session_mode: str = "regular_only") -> pd.DataFrame:
+    def _build_live_feature_cache(self, run_id: str, closed_ts: pd.Timestamp, symbols: list[str], bars_5m: pd.DataFrame, daily: pd.DataFrame, qqq_context: pd.DataFrame, session_mode: str) -> dict[str, dict[str, Any]]:
+        """Precompute symbol feature frames once per worker scan.
+
+        All-strategies mode previously recomputed add_intraday_features(), daily
+        feature joins, and QQQ context merges once for every strategy. With 14
+        strategies and 16 symbols that made a single live scan slow enough for
+        the dashboard to keep showing partial/queued rows. The strategy rules
+        still run independently, but the market/indicator feature frame is now
+        built once per symbol per scan and reused safely by each strategy.
+        """
+        cache: dict[str, dict[str, Any]] = {}
+        for symbol in symbols:
+            symbol = str(symbol).upper()
+            sym_5m = bars_5m[bars_5m["symbol"] == symbol].copy() if not bars_5m.empty and "symbol" in bars_5m.columns else pd.DataFrame()
+            sym_daily = daily[daily["symbol"] == symbol].copy() if not daily.empty and "symbol" in daily.columns else pd.DataFrame()
+            rec: dict[str, Any] = {"symbol": symbol, "sym_5m": sym_5m, "sym_daily": sym_daily, "intraday": pd.DataFrame(), "merged": pd.DataFrame(), "error": ""}
+            if sym_5m.empty or sym_daily.empty:
+                rec["error"] = "No recent 5-minute or daily bars for this symbol."
+                cache[symbol] = rec
+                continue
+            try:
+                intraday = add_intraday_features(sym_5m, session_mode=session_mode)
+                intraday = _add_daily_features_live_safe(intraday, sym_daily)
+                merged = merge_market_context(intraday, qqq_context)
+                rec.update({"intraday": intraday, "merged": merged})
+            except Exception as exc:
+                rec["error"] = str(exc)[:300]
+            cache[symbol] = rec
+        return cache
+
+    def _fetch_recent_signals_for_params(self, run_id: str, closed_ts: pd.Timestamp, today_ny: Any, symbols: list[str], bars_5m: pd.DataFrame, daily: pd.DataFrame, qqq_context: pd.DataFrame, params: StrategyParams, session_mode: str = "regular_only", feature_cache: dict[str, dict[str, Any]] | None = None) -> pd.DataFrame:
         monitor_records: list[dict[str, Any]] = []
         frames: list[pd.DataFrame] = []
         original_params = self.params
@@ -2027,21 +2044,42 @@ class LivePaperTradingEngine:
         strategy_preset = str(getattr(params, "live_strategy_preset", "manual"))
         try:
             for symbol in symbols:
-                sym_5m = bars_5m[bars_5m["symbol"] == symbol].copy()
-                sym_daily = daily[daily["symbol"] == symbol].copy()
-                if sym_5m.empty or sym_daily.empty:
-                    monitor_records.append(self._monitor_record_for_missing_symbol(symbol, run_id, closed_ts, "Waiting - symbol data", "No recent 5-minute or daily bars for this symbol."))
-                    continue
-                intraday = pd.DataFrame()
-                merged = pd.DataFrame()
+                symbol = str(symbol).upper()
+                cache_rec = (feature_cache or {}).get(symbol) if feature_cache is not None else None
+                if cache_rec is not None:
+                    sym_5m = cache_rec.get("sym_5m", pd.DataFrame()).copy()
+                    sym_daily = cache_rec.get("sym_daily", pd.DataFrame()).copy()
+                    intraday = cache_rec.get("intraday", pd.DataFrame()).copy()
+                    merged = cache_rec.get("merged", pd.DataFrame()).copy()
+                    cache_error = str(cache_rec.get("error", "") or "")
+                    if cache_error and (sym_5m.empty or sym_daily.empty):
+                        monitor_records.append(self._monitor_record_for_missing_symbol(symbol, run_id, closed_ts, "Waiting - symbol data", cache_error))
+                        continue
+                    if cache_error and merged.empty:
+                        fallback = self._latest_feature_monitor_record(symbol, run_id, closed_ts, intraday if not intraday.empty else sym_5m, "Error - indicator calculation", cache_error[:220])
+                        monitor_records.append(fallback or self._monitor_record_for_missing_symbol(symbol, run_id, closed_ts, "Error - indicator calculation", cache_error[:220]))
+                        continue
+                else:
+                    sym_5m = bars_5m[bars_5m["symbol"] == symbol].copy()
+                    sym_daily = daily[daily["symbol"] == symbol].copy()
+                    if sym_5m.empty or sym_daily.empty:
+                        monitor_records.append(self._monitor_record_for_missing_symbol(symbol, run_id, closed_ts, "Waiting - symbol data", "No recent 5-minute or daily bars for this symbol."))
+                        continue
+                    intraday = pd.DataFrame()
+                    merged = pd.DataFrame()
+                    try:
+                        intraday = add_intraday_features(sym_5m, session_mode=session_mode)
+                        intraday = _add_daily_features_live_safe(intraday, sym_daily)
+                        merged = merge_market_context(intraday, qqq_context)
+                    except Exception as exc:
+                        fallback = self._latest_feature_monitor_record(symbol, run_id, closed_ts, merged if not merged.empty else (intraday if not intraday.empty else sym_5m), "Error - indicator calculation", str(exc)[:220])
+                        monitor_records.append(fallback or self._monitor_record_for_missing_symbol(symbol, run_id, closed_ts, "Error - indicator calculation", str(exc)[:220]))
+                        continue
                 try:
-                    intraday = add_intraday_features(sym_5m, session_mode=session_mode)
-                    intraday = _add_daily_features_live_safe(intraday, sym_daily)
-                    merged = merge_market_context(intraday, qqq_context)
-                    signals = compute_signals(merged, params)
+                    signals = compute_signals(merged.copy(), params)
                 except Exception as exc:
-                    fallback = self._latest_feature_monitor_record(symbol, run_id, closed_ts, merged if not merged.empty else (intraday if not intraday.empty else sym_5m), "Error - indicator calculation", str(exc)[:220])
-                    monitor_records.append(fallback or self._monitor_record_for_missing_symbol(symbol, run_id, closed_ts, "Error - indicator calculation", str(exc)[:220]))
+                    fallback = self._latest_feature_monitor_record(symbol, run_id, closed_ts, merged if not merged.empty else (intraday if not intraday.empty else sym_5m), "Error - strategy calculation", str(exc)[:220])
+                    monitor_records.append(fallback or self._monitor_record_for_missing_symbol(symbol, run_id, closed_ts, "Error - strategy calculation", str(exc)[:220]))
                     continue
                 if signals.empty:
                     fallback = self._latest_feature_monitor_record(symbol, run_id, closed_ts, merged if not merged.empty else intraday, "Watching - no setup", "Indicator pipeline produced rows but no strategy output for this strategy.")
@@ -2223,6 +2261,23 @@ class LivePaperTradingEngine:
         symbols = list(dict.fromkeys([s.upper() for s in (self.live.symbols or []) if s]))
         session_mode = self._live_session_mode()
         specs = self._strategy_specs_for_current_run()
+        try:
+            self.store.set_state("live_scan_progress", {
+                "status": "running",
+                "run_id": run_id,
+                "started_at_utc": utc_now_iso(),
+                "updated_at_utc": utc_now_iso(),
+                "closed_bar_utc": pd.Timestamp(closed_ts).isoformat(),
+                "strategy_run_mode": getattr(self.live, "strategy_run_mode", "single"),
+                "expected_strategies": len(specs),
+                "completed_strategies": 0,
+                "expected_symbols": len(symbols),
+                "expected_rows": len(specs) * len(symbols),
+                "feed": self.live.feed,
+                "session_mode": session_mode,
+            })
+        except Exception:
+            pass
         # Make all-strategies mode visible immediately.  The actual indicator
         # rows overwrite this scaffold as each strategy finishes scanning.
         if str(getattr(self.live, "strategy_run_mode", "single")).lower() == "all_strategies":
@@ -2255,6 +2310,20 @@ class LivePaperTradingEngine:
             self._write_symbol_monitor_records(records)
             return pd.DataFrame()
         qqq_context = _build_qqq_context_live_safe(qqq_5m, qqq_daily, session_mode=session_mode)
+        feature_cache = self._build_live_feature_cache(run_id, closed_ts, symbols, bars_5m, daily, qqq_context, session_mode)
+        try:
+            ready_count = sum(1 for rec in feature_cache.values() if isinstance(rec, dict) and not rec.get("error") and not rec.get("merged", pd.DataFrame()).empty)
+            self.store.set_state("live_feature_cache_summary", {
+                "run_id": run_id,
+                "updated_at_utc": utc_now_iso(),
+                "symbols": len(symbols),
+                "ready_symbols": ready_count,
+                "session_mode": session_mode,
+                "feed": self.live.feed,
+                "note": "Symbol feature frames are built once per scan and reused by all strategy variants.",
+            })
+        except Exception:
+            pass
         selected_frames: list[pd.DataFrame] = []
         scan_summary = {
             "updated_at_utc": utc_now_iso(),
@@ -2271,7 +2340,7 @@ class LivePaperTradingEngine:
         for spec in specs:
             params = self._make_params_for_live_config(getattr(self, "_runtime_config", {}), spec.get("preset"), spec.get("variant"), spec.get("quality_gate"))
             try:
-                selected = self._fetch_recent_signals_for_params(run_id, closed_ts, today_ny, symbols, bars_5m, daily, qqq_context, params, session_mode=session_mode)
+                selected = self._fetch_recent_signals_for_params(run_id, closed_ts, today_ny, symbols, bars_5m, daily, qqq_context, params, session_mode=session_mode, feature_cache=feature_cache)
                 selected_count = int(0 if selected is None else len(selected))
                 scan_summary["strategies"].append({
                     "variant": spec.get("variant"),
@@ -2281,6 +2350,25 @@ class LivePaperTradingEngine:
                     "selected_signals": selected_count,
                     "status": "ok",
                 })
+                try:
+                    self.store.set_state("live_scan_progress", {
+                        "status": "running",
+                        "run_id": run_id,
+                        "updated_at_utc": utc_now_iso(),
+                        "closed_bar_utc": pd.Timestamp(closed_ts).isoformat(),
+                        "strategy_run_mode": getattr(self.live, "strategy_run_mode", "single"),
+                        "expected_strategies": len(specs),
+                        "completed_strategies": len(scan_summary["strategies"]),
+                        "current_strategy": spec.get("variant"),
+                        "last_strategy_status": "ok",
+                        "last_strategy_selected_signals": selected_count,
+                        "expected_symbols": len(symbols),
+                        "expected_rows": len(specs) * len(symbols),
+                        "feed": self.live.feed,
+                        "session_mode": session_mode,
+                    })
+                except Exception:
+                    pass
                 if selected is not None and not selected.empty:
                     selected_frames.append(selected)
             except Exception as exc:
@@ -2294,6 +2382,25 @@ class LivePaperTradingEngine:
                     "error": str(exc)[:300],
                 })
                 self.store.insert_event("strategy_scan_error", {"strategy_variant": spec.get("variant"), "message": str(exc)}, status="error")
+                try:
+                    self.store.set_state("live_scan_progress", {
+                        "status": "running",
+                        "run_id": run_id,
+                        "updated_at_utc": utc_now_iso(),
+                        "closed_bar_utc": pd.Timestamp(closed_ts).isoformat(),
+                        "strategy_run_mode": getattr(self.live, "strategy_run_mode", "single"),
+                        "expected_strategies": len(specs),
+                        "completed_strategies": len(scan_summary["strategies"]),
+                        "current_strategy": spec.get("variant"),
+                        "last_strategy_status": "error",
+                        "last_strategy_error": str(exc)[:300],
+                        "expected_symbols": len(symbols),
+                        "expected_rows": len(specs) * len(symbols),
+                        "feed": self.live.feed,
+                        "session_mode": session_mode,
+                    })
+                except Exception:
+                    pass
                 # Keep the Live Symbol Intelligence panel complete even if one
                 # experimental strategy errors.  Without this, all-strategies mode
                 # can show fewer strategy views than active_strategy_count and make
@@ -2316,7 +2423,31 @@ class LivePaperTradingEngine:
                     self.params = original_params
         try:
             scan_summary["selected_total"] = int(sum(int(x.get("selected_signals", 0) or 0) for x in scan_summary["strategies"]))
+            scan_summary["completed_at_utc"] = utc_now_iso()
+            scan_summary["completed_strategies"] = len(scan_summary["strategies"])
+            scan_summary["expected_strategies"] = len(specs)
+            scan_summary["expected_rows"] = len(specs) * len(symbols)
             self.store.set_state("last_strategy_scan_summary", scan_summary)
+            self.store.set_state("last_completed_strategy_scan", scan_summary)
+            self.store.set_state("live_scan_progress", {
+                "status": "complete",
+                "run_id": run_id,
+                "updated_at_utc": utc_now_iso(),
+                "completed_at_utc": utc_now_iso(),
+                "closed_bar_utc": pd.Timestamp(closed_ts).isoformat(),
+                "strategy_run_mode": getattr(self.live, "strategy_run_mode", "single"),
+                "expected_strategies": len(specs),
+                "completed_strategies": len(scan_summary["strategies"]),
+                "expected_symbols": len(symbols),
+                "expected_rows": len(specs) * len(symbols),
+                "selected_total": scan_summary["selected_total"],
+                "feed": self.live.feed,
+                "session_mode": session_mode,
+            })
+            try:
+                self.store.prune_strategy_symbol_monitor_runs(keep=8)
+            except Exception:
+                pass
         except Exception:
             pass
         if not selected_frames:
@@ -2524,6 +2655,53 @@ class LivePaperTradingEngine:
         self.state["max_hold_exit_keys"] = list(submitted)[-1000:]
         return rows
 
+    def _signal_identity_for_log(self, signal: pd.Series | dict[str, Any], plan: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Compact, JSON-safe identity payload for a selected signal/order candidate."""
+        data = signal.to_dict() if hasattr(signal, "to_dict") else dict(signal or {})
+        plan = plan or {}
+        try:
+            ts = pd.Timestamp(data.get("timestamp", data.get("candidate_time_utc", plan.get("signal_time_utc", ""))))
+            if pd.notna(ts):
+                if ts.tzinfo is None:
+                    ts = ts.tz_localize("UTC")
+                else:
+                    ts = ts.tz_convert("UTC")
+                ts_utc = ts.isoformat()
+                ts_et = ts.tz_convert(NY).strftime("%Y-%m-%d %H:%M")
+            else:
+                ts_utc = ""
+                ts_et = ""
+        except Exception:
+            ts_utc = str(data.get("timestamp") or plan.get("signal_time_utc") or "")
+            ts_et = str(plan.get("signal_time_et") or "")
+        raw_code = data.get("strategy_code") or plan.get("strategy_code") or ""
+        raw_variant = data.get("strategy_variant") or plan.get("strategy_variant") or _strategy_variant_from_code(raw_code) or getattr(self.params, "live_strategy_variant", getattr(self.live, "strategy_variant", "best_report_153601"))
+        raw_preset = data.get("strategy_preset") or plan.get("strategy_preset") or getattr(self.params, "live_strategy_preset", "")
+        raw_gate = data.get("quality_gate") or plan.get("quality_gate") or getattr(self.params, "live_quality_gate", "off")
+        return {
+            "symbol": str(data.get("symbol") or plan.get("symbol") or "").upper(),
+            "strategy_variant": str(raw_variant or ""),
+            "strategy_code": str(raw_code or _strategy_code(str(raw_variant or "")) or ""),
+            "strategy_preset": str(raw_preset or ""),
+            "quality_gate": str(raw_gate or ""),
+            "side": str(data.get("side") or plan.get("strategy_side") or ""),
+            "trigger_type": str(data.get("trigger_type") or plan.get("trigger_type") or ""),
+            "signal_time_utc": ts_utc,
+            "signal_time_et": ts_et,
+            "candidate_score": _safe_float(data.get("candidate_score", data.get("score", 0.0)), 0.0),
+            "estimated_notional": _safe_float(plan.get("estimated_notional"), 0.0) if plan else None,
+            "risk_budget": _safe_float(plan.get("risk_budget"), 0.0) if plan else None,
+            "actual_risk_dollars": _safe_float(plan.get("actual_risk_dollars"), 0.0) if plan else None,
+            "qty": plan.get("qty") if plan else None,
+        }
+
+    def _submission_rejection_summary_message(self, reason_counts: dict[str, int]) -> str:
+        if not reason_counts:
+            return "Signals existed, but no order was submitted. No rejection reason was captured."
+        items = sorted(reason_counts.items(), key=lambda kv: (-int(kv[1]), str(kv[0])))
+        summary = ", ".join([f"{reason}={count}" for reason, count in items[:8]])
+        return f"Signals existed, but no order was submitted. Filter reasons: {summary}."
+
     def run_once(self) -> list[dict[str, Any]]:
         self._apply_runtime_config_override()
         rows: list[dict[str, Any]] = []
@@ -2586,8 +2764,20 @@ class LivePaperTradingEngine:
         available_slots = max(0, effective_open_limit - len(existing))
         capacity = min(remaining_daily, available_slots)
         if capacity <= 0:
-            row = {"timestamp": timestamp, "event": "capacity_full", "message": "Daily/open-position limits reached.", "signals_seen": len(signals), "strategy_run_mode": getattr(self.live, "strategy_run_mode", "single"), "effective_daily_limit": effective_daily_limit, "effective_open_limit": effective_open_limit}
+            row = {
+                "timestamp": timestamp,
+                "event": "capacity_full",
+                "message": "Daily/open-position limits reached before any selected signal could be submitted.",
+                "signals_seen": len(signals),
+                "strategy_run_mode": getattr(self.live, "strategy_run_mode", "single"),
+                "effective_daily_limit": effective_daily_limit,
+                "effective_open_limit": effective_open_limit,
+                "remaining_daily": remaining_daily,
+                "available_slots": available_slots,
+                "open_symbols_now": sorted(existing),
+            }
             rows.append(row)
+            self.store.set_state("last_signal_filter_summary", row)
             self.store.insert_event("capacity_full", row, status="blocked")
             _append_log(self.live.log_path, rows)
             self._heartbeat("blocked", "Capacity full.", {"signals_seen": len(signals), "open_positions": len(existing), "effective_daily_limit": effective_daily_limit, "effective_open_limit": effective_open_limit})
@@ -2597,29 +2787,58 @@ class LivePaperTradingEngine:
         taken = 0
         reserved_notional = 0.0
         attempted_symbols: set[str] = set()
+        filter_reason_counts: dict[str, int] = {}
+        filter_examples: list[dict[str, Any]] = []
+        def _record_submit_filter(reason: str, signal_obj: Any, plan_obj: dict[str, Any] | None = None) -> None:
+            reason = str(reason or "unknown_submit_filter")
+            filter_reason_counts[reason] = filter_reason_counts.get(reason, 0) + 1
+            if len(filter_examples) < 12:
+                data = signal_obj.to_dict() if hasattr(signal_obj, "to_dict") else dict(signal_obj or {})
+                example = {
+                    "reason": reason,
+                    "symbol": str((plan_obj or data).get("symbol", "")).upper(),
+                    "strategy_variant": str((plan_obj or data).get("strategy_variant", data.get("strategy_variant", ""))),
+                    "strategy_code": str((plan_obj or data).get("strategy_code", data.get("strategy_code", ""))),
+                    "signal_time": str((plan_obj or data).get("signal_time_et", data.get("timestamp", ""))),
+                }
+                if plan_obj:
+                    example.update({
+                        "qty": plan_obj.get("qty"),
+                        "estimated_notional": plan_obj.get("estimated_notional"),
+                        "risk_budget": plan_obj.get("risk_budget"),
+                        "actual_risk_dollars": plan_obj.get("actual_risk_dollars"),
+                        "notional_cap_reason": plan_obj.get("notional_cap_reason"),
+                    })
+                filter_examples.append(example)
         buying_power_safety = self._buying_power_safety_fraction()
         for _, signal in signals.iterrows():
             sym = str(signal.get("symbol", "")).upper()
             if sym in attempted_symbols:
+                _record_submit_filter("symbol_already_attempted_this_scan", signal)
                 self.store.upsert_candidate_audit(self._audit_record_from_signal(signal, timestamp, "rejected", "symbol_already_attempted_this_scan", stage="submit_checks"))
                 continue
             signal_params = self._params_for_signal(signal)
             order_notional_cap, order_notional_reason = self._order_notional_budget(account_buying_power, reserved_notional, capacity - taken, strategy_multiplier)
             plan = self.build_order_plan(signal, equity, high_watermark, reference_price=quote_lookup.get(sym), params=signal_params, max_notional=order_notional_cap, max_notional_reason=order_notional_reason)
             if not plan:
+                _record_submit_filter("sizing_or_invalid_order_plan", signal)
                 self.store.upsert_candidate_audit(self._audit_record_from_signal(signal, timestamp, "rejected", "sizing_or_invalid_order_plan", stage="order_plan"))
                 continue
             key = f"{plan.get('strategy_variant','')}|{plan['symbol']}|{plan['session_date']}|{plan['signal_time_et']}|{plan['strategy_side']}|{plan['trigger_type']}"
             if key in submitted:
+                _record_submit_filter("duplicate_signal_already_submitted", signal, plan)
                 self.store.upsert_candidate_audit(self._audit_record_from_signal(signal, timestamp, "rejected", "duplicate_signal_already_submitted", stage="submit_checks", plan=plan))
                 continue
             if plan["symbol"] in existing:
+                _record_submit_filter("position_already_open", signal, plan)
                 self.store.upsert_candidate_audit(self._audit_record_from_signal(signal, timestamp, "rejected", "position_already_open", stage="submit_checks", plan=plan))
                 continue
             if self._symbol_daily_count(plan["symbol"], plan["session_date"]) >= self.live.max_orders_per_symbol_per_day:
+                _record_submit_filter("symbol_daily_order_limit", signal, plan)
                 self.store.upsert_candidate_audit(self._audit_record_from_signal(signal, timestamp, "rejected", "symbol_daily_order_limit", stage="submit_checks", plan=plan))
                 continue
             if account_buying_power > 0 and (reserved_notional + _safe_float(plan.get("estimated_notional"), 0.0)) > account_buying_power * buying_power_safety:
+                _record_submit_filter("buying_power_reserve_limit", signal, plan)
                 self.store.upsert_candidate_audit(self._audit_record_from_signal(signal, timestamp, "rejected", "buying_power_reserve_limit", stage="submit_checks", plan=plan))
                 continue
             self.store.upsert_candidate_audit(self._audit_record_from_signal(signal, timestamp, "accepted", "order_plan_created", stage="order_plan", plan=plan))
@@ -2700,8 +2919,45 @@ class LivePaperTradingEngine:
             if taken >= capacity:
                 break
         self.state["submitted_signal_keys"] = submitted[-1000:]
+        if filter_reason_counts:
+            reason_text = ", ".join(f"{k}={v}" for k, v in sorted(filter_reason_counts.items(), key=lambda kv: (-kv[1], kv[0]))) or "unknown"
+            filter_summary = {
+                "timestamp": timestamp,
+                "event": "signals_filtered" if not rows else "signals_partially_filtered",
+                "message": (
+                    f"Signals existed but none were submitted; filter reasons: {reason_text}."
+                    if not rows else
+                    f"Some selected signals were filtered after submit checks; filter reasons: {reason_text}."
+                ),
+                "signals_seen": len(signals),
+                "orders_planned_or_submitted": taken,
+                "filter_reason_counts": filter_reason_counts,
+                "filter_examples": filter_examples,
+                "account_buying_power": account_buying_power,
+                "buying_power_safety_pct": buying_power_safety * 100.0,
+                "reserved_notional": reserved_notional,
+                "capacity": capacity,
+                "effective_daily_limit": effective_daily_limit,
+                "effective_open_limit": effective_open_limit,
+                "remaining_daily": remaining_daily,
+                "available_slots": available_slots,
+            }
+            self.store.set_state("last_signal_filter_summary", filter_summary)
         if not rows:
-            rows.append({"timestamp": timestamp, "event": "signals_filtered", "message": "Signals existed but were duplicate, already open, or failed sizing/capacity checks.", "signals_seen": len(signals)})
+            rows.append(dict(filter_summary if filter_reason_counts else {
+                "timestamp": timestamp,
+                "event": "signals_filtered",
+                "message": "Signals existed but none were submitted; no submit filter reason was captured.",
+                "signals_seen": len(signals),
+                "filter_reason_counts": {},
+                "filter_examples": [],
+                "account_buying_power": account_buying_power,
+                "reserved_notional": reserved_notional,
+                "capacity": capacity,
+                "effective_daily_limit": effective_daily_limit,
+                "effective_open_limit": effective_open_limit,
+            }))
+            rows[-1]["event"] = "signals_filtered"
             self.store.insert_event("signals_filtered", rows[-1], status="filtered")
         try:
             self._sync_account_state()

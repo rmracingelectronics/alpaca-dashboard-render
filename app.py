@@ -141,7 +141,7 @@ def debug_live_state():
     try:
         store = LiveStore(initialize_schema=False)
         out["store"] = {"is_postgres": store.is_postgres}
-        for key in ["live_config_override", "settings", "heartbeat", "market_clock", "last_bar_fetch", "last_strategy_scan_summary"]:
+        for key in ["live_config_override", "settings", "heartbeat", "market_clock", "last_bar_fetch", "last_strategy_scan_summary", "last_completed_strategy_scan", "live_scan_progress", "live_feature_cache_summary", "last_signal_filter_summary", "worker_error"]:
             value, updated_at = store.get_state_with_updated_at(key, None)
             out[key] = {"updated_at_utc": updated_at, "value": _safe_diag_value(value)}
         out["table_counts"] = {
@@ -232,6 +232,40 @@ def debug_live_strategies():
         return jsonify({"ok": False, "error": str(exc), "traceback": traceback.format_exc()}), 500
 
 
+@server.route("/debug/live-submit-filters")
+def debug_live_submit_filters():
+    """Explain why selected live signals did or did not become Alpaca orders."""
+    out = {"ok": False, "service": os.getenv("RENDER_SERVICE_NAME", "unknown"), "database_url_present": bool(os.getenv("DATABASE_URL"))}
+    try:
+        store = LiveStore(initialize_schema=False)
+        summary = store.get_state("last_signal_filter_summary", {}) or {}
+        audit = store.recent_candidate_audit(500)
+        recent_rejects = audit
+        if recent_rejects is not None and not recent_rejects.empty:
+            if "decision_status" in recent_rejects.columns:
+                recent_rejects = recent_rejects[recent_rejects["decision_status"].astype(str).str.lower().eq("rejected")].copy()
+            keep = [
+                "updated_at_utc", "candidate_time_et", "symbol", "strategy_variant", "strategy_code", "strategy_side",
+                "trigger_type", "audit_stage", "decision_status", "reject_reason", "candidate_score", "final_rank_score",
+                "entry_reference_price", "qty", "risk_budget", "stop_price", "target_price",
+            ]
+            recent_rejects = recent_rejects[[c for c in keep if c in recent_rejects.columns]].head(100)
+        out.update({
+            "ok": True,
+            "store": {"is_postgres": store.is_postgres},
+            "last_signal_filter_summary": _safe_diag_value(summary),
+            "recent_rejected_candidates": _df_preview(recent_rejects, 100),
+            "interpretation": [
+                "signals_filtered is not an Alpaca/API error. It means at least one strategy produced a signal, but none survived the final submit checks.",
+                "Use filter_reason_counts to see whether the blocker was duplicate signal, open position, symbol daily order limit, buying-power reserve, invalid sizing, or capacity.",
+                "Candidate audit keeps per-symbol/per-strategy rows so reports can show which strategy generated the signal and why it was rejected.",
+            ],
+        })
+    except Exception as exc:
+        out.update({"ok": False, "error": str(exc), "traceback": traceback.format_exc()})
+    return jsonify(out)
+
+
 @server.route("/debug/live-data")
 @server.route("/debug/live-tables")
 @server.route("/debug/live-snapshot")
@@ -288,6 +322,9 @@ def debug_live_symbol_monitor():
             "store": {"is_postgres": store.is_postgres},
             "configured_symbols": cfg.get("symbols") or heartbeat.get("symbols"),
             "heartbeat": _safe_diag_value(heartbeat),
+            "live_scan_progress": _safe_diag_value(store.get_state("live_scan_progress", {}) or {}),
+            "last_completed_strategy_scan": _safe_diag_value(store.get_state("last_completed_strategy_scan", {}) or {}),
+            "last_signal_filter_summary": _safe_diag_value(store.get_state("last_signal_filter_summary", {}) or {}),
             "symbol_monitor": _df_preview(monitor, 1000),
         })
     except Exception as exc:

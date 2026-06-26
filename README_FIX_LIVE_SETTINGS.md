@@ -1,255 +1,88 @@
-# V33 V10 - free-feed live monitor and extended-hours diagnostics
+# V20 live worker scan + diagnostics fix
 
-This package keeps the V5/V6/V7/V8/V9 fixes and adds a stricter solution for the remaining blank Live Symbol Intelligence rows on Alpaca Basic/free paper accounts.
+This build keeps all prior fixes (database-backed settings, Alpaca paper trade history, live symbol intelligence, all-strategies paper experiment mode, real-time-only live decisions, risk/compounding guard, bracket auto-repair retry, monitor value carry-forward, and worker-independent scan progress).
 
-## What was actually wrong
+## Main V20 changes
 
-The worker settings were already saved and loaded from Postgres. The worker was also running in `all_strategies` mode with extended-hours enabled.
+### 1) Faster all-strategies scan
+All-strategies mode was recomputing the same intraday/daily/QQQ indicator feature frames for every strategy. With 14 strategies x 16 symbols, that made scans slow enough for the dashboard to show old or partial monitor rows.
 
-The remaining blank rows came from the live market-data/indicator path:
+V20 precomputes the per-symbol market/indicator feature frames once per scan and reuses them for every strategy variant. The strategy rules still run independently and keep their own strategy attribution.
 
-1. **The strategy schedule was extended, but the indicator diagnostics could still end up with no same-day usable feature row.**
-   The worker was showing `Waiting - no latest bar` / `0/0 checks` when the final strategy output did not align with the exact wall-clock 5-minute slot. This is common with IEX in pre/after-market because some symbols do not print every five minutes.
+New DB diagnostic state:
 
-2. **The live daily-feature merge required a same-session daily row.**
-   Alpaca's current `1Day` row may be missing or partial during live/pre-market. The old merge could leave `prev_close`, `daily_atr14_percent`, and `avg_20d_dollar_volume` blank for today's intraday bars. Those fields are required by the strategy gates.
+- `live_feature_cache_summary`
 
-3. **The app needed to be explicit about Alpaca Basic/free data limitations.**
-   Free/no-subscription historical equity bars are reliable only on IEX. IEX is one exchange, so extended-hours bars can be sparse or missing by symbol. SIP is broader, but recent SIP requires a data entitlement or a delayed query.
+### 2) Monitor table no longer shows queued placeholders as if they were final values
+The strategy-symbol monitor table is a current-state table keyed by symbol/strategy/gate. Earlier queued scaffolds overwrote useful indicator values during scans. V20 makes scaffold/progress state progress-only and leaves the monitor table to store real indicator/check rows.
 
-## What V10 changes
+The dashboard should now keep the last useful RVOL/ATR/RS/VWAP/check values visible while a new scan is running.
 
-### 1. Live-safe daily features
+### 3) `signals_filtered` now explains why
+The previous event only said:
 
-The live worker now attaches daily features from the most recent completed daily bar before the current intraday session. It no longer requires today's `1Day` row to exist before computing:
+`Signals existed but were duplicate, already open, or failed sizing/capacity checks.`
 
-- previous close
-- previous day high/low
-- 20-day average dollar volume
-- daily ATR percent
+V20 stores and displays reason counts/examples, such as:
 
-### 2. Latest usable bar diagnostics
+- `duplicate_signal_already_submitted`
+- `symbol_daily_order_limit`
+- `position_already_open`
+- `buying_power_reserve_limit`
+- `sizing_or_invalid_order_plan`
+- `symbol_already_attempted_this_scan`
 
-When no strategy signal exists, the Live Symbol Intelligence panel now falls back to the latest usable indicator row within `live_max_bar_age_minutes` and still shows:
+New DB diagnostic state:
 
-- close
-- RVOL
-- daily ATR percent
-- day/open relative strength
-- VWAP extension in ATR
-- check count
-- reason no setup was active
+- `last_signal_filter_summary`
 
-So the panel should show `Watching - no setup` or `Blocked - ...` with indicator values instead of blank `Waiting - no latest bar` whenever usable bars exist.
+## What this does not change
 
-### 3. Alpaca free-feed aware fetching
+- Does not require the browser to stay open.
+- Does not change live/backtest separation.
+- Does not remove Alpaca order submission.
+- Does not change fixed-risk / percent-equity / controlled-compounding logic.
+- Does not add user settings.
+- Does not use delayed/historical data for live order decisions.
+- Does not change extended-hours order rules.
 
-The worker keeps `IEX` as the safest free/default feed. In all-strategies extended-hours mode it also attempts a best-effort SIP request with an end time at least 16 minutes delayed. If Alpaca rejects it, the worker continues using IEX and stores the rejection in diagnostics.
+## Useful checks after deploy
 
-A dashboard feed dropdown is available:
-
-- `IEX - free/no-subscription, single-exchange`
-- `SIP delayed - broad market, 16+ min delayed`
-- `SIP real-time - paid/unlimited entitlement`
-
-For `SIP delayed`, the code uses `feed=sip` with a delayed `end` time for historical bars. It does not pass `feed=delayed_sip` to `/v2/stocks/bars` because the historical bars endpoint documents `iex`, `sip`, `otc`, and `boats` as allowed bars feeds.
-
-### 4. Better diagnostics
-
-Added/kept these no-Dash endpoints:
+Open these URLs after Render redeploys:
 
 - `/healthz`
-- `/debug/db-ping`
 - `/debug/live-state`
-- `/debug/live-data`
 - `/debug/live-symbol-monitor`
-- `/debug/live-data-readiness`
 - `/debug/live-bar-health`
 
-`/debug/live-bar-health` is the key endpoint for this issue. It shows:
+In `/debug/live-state`, check:
 
-- configured feed
-- primary API feed actually used
-- effective feed
-- 5-minute row count
-- daily row count
-- missing/stale symbols
-- latest bar per symbol
-- SIP fallback rows
-- Alpaca API errors/rejections if any
-- symbol monitor preview
+- `heartbeat.status`
+- `heartbeat.strategy_run_mode`
+- `live_scan_progress`
+- `last_completed_strategy_scan`
+- `live_feature_cache_summary`
+- `last_signal_filter_summary`
 
-## What this does not hide
 
-The current strategy presets are still mainly regular-session/morning-trained strategies. Extended-hours mode is now technically monitored correctly, but the strategies may still produce no trades because their gates were researched on regular-market behavior. That is different from the panel being blank.
+## V20 - signal filter diagnostics and complete strategy-symbol monitor view
 
-Expected healthy extended-hours states are now:
+This build keeps all previous live fixes and adds two operational corrections:
 
-- `Watching - no setup`
-- `Blocked - score`
-- `Blocked - liquidity`
-- `Blocked - quality gate`
-- `Candidate - passed latest-bar checks`
-- `Selected - order planning`
+1. `signals_filtered` is no longer a vague event.  When strategies produce signals but no Alpaca order is submitted, the worker now writes `last_signal_filter_summary` with `filter_reason_counts` and examples.  The dashboard/debug endpoint `/debug/live-submit-filters` shows whether the blocker was duplicate signal, open position, symbol daily order limit, buying-power reserve, invalid sizing, or capacity.
 
-A row should only stay `Waiting - symbol data` / `Waiting - no latest bar` if Alpaca did not provide usable bars for that symbol/feed/session.
+2. Live Symbol Intelligence now reads `live_strategy_symbol_monitor` as a latest-state table keyed by strategy-symbol, not as a single `run_id` batch.  This prevents the dashboard from showing only a partial in-progress scan such as 44 rows when all 14 strategies x 16 symbols should be represented.  Queued rows continue to carry forward the last completed indicator values.
 
-## Commit commands
+New diagnostic endpoint:
+
+- `/debug/live-submit-filters`
+
+Deployment command reminder:
 
 ```powershell
 cd C:\render_apps\alpaca_dashboard_v33
 git status --short
-git add app.py src/alpaca_rest.py src/live_engine.py src/live_store.py src/live_dashboard.py assets/styles.css Procfile render.yaml README_FIX_LIVE_SETTINGS.md
-git commit -m "Fix free-feed live monitor and extended-hours diagnostics"
+git add app.py src/live_store.py src/live_engine.py README_FIX_LIVE_SETTINGS.md
+git commit -m "Improve live signal filter diagnostics and monitor coverage"
 git push origin master --verbose --progress
 ```
-
-If Render watches `main` instead of `master`:
-
-```powershell
-git push origin master:main --verbose --progress
-```
-
-## After deploy
-
-Open these in order:
-
-```text
-https://alpaca-momentum-dashboard-v33.onrender.com/healthz
-https://alpaca-momentum-dashboard-v33.onrender.com/debug/db-ping
-https://alpaca-momentum-dashboard-v33.onrender.com/debug/live-state
-https://alpaca-momentum-dashboard-v33.onrender.com/debug/live-bar-health
-https://alpaca-momentum-dashboard-v33.onrender.com/debug/live-symbol-monitor
-https://alpaca-momentum-dashboard-v33.onrender.com/debug/live-data
-```
-
-Then open the dashboard Live tab and click `Refresh live data now`.
-
-## Operational recommendation
-
-For free Alpaca paper experiments:
-
-- Use `IEX` if you want the real-time free feed but accept incomplete extended-hours coverage.
-- Use `SIP delayed` if you want broader paper-research diagnostics and can accept 16+ minute delayed decisions.
-- Use `SIP real-time` only if the account has the paid/unlimited data entitlement.
-
-For real-money trading, do not use the all-strategies extended-hours experiment without separate risk controls, spread checks, and dedicated extended-hours strategy validation.
-
-## V11 live-data safety correction
-
-V10 added free-feed diagnostics for Alpaca Basic/IEX accounts. V11 tightens the live trading path so order decisions always use a real-time feed only:
-
-- Live order decisions use `iex` or `sip` only.
-- If an old saved database config contains `delayed_sip`, the live worker automatically uses `iex` for live scans instead of trading from delayed bars.
-- The worker heartbeat and `last_bar_fetch` now expose `live_data_policy = real_time_only_for_order_decisions` and `delayed_data_used_for_orders = false`.
-- The delayed SIP idea is kept out of the live order path. Delayed/broad-market data is only appropriate for diagnostics/research/backtest, not for live entries.
-- Regular-session entries still submit market bracket paper orders.
-- Extended-hours entries still submit Alpaca-compatible marketable limit paper orders with `extended_hours=true`.
-
-## V12 - All-strategies monitor scaffold fix
-
-The V11 diagnostics showed `live_config_override` correctly saved `live_strategy_run_mode=all_strategies` with 14 active variants, and the heartbeat later showed the worker running all 14 variants, but the Live Symbol Intelligence table still displayed only one or two strategy views during a scan.
-
-Root cause: the worker wrote `live_strategy_symbol_monitor` rows one strategy at a time. The dashboard reads the newest run_id, so while a scan was still in progress it could show a partial run: 16 rows for one strategy, 32 rows for two strategies, etc. This looked like all-strategies mode was not working even though the worker had started the all-strategies scan.
-
-Fix: at the start of every all-strategies scan, the worker now publishes a complete scaffold of all active strategies x all configured symbols using status `Scanning - queued`. Each strategy then overwrites its own scaffold rows with real indicator/check data as it finishes. This makes the dashboard immediately show the expected coverage, e.g. 14 strategies x 16 symbols = 224 monitor rows, instead of showing only the first strategy that finished writing.
-
-This does not change live trading decisions, risk sizing, Alpaca order submission, data feed policy, or backtesting. It only fixes the visibility/diagnostic layer for all-strategies mode.
-
-## V13 - order budget / Alpaca rejection fix
-
-This build fixes order submission failures observed in the worker events table:
-
-- Alpaca 403 insufficient Reg-T buying power on repeated AMD short attempts.
-- Alpaca 422 bracket short stop-loss price too close to the base price.
-
-Changes:
-
-- Added conservative account buying-power detection using Alpaca account buckets (`regt_buying_power`, `buying_power`, `daytrading_buying_power`, `non_marginable_buying_power`).
-- Added a per-order notional cap so tiny stop distances cannot create very large positions. Default is 10% of equity in all-strategies mode and 25% in single-strategy mode. Override with `live_max_position_notional_pct` if needed.
-- Added an 80% buying-power safety reserve, overrideable with `live_buying_power_safety_pct`.
-- When a signal is capped, the order plan/report records `notional_capped`, `notional_cap`, `uncapped_qty`, and `estimated_notional`.
-- Added a practical minimum stop/target distance before sizing. This prevents Alpaca bracket rejections where a short stop rounds to the same cent as Alpaca's base price.
-- Prevents repeated order attempts for the same symbol inside the same worker scan after an attempted submission, reducing repeated 403/422 spam in all-strategies mode.
-
-The live Alpaca order path remains active:
-
-- Regular session: market bracket order.
-- Extended hours: simple limit order with `extended_hours=true` and `time_in_force=day`.
-
-
-## V14 risk/compounding correction
-
-V13 introduced a fixed default notional cap to prevent Alpaca buying-power rejects. That was too blunt for this project because the dashboard already has an explicit risk model: fixed-dollar risk, percent-equity risk, and controlled compounding with min/max risk dollars and drawdown throttles.
-
-V14 removes the hard-coded 10%/25% order cap. The live worker now keeps the existing risk budget calculation as the source of truth:
-
-- `fixed_dollar_risk` uses the configured fixed risk dollars.
-- `percent_equity` uses current Alpaca account equity and the configured base risk percent.
-- `controlled_compounding` uses current Alpaca equity, high-water mark, drawdown thresholds, min risk, max risk, and pause drawdown.
-
-After the target risk budget is calculated, the worker applies an execution affordability guard based on the live Alpaca paper account's current buying-power buckets. In all-strategies mode, the default allocation is based on the number of remaining configured strategy slots, derived from `max_open_positions`, `max_daily_trades`, and active strategy count. This prevents one tight-stop setup from consuming the whole paper account while keeping the user's risk model intact.
-
-The order plan now reports:
-
-- `risk_budget`: target risk from the selected risk/compounding model.
-- `actual_risk_dollars`: actual risk after any affordability sizing.
-- `risk_budget_shortfall`: difference between target and actual risk.
-- `notional_cap_reason`: why the quantity was capped, if it was capped.
-- `notional_capped`: whether the order size was reduced by the affordability guard.
-
-No strategy preset hides sizing or compounding. Risk settings remain separate from strategy selection.
-
-## V15 risk UI/compounding clarification
-
-- Clarifies that live mode uses Alpaca account equity when available. The Account value field is a fallback/backtest value.
-- Adds a live risk preview showing the effective intended risk budget for the selected risk mode.
-- Makes fixed risk, percent-equity, and controlled compounding explicit:
-  - Fixed dollar risk uses the selected fixed $ radio only.
-  - Percent-equity uses Base risk % x live Alpaca equity and ignores fixed-risk and min/max fields.
-  - Controlled compounding uses Base risk % plus min/max risk and drawdown brakes.
-- Stops saving controlled-compounding min/max values as active settings when the selected mode is fixed-dollar or percent-equity, so DB/debug output no longer implies hidden $300 caps.
-- Keeps the Alpaca affordability guard as an execution-layer guard only; it does not replace the selected risk/compounding model.
-
-## V16 live monitor carry-forward fix
-
-The Live Symbol Intelligence table now preserves the last completed indicator values while the worker is in the temporary `Scanning - queued` phase. Scaffold rows written at the start of all-strategies scans no longer blank RVOL, ATR, RS, VWAP, checks, close, or other diagnostics.
-
-Technical change:
-- Scaffold rows no longer purge the previous completed monitor rows.
-- If a scaffold row is written for an existing symbol/strategy key, the DB keeps the last completed indicator fields and marks the row as queued/current.
-- Legacy one-row-per-symbol monitor snapshots are not overwritten by blank scaffold rows.
-
-This does not change trade selection, risk management, order sizing, order submission, or backtesting. It only fixes the monitor display/readiness layer.
-
-## V17 regular-session bracket guard
-
-Fixes Alpaca 422 bracket validation errors such as:
-
-`stop_loss.stop_price must be >= base_price + 0.01`
-
-These errors happen after the strategy has already found a signal and the worker has called Alpaca `/orders`. Alpaca validates bracket child order prices against its current internal base price, which can differ from the signal/quote price used when the order plan was built. V17 refreshes the reference price immediately before regular-session bracket submission, moves the stop/target to the correct side of that base with a configurable buffer, and reduces quantity if needed so the submitted risk remains inside the configured risk budget. Extended-hours limit-order behavior is unchanged.
-
-New plan/report fields include:
-
-- `regular_bracket_base_reference_price`
-- `regular_bracket_price_buffer`
-- `regular_bracket_guard_adjusted`
-- `regular_bracket_guard_note`
-
-This is an execution-layer validation guard only. It does not replace the existing fixed-risk / percent-equity / controlled-compounding sizing model.
-
-## V18 - Automatic Alpaca bracket repair/retry
-
-This version adds automatic execution repair for regular-session Alpaca bracket orders.
-
-When Alpaca rejects a bracket order because the child stop/target is invalid against Alpaca's current moving `base_price`, the worker now:
-
-1. Parses Alpaca's rejection payload and base price when available.
-2. Refreshes the latest reference quote when needed.
-3. Recalculates stop/target around the current base price using the configured `slippage_bps` as the execution buffer.
-4. Reduces quantity if widening the stop would otherwise exceed the configured risk budget.
-5. Retries the order with a fresh client order id.
-6. Records all repair attempts in the signal plan/event payload for audit/reporting.
-
-This does not add any new user setting and does not replace the configured risk mode. Fixed risk, percent-equity compounding, and controlled compounding remain the source of truth for risk sizing.
