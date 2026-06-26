@@ -95,16 +95,19 @@ def _settings_snapshot_from_cfg(cfg: dict, existing_settings: dict | None = None
         "selection_mode": cfg.get("selection_mode", live_existing.get("selection_mode", "seen_so_far_top_n")),
     })
     risk = dict(risk_existing)
+    mode = str(cfg.get("risk_mode", risk_existing.get("position_sizing_mode", "percent_equity")) or "percent_equity")
     risk.update({
-        "position_sizing_mode": cfg.get("risk_mode", risk_existing.get("position_sizing_mode", "percent_equity")),
+        "position_sizing_mode": mode,
         "fixed_risk_dollars": float(cfg.get("risk_dollars", risk_existing.get("fixed_risk_dollars", 100)) or 100),
         "account_value_fallback": float(cfg.get("account_value", risk_existing.get("account_value_fallback", 10000)) or 10000),
         "base_risk_pct": float(cfg.get("base_risk_pct", risk_existing.get("base_risk_pct", 1.0)) or 1.0),
-        "min_risk_dollars": float(cfg.get("min_risk_dollars", risk_existing.get("min_risk_dollars", 10)) or 10),
-        "max_risk_dollars": float(cfg.get("max_risk_dollars", risk_existing.get("max_risk_dollars", 300)) or 300),
-        "dd1_risk_pct": float(cfg.get("dd1_risk_pct", risk_existing.get("dd1_risk_pct", 0.75)) or 0.75),
-        "dd2_risk_pct": float(cfg.get("dd2_risk_pct", risk_existing.get("dd2_risk_pct", 0.50)) or 0.50),
-        "pause_dd_pct": float(cfg.get("pause_dd_pct", risk_existing.get("pause_dd_pct", 15)) or 15),
+        # These only apply to controlled_compounding. For fixed/percent modes they are
+        # deliberately stored as null so the DB/debug output does not imply a hidden cap.
+        "min_risk_dollars": (float(cfg.get("min_risk_dollars") or 0.0) if mode == "controlled_compounding" else None),
+        "max_risk_dollars": (float(cfg.get("max_risk_dollars") or 0.0) if mode == "controlled_compounding" else None),
+        "dd1_risk_pct": (float(cfg.get("dd1_risk_pct") or 0.0) if mode == "controlled_compounding" else None),
+        "dd2_risk_pct": (float(cfg.get("dd2_risk_pct") or 0.0) if mode == "controlled_compounding" else None),
+        "pause_dd_pct": (float(cfg.get("pause_dd_pct") or 0.0) if mode == "controlled_compounding" else None),
     })
     return {"live": live, "risk": risk, "alpaca": alpaca}
 
@@ -901,9 +904,10 @@ def risk_controls():
         "Risk & Position Sizing",
         "Kept separate from strategy presets",
         [
-            html.Div(id="risk-mode-help", className="subtle-note", children="Risk sizing is independent from the strategy preset."),
+            html.Div(id="risk-mode-help", className="subtle-note", children="Risk sizing is independent from the strategy preset. In live mode the worker uses Alpaca equity when available; Account value is only a fallback/backtest value."),
+            html.Div(id="live-risk-preview", className="status-pill good", children="Live risk preview loads after the first worker/account snapshot."),
             html.Div(className="form-grid three", children=[
-                field("Account value", dcc.Input(id="account-value", value=10000, type="number", min=500, step=100)),
+                field("Account value fallback", dcc.Input(id="account-value", value=10000, type="number", min=500, step=100)),
                 field("Fixed risk $/trade", dcc.RadioItems(id="risk-dollars-v12", options=[{"label": "$10", "value": 10}, {"label": "$25", "value": 25}, {"label": "$50", "value": 50}, {"label": "$100", "value": 100}, {"label": "$200", "value": 200}, {"label": "$500", "value": 500}], value=100, inline=True)),
                 field("Risk mode", dcc.Dropdown(id="risk-mode", options=[{"label": "Fixed dollar risk", "value": "fixed_dollar_risk"}, {"label": "Percent of equity", "value": "percent_equity"}, {"label": "Controlled compounding", "value": "controlled_compounding"}], value="percent_equity", clearable=False)),
             ]),
@@ -1340,11 +1344,11 @@ def _live_config_from_controls(strategy_profile, settings_preset, live_strategy_
         "risk_dollars": risk_dollars,
         "risk_mode": risk_mode,
         "base_risk_pct": base_risk_pct,
-        "min_risk_dollars": min_risk_dollars,
-        "max_risk_dollars": max_risk_dollars,
-        "dd1_risk_pct": dd1_risk_pct,
-        "dd2_risk_pct": dd2_risk_pct,
-        "pause_dd_pct": pause_dd_pct,
+        "min_risk_dollars": min_risk_dollars if str(risk_mode or "").lower() == "controlled_compounding" else None,
+        "max_risk_dollars": max_risk_dollars if str(risk_mode or "").lower() == "controlled_compounding" else None,
+        "dd1_risk_pct": dd1_risk_pct if str(risk_mode or "").lower() == "controlled_compounding" else None,
+        "dd2_risk_pct": dd2_risk_pct if str(risk_mode or "").lower() == "controlled_compounding" else None,
+        "pause_dd_pct": pause_dd_pct if str(risk_mode or "").lower() == "controlled_compounding" else None,
         "min_score": min_score,
         "max_trades": max_trades,
         "max_daily_trades": max_trades,
@@ -1449,10 +1453,68 @@ def update_risk_mode_visibility(risk_mode):
     hidden = {"display": "none"}
     shown = {}
     if mode == "fixed_dollar_risk":
-        return hidden, hidden, "Fixed dollar risk is selected: compounding is OFF. The Fixed risk $/trade radio buttons set the same dollar risk for every trade."
+        return hidden, hidden, "Fixed dollar risk is selected: compounding is OFF. The Fixed risk $/trade radio buttons set the same dollar risk for every trade. Base risk %, min/max risk, and DD brakes are ignored."
     if mode == "percent_equity":
-        return shown, hidden, "Percent of equity is selected: full compounding is ON. Base risk % is applied to current equity on every trade, with no cap or drawdown brake. Use 1.0% to reproduce the high-equity report."
-    return shown, shown, "Controlled compounding is selected: compounding is ON, but the minimum/maximum risk and drawdown brakes below control how much profits can increase risk."
+        return shown, hidden, "Percent of equity is selected: full compounding is ON. In live mode the worker uses current Alpaca equity; Account value is fallback only. The fixed-risk radio and controlled-compounding min/max are ignored."
+    return shown, shown, "Controlled compounding is selected: compounding is ON and uses current Alpaca equity, with min/max risk and drawdown brakes below controlling how much profits can increase risk."
+
+
+@app.callback(
+    Output("live-risk-preview", "children"),
+    Input("risk-mode", "value"),
+    Input("risk-dollars-v12", "value"),
+    Input("base-risk-pct", "value"),
+    Input("account-value", "value"),
+    Input("min-risk-dollars", "value"),
+    Input("max-risk-dollars", "value"),
+    Input("dd1-risk-pct", "value"),
+    Input("dd2-risk-pct", "value"),
+    Input("pause-dd-pct", "value"),
+    Input("live-refresh-interval", "n_intervals"),
+)
+def update_live_risk_preview(risk_mode, fixed_risk, base_pct, account_value, min_risk, max_risk, dd1, dd2, pause_dd, _n):
+    mode = str(risk_mode or "fixed_dollar_risk")
+    fallback_equity = float(account_value or 0.0)
+    equity = fallback_equity
+    equity_source = "fallback input"
+    buying_power = None
+    try:
+        acct = LiveStore(initialize_schema=False).latest_account()
+        if acct is not None and not acct.empty:
+            row = acct.iloc[0]
+            eq = float(row.get("equity") or row.get("portfolio_value") or 0.0)
+            if eq > 0:
+                equity = eq
+                equity_source = "Alpaca live equity"
+            try:
+                buying_power = float(row.get("buying_power") or 0.0)
+            except Exception:
+                buying_power = None
+    except Exception:
+        pass
+    if equity <= 0:
+        equity = fallback_equity or 0.0
+    if mode == "fixed_dollar_risk":
+        budget = float(fixed_risk or 0.0)
+        detail = f"Fixed risk mode: ${budget:,.2f} risk/trade. No compounding. Equity source: {equity_source}."
+    elif mode == "percent_equity":
+        pct = float(base_pct or 0.0)
+        budget = equity * pct / 100.0
+        detail = f"Percent-equity mode: {pct:.2f}% x ${equity:,.2f} ({equity_source}) = ${budget:,.2f} intended risk/trade. Fixed-risk radio and min/max fields are ignored."
+    else:
+        pct = float(base_pct or 0.0)
+        raw = equity * pct / 100.0
+        min_v = float(min_risk or 0.0)
+        max_v = float(max_risk or 0.0)
+        budget = raw
+        if min_v > 0:
+            budget = max(budget, min_v)
+        if max_v > 0:
+            budget = min(budget, max_v)
+        detail = f"Controlled compounding: base {pct:.2f}% x ${equity:,.2f} = ${raw:,.2f}, after min/max = ${budget:,.2f}. DD brakes: {dd1}% / {dd2}%, pause at {pause_dd}%."
+    if buying_power is not None and buying_power > 0:
+        detail += f" Current Alpaca buying power: ${buying_power:,.2f}."
+    return detail
 
 
 @app.callback(

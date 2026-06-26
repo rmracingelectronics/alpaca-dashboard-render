@@ -199,3 +199,14 @@ The order plan now reports:
 - `notional_capped`: whether the order size was reduced by the affordability guard.
 
 No strategy preset hides sizing or compounding. Risk settings remain separate from strategy selection.
+
+## V15 risk UI/compounding clarification
+
+- Clarifies that live mode uses Alpaca account equity when available. The Account value field is a fallback/backtest value.
+- Adds a live risk preview showing the effective intended risk budget for the selected risk mode.
+- Makes fixed risk, percent-equity, and controlled compounding explicit:
+  - Fixed dollar risk uses the selected fixed $ radio only.
+  - Percent-equity uses Base risk % x live Alpaca equity and ignores fixed-risk and min/max fields.
+  - Controlled compounding uses Base risk % plus min/max risk and drawdown brakes.
+- Stops saving controlled-compounding min/max values as active settings when the selected mode is fixed-dollar or percent-equity, so DB/debug output no longer implies hidden $300 caps.
+- Keeps the Alpaca affordability guard as an execution-layer guard only; it does not replace the selected risk/compounding model.
