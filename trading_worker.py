@@ -32,6 +32,11 @@ def main() -> int:
             return 0
         except Exception as exc:
             print(f"[{datetime.now(timezone.utc).isoformat()}] Worker error: {exc}", file=sys.stderr, flush=True)
+            try:
+                engine.store.insert_event("worker_error", {"message": str(exc), "timestamp": datetime.now(timezone.utc).isoformat()}, status="error")
+                engine._heartbeat("error", f"Worker error: {str(exc)[:240]}")
+            except Exception:
+                pass
         time.sleep(max(30, int(live.poll_seconds)))
 
 

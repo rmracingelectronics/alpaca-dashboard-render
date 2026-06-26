@@ -2655,6 +2655,188 @@ class LivePaperTradingEngine:
         self.state["max_hold_exit_keys"] = list(submitted)[-1000:]
         return rows
 
+
+    def _marketable_exit_limit_price(self, symbol: str, close_side: str, reference_price: float) -> float:
+        """Return a marketable limit price for client-side protective exits.
+
+        Extended-hours Alpaca orders must be limit orders.  For protective exits
+        we use a small slippage-based buffer so the order is likely to execute,
+        while still respecting Alpaca's extended-hours limit-order requirement.
+        """
+        ref = _safe_float(reference_price, 0.0)
+        if ref <= 0:
+            try:
+                ref = _safe_float(self._latest_reference_prices([symbol]).get(symbol), 0.0)
+            except Exception:
+                ref = 0.0
+        if ref <= 0:
+            return 0.0
+        cfg = getattr(self, "_runtime_config", {}) if isinstance(getattr(self, "_runtime_config", {}), dict) else {}
+        bps = max(3.0, _safe_float(cfg.get("slippage_bps", 3.0), 3.0))
+        side = str(close_side or "").lower().strip()
+        # Selling to close a long: set limit slightly below reference.
+        # Buying to cover a short: set limit slightly above reference.
+        price = ref * (1.0 - bps / 10000.0) if side == "sell" else ref * (1.0 + bps / 10000.0)
+        return _round_price(price)
+
+    def enforce_client_side_protective_exits(self, positions: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+        """Protect simple extended-hours entries with client-side stop/target exits.
+
+        Alpaca regular-session bracket entries have broker-side stop/target legs.
+        Extended-hours entries are submitted as simple limit orders because Alpaca
+        does not accept the regular market-bracket entry path in extended hours.
+        Those entries still need protection, so the worker checks open positions
+        every scan and submits an opposite-side closing order when stop or target
+        is touched.
+        """
+        rows: list[dict[str, Any]] = []
+        try:
+            open_positions = self.store.open_positions()
+        except Exception:
+            open_positions = pd.DataFrame()
+        if open_positions is None or open_positions.empty:
+            return rows
+        submitted = set(self.state.get("client_side_exit_keys", []))
+        now_iso = utc_now_iso()
+        latest_prices: dict[str, float] = {}
+        try:
+            syms = [str(x).upper() for x in open_positions.get("symbol", pd.Series(dtype=str)).dropna().unique().tolist()]
+            latest_prices = self._latest_reference_prices(syms) if syms else {}
+        except Exception:
+            latest_prices = {}
+        for _, pos in open_positions.iterrows():
+            symbol = str(pos.get("symbol", "")).upper().strip()
+            if not symbol:
+                continue
+            order_mode = str(pos.get("order_mode", "") or "").lower()
+            extended_flag = str(pos.get("extended_hours", "") or "").lower() in {"1", "true", "yes", "on"}
+            # Only client-protect the simple extended-hours entries.  Regular
+            # bracket entries are protected broker-side by Alpaca child legs.
+            if not (extended_flag or "extended_hours_simple_limit" in order_mode):
+                continue
+            stop_price = _safe_float(pos.get("stop_price"), 0.0)
+            target_price = _safe_float(pos.get("target_price"), 0.0)
+            if stop_price <= 0 and target_price <= 0:
+                continue
+            qty = abs(_safe_float(pos.get("qty"), 0.0))
+            if qty <= 0:
+                continue
+            side = str(pos.get("side", "") or "").lower().strip()
+            if side not in {"long", "short"}:
+                raw_qty = _safe_float(pos.get("qty"), 0.0)
+                side = "short" if raw_qty < 0 else "long"
+            current = _safe_float(latest_prices.get(symbol), _safe_float(pos.get("current_price"), 0.0))
+            if current <= 0:
+                current = _safe_float(pos.get("avg_entry_price"), 0.0)
+            if current <= 0:
+                continue
+            exit_reason = ""
+            if side == "long":
+                if stop_price > 0 and current <= stop_price:
+                    exit_reason = "client_stop_loss"
+                elif target_price > 0 and current >= target_price:
+                    exit_reason = "client_take_profit"
+                close_side = "sell"
+            else:
+                if stop_price > 0 and current >= stop_price:
+                    exit_reason = "client_stop_loss"
+                elif target_price > 0 and current <= target_price:
+                    exit_reason = "client_take_profit"
+                close_side = "buy"
+            if not exit_reason:
+                continue
+            entry_cid = str(pos.get("entry_client_order_id") or symbol)
+            key = f"{symbol}|{entry_cid}|{exit_reason}"
+            if key in submitted:
+                continue
+            try:
+                open_orders = self.trading_client.list_open_orders([symbol]) if not self.live.dry_run else []
+                if open_orders:
+                    row = {
+                        "timestamp": now_iso,
+                        "event": "client_protective_exit_skipped_open_order",
+                        "symbol": symbol,
+                        "strategy_side": side,
+                        "status": "skipped_open_order",
+                        "message": f"Protective exit {exit_reason} detected but open Alpaca order(s) already exist for {symbol}.",
+                        "exit_reason": exit_reason,
+                        "current_price": current,
+                        "stop_price": stop_price,
+                        "target_price": target_price,
+                        "open_order_count": len(open_orders),
+                    }
+                    self.store.insert_event("client_protective_exit_skipped_open_order", row, symbol=symbol, status="skipped")
+                    rows.append(row)
+                    continue
+            except Exception:
+                pass
+            row = {
+                "timestamp": now_iso,
+                "event": "client_protective_exit_triggered",
+                "symbol": symbol,
+                "strategy_side": side,
+                "qty": qty,
+                "current_price": current,
+                "stop_price": stop_price,
+                "target_price": target_price,
+                "exit_reason": exit_reason,
+                "dry_run": self.live.dry_run,
+                "entry_client_order_id": entry_cid,
+                "order_mode": order_mode or "extended_hours_simple_limit",
+            }
+            if self.live.dry_run:
+                row["alpaca_status"] = "dry_run_exit_not_submitted"
+            else:
+                try:
+                    self.trading_client.cancel_open_orders_for_symbol(symbol)
+                except Exception as exc:
+                    row["cancel_warning"] = str(exc)[:300]
+                try:
+                    if self._is_extended_session_order_context(None):
+                        limit_price = self._marketable_exit_limit_price(symbol, close_side, current)
+                        if limit_price <= 0:
+                            raise ValueError("Cannot submit client-side protective exit without a valid limit price.")
+                        cid_suffix = pd.Timestamp(_now_utc()).strftime("%Y%m%d%H%M%S")
+                        cid = f"rmv33-exit-{symbol}-{cid_suffix}-{exit_reason[:4]}"[:48]
+                        result = self.trading_client.submit_limit_order(
+                            symbol=symbol,
+                            side=close_side,
+                            qty=qty,
+                            limit_price=limit_price,
+                            client_order_id=cid,
+                            fractional=self.risk.allow_fractional,
+                            extended_hours=True,
+                            time_in_force="day",
+                        )
+                        row["alpaca_status"] = result.status
+                        row["alpaca_order_id"] = result.response.get("id", "")
+                        row["client_order_id"] = cid
+                        row["limit_price"] = limit_price
+                        row["exit_order_mode"] = "extended_hours_client_limit_exit"
+                        self.store.upsert_order(result.response)
+                    else:
+                        response = self.trading_client.close_position(symbol)
+                        row["alpaca_status"] = str(response.get("status", "close_submitted"))
+                        row["alpaca_order_id"] = response.get("id", "")
+                        row["exit_order_mode"] = "regular_session_close_position"
+                        self.store.upsert_order(response)
+                    submitted.add(key)
+                except Exception as exc:
+                    row["alpaca_status"] = "exit_submit_error"
+                    row["message"] = str(exc)
+                    self.store.insert_event("client_protective_exit_error", row, symbol=symbol, status="error")
+                    rows.append(row)
+                    continue
+            self.store.insert_event("client_protective_exit_triggered", row, symbol=symbol, status=row.get("alpaca_status"))
+            rows.append(row)
+        self.state["client_side_exit_keys"] = list(submitted)[-1000:]
+        if rows:
+            try:
+                self.store.set_state("last_client_side_protective_exits", {"updated_at_utc": utc_now_iso(), "rows": rows[-20:]})
+            except Exception:
+                pass
+        return rows
+
     def _signal_identity_for_log(self, signal: pd.Series | dict[str, Any], plan: dict[str, Any] | None = None) -> dict[str, Any]:
         """Compact, JSON-safe identity payload for a selected signal/order candidate."""
         data = signal.to_dict() if hasattr(signal, "to_dict") else dict(signal or {})
@@ -2719,6 +2901,10 @@ class LivePaperTradingEngine:
             self._heartbeat("idle", "Market is closed.", {"open_positions": len(positions)})
             self._save_engine_state()
             return rows
+        # Protective exits are allowed to run independently from the new-entry window.
+        # This is important for extended-hours simple entries, which do not have
+        # Alpaca broker-side bracket legs.
+        rows.extend(self.enforce_client_side_protective_exits(positions))
         if not self._within_live_entry_window(pd.Timestamp.now(tz=NY)):
             row = {
                 "timestamp": timestamp,
@@ -2734,6 +2920,7 @@ class LivePaperTradingEngine:
             self._save_engine_state()
             return rows
         rows.extend(self.enforce_max_hold_exits())
+        rows.extend(self.enforce_client_side_protective_exits(positions))
         existing = self._existing_symbols()
         equity, high_watermark, daily_pl = self._account_equity(account)
         account_buying_power = self._account_buying_power(account)

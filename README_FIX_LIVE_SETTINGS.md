@@ -86,3 +86,18 @@ git add app.py src/live_store.py src/live_engine.py README_FIX_LIVE_SETTINGS.md
 git commit -m "Improve live signal filter diagnostics and monitor coverage"
 git push origin master --verbose --progress
 ```
+
+## V21 - Extended-hours protective exits and scan lifecycle hardening
+
+This build keeps the V20 settings/database/all-strategies fixes and adds the missing execution safety required for unattended paper testing:
+
+- Extended-hours entries are still submitted as Alpaca-compatible simple limit orders.
+- Those extended-hours positions are now protected client-side by the worker:
+  - if current price touches the stored stop, the worker submits an opposite-side exit order;
+  - if current price touches the stored target, the worker submits an opposite-side exit order;
+  - in extended hours the exit is a marketable limit order with `extended_hours=true`;
+  - during the regular session it uses Alpaca close-position after cancelling open symbol orders.
+- The worker stores stop/target/order-mode/strategy metadata on `live_positions` so protective exits survive browser closure and worker cycles.
+- `/debug/live-state` and `/debug/live-symbol-monitor` now include the latest client-side protective-exit diagnostics.
+
+The browser is still only a viewer/config UI. The Render worker performs scanning, order placement, and protective exits from the shared database state.

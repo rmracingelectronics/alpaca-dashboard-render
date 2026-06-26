@@ -141,7 +141,7 @@ def debug_live_state():
     try:
         store = LiveStore(initialize_schema=False)
         out["store"] = {"is_postgres": store.is_postgres}
-        for key in ["live_config_override", "settings", "heartbeat", "market_clock", "last_bar_fetch", "last_strategy_scan_summary", "last_completed_strategy_scan", "live_scan_progress", "live_feature_cache_summary", "last_signal_filter_summary", "worker_error"]:
+        for key in ["live_config_override", "settings", "heartbeat", "market_clock", "last_bar_fetch", "last_strategy_scan_summary", "last_completed_strategy_scan", "live_scan_progress", "live_feature_cache_summary", "last_signal_filter_summary", "last_client_side_protective_exits", "worker_error"]:
             value, updated_at = store.get_state_with_updated_at(key, None)
             out[key] = {"updated_at_utc": updated_at, "value": _safe_diag_value(value)}
         out["table_counts"] = {
@@ -325,6 +325,7 @@ def debug_live_symbol_monitor():
             "live_scan_progress": _safe_diag_value(store.get_state("live_scan_progress", {}) or {}),
             "last_completed_strategy_scan": _safe_diag_value(store.get_state("last_completed_strategy_scan", {}) or {}),
             "last_signal_filter_summary": _safe_diag_value(store.get_state("last_signal_filter_summary", {}) or {}),
+            "last_client_side_protective_exits": _safe_diag_value(store.get_state("last_client_side_protective_exits", {}) or {}),
             "symbol_monitor": _df_preview(monitor, 1000),
         })
     except Exception as exc:
