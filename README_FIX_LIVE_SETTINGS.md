@@ -210,3 +210,14 @@ No strategy preset hides sizing or compounding. Risk settings remain separate fr
   - Controlled compounding uses Base risk % plus min/max risk and drawdown brakes.
 - Stops saving controlled-compounding min/max values as active settings when the selected mode is fixed-dollar or percent-equity, so DB/debug output no longer implies hidden $300 caps.
 - Keeps the Alpaca affordability guard as an execution-layer guard only; it does not replace the selected risk/compounding model.
+
+## V16 live monitor carry-forward fix
+
+The Live Symbol Intelligence table now preserves the last completed indicator values while the worker is in the temporary `Scanning - queued` phase. Scaffold rows written at the start of all-strategies scans no longer blank RVOL, ATR, RS, VWAP, checks, close, or other diagnostics.
+
+Technical change:
+- Scaffold rows no longer purge the previous completed monitor rows.
+- If a scaffold row is written for an existing symbol/strategy key, the DB keeps the last completed indicator fields and marks the row as queued/current.
+- Legacy one-row-per-symbol monitor snapshots are not overwritten by blank scaffold rows.
+
+This does not change trade selection, risk management, order sizing, order submission, or backtesting. It only fixes the monitor display/readiness layer.

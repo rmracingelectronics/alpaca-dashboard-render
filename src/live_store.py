@@ -1109,6 +1109,50 @@ class LiveStore:
         code = str(data.get("strategy_code") or "").strip().lower()
         gate = str(data.get("quality_gate") or "off").strip().lower() or "off"
         data["monitor_key"] = str(record.get("monitor_key") or f"{symbol}|{code or variant}|{gate}")
+
+        # Scaffold/queued rows are diagnostic placeholders written at the start
+        # of a long all-strategies scan.  They must NOT wipe the last real
+        # indicator values from the table.  Otherwise the dashboard flickers
+        # back to blank RVOL/ATR/RS columns while the worker is still scanning.
+        # Preserve the previous completed measurements for the same
+        # symbol-strategy key and only update the status/reason/run metadata.
+        payload_obj = record.get("payload") if isinstance(record.get("payload"), dict) else {}
+        is_scaffold = bool(payload_obj.get("scaffold")) or str(data.get("monitor_status") or "").lower().startswith("scanning - queued")
+        if is_scaffold:
+            try:
+                self._ensure_strategy_symbol_monitor_table()
+                existing_rows = self._fetch(f"SELECT * FROM live_strategy_symbol_monitor WHERE monitor_key = {self._ph()} LIMIT 1", [data["monitor_key"]])
+                if existing_rows:
+                    existing = existing_rows[0]
+                    preserve_cols = [
+                        "latest_bar_time_utc", "latest_bar_time_et", "session_date",
+                        "setup_signal", "selected_signal", "in_entry_window", "liquidity_ok", "score_ok", "quality_gate_ok", "candle_ok",
+                        "checks_passed", "checks_total", "symbol_side_bias", "strategy_side", "trigger_type",
+                        "candidate_score", "final_rank_score", "close_price", "volume", "rvol_time_of_day", "daily_atr14_percent",
+                        "gap_percent", "day_relative_strength", "open_relative_strength", "vwap_extension_atr", "qqq_change_from_open",
+                        "qqq_day_change_percent", "atr5m14", "ema9", "ema20", "session_vwap",
+                    ]
+                    for col in preserve_cols:
+                        prev = existing.get(col)
+                        if prev not in (None, ""):
+                            data[col] = prev
+                    prev_summary = str(existing.get("check_summary") or "").strip()
+                    queued_msg = str(data.get("check_summary") or data.get("reject_reason") or "Queued for current scan.").strip()
+                    if prev_summary:
+                        data["check_summary"] = f"{queued_msg} Last completed values are carried forward until this strategy finishes scanning. Previous: {prev_summary}"[:1000]
+                    else:
+                        data["check_summary"] = f"{queued_msg} Last completed values are carried forward until this strategy finishes scanning."[:1000]
+                    data["payload_json"] = _json_dumps({
+                        "scaffold": True,
+                        "carried_forward_previous_values": True,
+                        "queued_reason": queued_msg,
+                        "previous_run_id": existing.get("run_id"),
+                        "current_run_id": data.get("run_id"),
+                        "previous_updated_at_utc": existing.get("updated_at_utc"),
+                    })
+            except Exception:
+                pass
+
         cols = ["monitor_key"] + [c for c in data.keys() if c != "monitor_key"]
         ph = self._ph()
         self._ensure_strategy_symbol_monitor_table()
@@ -1203,8 +1247,16 @@ class LiveStore:
             return
         # Keep the per-strategy monitor table representing the latest worker scan.
         # The legacy live_symbol_monitor table remains one row per symbol for backward compatibility.
+        # Do not purge the previous completed run when the current batch is only
+        # a scaffold/queued batch; those queued rows intentionally carry forward
+        # previous indicator values until real results arrive.
+        def _is_scaffold_row(rec: dict[str, Any]) -> bool:
+            payload_obj = rec.get("payload") if isinstance(rec.get("payload"), dict) else {}
+            return bool(payload_obj.get("scaffold")) or str(rec.get("monitor_status") or "").lower().startswith("scanning - queued")
+
+        all_scaffold = all(_is_scaffold_row(rec) for rec in rows)
         run_id = str(rows[0].get("run_id") or "").strip()
-        if run_id:
+        if run_id and not all_scaffold:
             try:
                 self._ensure_strategy_symbol_monitor_table()
                 ph = self._ph()
@@ -1213,7 +1265,16 @@ class LiveStore:
                 pass
         for rec in rows:
             try:
-                self.upsert_symbol_monitor_snapshot(rec)
+                payload_obj = rec.get("payload") if isinstance(rec.get("payload"), dict) else {}
+                is_scaffold = bool(payload_obj.get("scaffold")) or str(rec.get("monitor_status") or "").lower().startswith("scanning - queued")
+                if is_scaffold:
+                    # Strategy-level scaffolds are useful for progress visibility,
+                    # but the legacy one-row-per-symbol table should keep the last
+                    # real per-symbol indicator snapshot instead of being blanked by
+                    # a queued placeholder.
+                    self.upsert_strategy_symbol_monitor_snapshot(rec)
+                else:
+                    self.upsert_symbol_monitor_snapshot(rec)
             except Exception:
                 pass
 
