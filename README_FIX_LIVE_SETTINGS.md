@@ -145,3 +145,13 @@ V10 added free-feed diagnostics for Alpaca Basic/IEX accounts. V11 tightens the 
 - The delayed SIP idea is kept out of the live order path. Delayed/broad-market data is only appropriate for diagnostics/research/backtest, not for live entries.
 - Regular-session entries still submit market bracket paper orders.
 - Extended-hours entries still submit Alpaca-compatible marketable limit paper orders with `extended_hours=true`.
+
+## V12 - All-strategies monitor scaffold fix
+
+The V11 diagnostics showed `live_config_override` correctly saved `live_strategy_run_mode=all_strategies` with 14 active variants, and the heartbeat later showed the worker running all 14 variants, but the Live Symbol Intelligence table still displayed only one or two strategy views during a scan.
+
+Root cause: the worker wrote `live_strategy_symbol_monitor` rows one strategy at a time. The dashboard reads the newest run_id, so while a scan was still in progress it could show a partial run: 16 rows for one strategy, 32 rows for two strategies, etc. This looked like all-strategies mode was not working even though the worker had started the all-strategies scan.
+
+Fix: at the start of every all-strategies scan, the worker now publishes a complete scaffold of all active strategies x all configured symbols using status `Scanning - queued`. Each strategy then overwrites its own scaffold rows with real indicator/check data as it finishes. This makes the dashboard immediately show the expected coverage, e.g. 14 strategies x 16 symbols = 224 monitor rows, instead of showing only the first strategy that finished writing.
+
+This does not change live trading decisions, risk sizing, Alpaca order submission, data feed policy, or backtesting. It only fixes the visibility/diagnostic layer for all-strategies mode.

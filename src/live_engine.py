@@ -1395,6 +1395,44 @@ class LivePaperTradingEngine:
             self.params = original_params
         return records
 
+    def _seed_full_strategy_symbol_monitor(self, run_id: str, closed_ts: pd.Timestamp, specs: list[dict[str, str]], symbols: list[str], reason: str = "Queued for this worker scan.") -> None:
+        """Publish a complete strategy x symbol scaffold before expensive scans run.
+
+        Without this, all-strategies mode can look broken in the dashboard while
+        a scan is still running: the worker writes strategy monitor rows one
+        strategy at a time, and the reader naturally sees only the first 1-2
+        strategies until the scan finishes.  This scaffold makes the monitor
+        table immediately contain the expected active_strategy_count * symbols
+        rows for the current run_id; each strategy then replaces its own rows
+        with real indicator/check values as it completes.
+        """
+        symbols = list(dict.fromkeys([str(s or "").upper() for s in (symbols or []) if s]))
+        if not specs or not symbols:
+            return
+        original_params = self.params
+        rows: list[dict[str, Any]] = []
+        try:
+            for spec in specs:
+                self.params = self._make_params_for_live_config(getattr(self, "_runtime_config", {}), spec.get("preset"), spec.get("variant"), spec.get("quality_gate"))
+                for sym in symbols:
+                    rec = self._symbol_monitor_base_config(sym, run_id, "Scanning - queued", reason)
+                    rec["latest_bar_time_utc"] = pd.Timestamp(closed_ts).isoformat()
+                    rec["latest_bar_time_et"] = pd.Timestamp(closed_ts).tz_convert("America/New_York").strftime("%Y-%m-%d %H:%M")
+                    rec["decision_status"] = "waiting"
+                    rec["check_summary"] = reason
+                    rec["payload"] = {
+                        "reason": reason,
+                        "scaffold": True,
+                        "strategy_run_mode": getattr(self.live, "strategy_run_mode", "single"),
+                        "expected_strategy_count": len(specs),
+                        "expected_symbol_count": len(symbols),
+                        "bar_session_mode": self._live_session_mode(),
+                    }
+                    rows.append(rec)
+        finally:
+            self.params = original_params
+        self._write_symbol_monitor_records(rows)
+
     def _monitor_record_from_latest_row(self, row: pd.Series, run_id: str, closed_ts: pd.Timestamp) -> dict[str, Any]:
         symbol = self._monitor_text(row, "symbol").upper()
         ts = pd.to_datetime(row.get("timestamp"), utc=True, errors="coerce")
@@ -1899,9 +1937,16 @@ class LivePaperTradingEngine:
         closed_ts = latest_closed_5m_start(now)
         today_ny = closed_ts.tz_convert("America/New_York").date()
         symbols = list(dict.fromkeys([s.upper() for s in (self.live.symbols or []) if s]))
-        bars_5m, daily = self._update_bar_cache()
         session_mode = self._live_session_mode()
         specs = self._strategy_specs_for_current_run()
+        # Make all-strategies mode visible immediately.  The actual indicator
+        # rows overwrite this scaffold as each strategy finishes scanning.
+        if str(getattr(self.live, "strategy_run_mode", "single")).lower() == "all_strategies":
+            try:
+                self._seed_full_strategy_symbol_monitor(run_id, closed_ts, specs, symbols, "Queued; worker is scanning all strategies for this symbol.")
+            except Exception as exc:
+                self.store.insert_event("symbol_monitor_seed_error", {"message": str(exc)}, status="warning")
+        bars_5m, daily = self._update_bar_cache()
         if bars_5m.empty or daily.empty:
             records = []
             for spec in specs:
