@@ -37,6 +37,7 @@ class AlpacaDataClient:
         self.settings = settings or AlpacaSettings()
         self.timeout = timeout
         self.session = requests.Session()
+        self.last_request_errors: list[dict[str, Any]] = []
 
     @property
     def headers(self) -> Dict[str, str]:
@@ -248,19 +249,29 @@ class AlpacaDataClient:
         feed: str,
         adjustment: str,
     ) -> pd.DataFrame:
-        """Fetch bars without letting one unsupported/invalid symbol kill a custom run.
+        """Fetch bars without letting one unsupported/invalid symbol kill a run.
 
-        Alpaca can reject a multi-symbol request if one symbol is not available on
-        the selected feed.  That is common with custom penny/micro-cap lists.  The
-        original preset universe did not hit this much, but custom watchlists need
-        graceful degradation: fetch what Alpaca has, skip what it does not.
+        Also records the last request errors for Render diagnostics.  This is
+        especially important for Alpaca Basic/free accounts where IEX works but
+        SIP access may be rejected unless the end time is sufficiently delayed or
+        the account has the proper data entitlement.
         """
         symbols = [s.upper() for s in symbols if s]
         if not symbols:
             return pd.DataFrame()
         try:
             return self._fetch_bars_api(symbols, timeframe, start, end, feed, adjustment)
-        except AlpacaAPIError:
+        except AlpacaAPIError as exc:
+            self.last_request_errors.append({
+                "stage": "bulk",
+                "symbols": symbols[:50],
+                "symbol_count": len(symbols),
+                "timeframe": timeframe,
+                "feed": feed,
+                "start": str(start),
+                "end": str(end),
+                "error": str(exc)[:500],
+            })
             if len(symbols) <= 1:
                 return pd.DataFrame()
             frames: list[pd.DataFrame] = []
@@ -269,7 +280,16 @@ class AlpacaDataClient:
                     frame = self._fetch_bars_api([symbol], timeframe, start, end, feed, adjustment)
                     if frame is not None and not frame.empty:
                         frames.append(frame)
-                except AlpacaAPIError:
+                except AlpacaAPIError as one_exc:
+                    self.last_request_errors.append({
+                        "stage": "single_symbol",
+                        "symbol": symbol,
+                        "timeframe": timeframe,
+                        "feed": feed,
+                        "start": str(start),
+                        "end": str(end),
+                        "error": str(one_exc)[:500],
+                    })
                     continue
             if not frames:
                 return pd.DataFrame()

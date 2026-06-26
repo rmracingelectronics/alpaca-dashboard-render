@@ -152,6 +152,52 @@ def debug_live_state():
     return jsonify(out)
 
 
+
+
+@server.route("/debug/live-bar-health")
+def debug_live_bar_health():
+    """No-Dash data-feed diagnostic for live scans.
+
+    Shows whether the worker is receiving same-day bars, which feed was used,
+    and whether the free IEX/delayed-SIP fallback is active.
+    """
+    out = {"ok": False, "service": os.getenv("RENDER_SERVICE_NAME", "unknown")}
+    try:
+        store = LiveStore(initialize_schema=False)
+        last_bar_fetch = store.get_state("last_bar_fetch", {}) or {}
+        heartbeat = store.get_state("heartbeat", {}) or {}
+        monitor = store.latest_symbol_monitor(1000)
+        summary = {}
+        if monitor is not None and not monitor.empty:
+            work = monitor.copy()
+            strategies_seen = int(work["strategy_variant"].astype(str).nunique()) if "strategy_variant" in work.columns else 0
+            symbols_seen = int(work["symbol"].astype(str).str.upper().nunique()) if "symbol" in work.columns else 0
+            summary["rows"] = int(len(work))
+            summary["strategies_seen"] = strategies_seen
+            summary["symbols_seen"] = symbols_seen
+            active_count = int(float((heartbeat or {}).get("active_strategy_count") or 0) or 0)
+            configured_symbols = int(float((heartbeat or {}).get("symbols") or 0) or 0)
+            expected_rows = active_count * configured_symbols if active_count and configured_symbols else 0
+            summary["expected_rows_from_heartbeat"] = expected_rows
+            summary["row_coverage_ok"] = bool(not expected_rows or len(work) >= expected_rows)
+            if expected_rows and len(work) < expected_rows:
+                summary["coverage_warning"] = "Latest monitor row count is below active_strategy_count * symbols. Check last_strategy_scan_summary for strategy errors or an incomplete worker scan."
+            if "monitor_status" in work.columns:
+                summary["status_counts"] = _safe_diag_value(work["monitor_status"].astype(str).value_counts().head(30).to_dict())
+            if "latest_bar_time_et" in work.columns:
+                summary["latest_bar_time_et_counts"] = _safe_diag_value(work["latest_bar_time_et"].astype(str).value_counts().head(20).to_dict())
+        out.update({
+            "ok": True,
+            "heartbeat": _safe_diag_value(heartbeat),
+            "last_bar_fetch": _safe_diag_value(last_bar_fetch),
+            "monitor_summary": summary,
+            "symbol_monitor_preview": _df_preview(monitor, 50),
+        })
+    except Exception as exc:
+        out.update({"ok": False, "error": str(exc), "traceback": traceback.format_exc()})
+    return jsonify(out)
+
+
 @server.route("/debug/db-ping")
 def debug_db_ping():
     out = {"ok": False, "database_url_present": bool(os.getenv("DATABASE_URL"))}
@@ -240,6 +286,61 @@ def debug_live_symbol_monitor():
             "configured_symbols": cfg.get("symbols") or heartbeat.get("symbols"),
             "heartbeat": _safe_diag_value(heartbeat),
             "symbol_monitor": _df_preview(monitor, 1000),
+        })
+    except Exception as exc:
+        out.update({"ok": False, "error": str(exc), "traceback": traceback.format_exc()})
+    return jsonify(out)
+
+
+@server.route("/debug/live-data-readiness")
+def debug_live_data_readiness():
+    """Explain whether the current free/IEX extended-hours data is usable for scans.
+
+    This endpoint is intentionally JSON-only and avoids Dash so it remains usable
+    even while diagnosing UI refresh problems.
+    """
+    out = {"ok": False, "service": os.getenv("RENDER_SERVICE_NAME", "unknown")}
+    try:
+        store = LiveStore(initialize_schema=False)
+        heartbeat = store.get_state("heartbeat", {}) or {}
+        last_bar_fetch = store.get_state("last_bar_fetch", {}) or {}
+        scan_summary = store.get_state("last_strategy_scan_summary", {}) or {}
+        monitor = store.latest_symbol_monitor(1000)
+        status_counts = {}
+        if monitor is not None and not monitor.empty and "monitor_status" in monitor.columns:
+            status_counts = monitor["monitor_status"].astype(str).value_counts().to_dict()
+        strategies_seen = 0
+        symbols_seen = 0
+        latest_bar = None
+        if monitor is not None and not monitor.empty:
+            if "strategy_variant" in monitor.columns:
+                strategies_seen = int(monitor["strategy_variant"].astype(str).nunique())
+            if "symbol" in monitor.columns:
+                symbols_seen = int(monitor["symbol"].astype(str).str.upper().nunique())
+            if "latest_bar_time_utc" in monitor.columns:
+                vals = monitor["latest_bar_time_utc"].dropna().astype(str)
+                latest_bar = vals.max() if not vals.empty else None
+        out.update({
+            "ok": True,
+            "database": {"is_postgres": store.is_postgres},
+            "heartbeat": _safe_diag_value(heartbeat),
+            "last_bar_fetch": _safe_diag_value(last_bar_fetch),
+            "last_strategy_scan_summary": _safe_diag_value(scan_summary),
+            "monitor_counts": {
+                "rows": int(0 if monitor is None else len(monitor)),
+                "symbols_seen": symbols_seen,
+                "strategies_seen": strategies_seen,
+                "expected_rows_from_heartbeat": int(float((heartbeat or {}).get("active_strategy_count") or 0) * float((heartbeat or {}).get("symbols") or 0)) if heartbeat else 0,
+                "latest_bar_time_utc": latest_bar,
+                "status_counts": _safe_diag_value(status_counts),
+            },
+            "sample_monitor_rows": _df_preview(monitor, 25),
+            "interpretation": [
+                "For Alpaca Basic/free accounts, feed=iex is only one exchange and may be sparse in extended hours.",
+                "The worker now uses the newest available bar within live_max_bar_age_minutes instead of requiring a wall-clock exact 5-minute slot.",
+                "If rows show Watching with non-zero checks and indicator values, the data pipeline is working; no trade means no strategy setup passed.",
+                "If rows show Waiting - symbol data/no latest bar, the selected feed did not provide usable bars for that symbol/session.",
+            ],
         })
     except Exception as exc:
         out.update({"ok": False, "error": str(exc), "traceback": traceback.format_exc()})
@@ -481,7 +582,7 @@ app.layout = html.Div(
                         html.Div(title="Selects the stock universe to test. Best Report 153601 uses the V25 playbook universe.", children=[html.Label("Watchlist preset"), dcc.Dropdown(id="preset", options=[{"label": k.replace("_", " ").title(), "value": k} for k in WATCHLISTS.keys()], value="v25_playbook", clearable=False)]),
                         html.Div(title="Optional: enter a comma-separated custom symbol list. When populated, this overrides the preset and uses the raw local Alpaca bar cache/fetch path for those symbols.", children=[html.Label("Custom symbols, comma separated - overrides preset"), dcc.Textarea(id="custom-symbols", placeholder="Example: ADTX, GDC, GPUS, SRXH, CDT", value="", className="textarea")]),
                         html.Div(className="two-col", children=[html.Div(title="Backtest start date.", children=[html.Label("Start"), dcc.DatePickerSingle(id="start-date", date=DEFAULT_START.isoformat())]), html.Div(title="Backtest end date.", children=[html.Label("End"), dcc.DatePickerSingle(id="end-date", date=DEFAULT_END.isoformat())])]),
-                        html.Div(title="IEX is the free Alpaca feed. SIP is the paid/unlimited feed if your account has access.", children=[html.Label("Alpaca feed"), dcc.Dropdown(id="feed", options=[{"label": "IEX - free plan", "value": "iex"}, {"label": "SIP - paid/unlimited", "value": "sip"}], value=os.getenv("ALPACA_FEED", "iex"), clearable=False)]),
+                        html.Div(title="IEX is the free/no-subscription historical-bars feed but it is only one exchange. Delayed SIP mode uses the SIP bars feed with an end time older than the recent-data restriction; if your Alpaca entitlement rejects it, diagnostics will show the error and the worker continues on IEX. SIP real-time requires the paid/unlimited data entitlement.", children=[html.Label("Alpaca data feed"), dcc.Dropdown(id="feed", options=[{"label": "IEX - free/no-subscription, single-exchange", "value": "iex"}, {"label": "SIP delayed - broad market, 16+ min delayed", "value": "delayed_sip"}, {"label": "SIP real-time - paid/unlimited entitlement", "value": "sip"}], value=os.getenv("ALPACA_FEED", "iex"), clearable=False)]),
                         html.Div(title="Regular hours preserves the original V33 backtest/replay/cache behavior. Extended hours uses the same local Alpaca bar store and fetches missing chunks only when they are not available locally.", children=[
                             html.Label("Backtest data session"),
                             dcc.Dropdown(

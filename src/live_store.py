@@ -1275,7 +1275,17 @@ class LiveStore:
         ]
         try:
             df = self._fetch_df(
-                f"SELECT * FROM live_strategy_symbol_monitor ORDER BY strategy_variant ASC, symbol ASC LIMIT {int(limit)}",
+                f"""
+                SELECT * FROM live_strategy_symbol_monitor
+                WHERE run_id = (
+                    SELECT run_id FROM live_strategy_symbol_monitor
+                    WHERE run_id IS NOT NULL AND run_id <> ''
+                    ORDER BY updated_at_utc DESC
+                    LIMIT 1
+                )
+                ORDER BY strategy_variant ASC, symbol ASC
+                LIMIT {int(limit)}
+                """,
                 columns=cols,
             )
             if df is not None and not df.empty:

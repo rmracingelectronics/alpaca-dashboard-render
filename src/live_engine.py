@@ -451,6 +451,145 @@ def _parse_hhmm(value: Any, default: str) -> tuple[int, int]:
     return int(h), int(m)
 
 
+
+
+def _session_date_series(df: pd.DataFrame) -> pd.Series:
+    ts = pd.to_datetime(df.get("timestamp"), utc=True, errors="coerce")
+    return ts.dt.tz_convert(NY).dt.date
+
+
+def _daily_feature_table_for_next_session(daily: pd.DataFrame) -> pd.DataFrame:
+    """Build previous-completed-day features for live intraday rows.
+
+    Alpaca's 1Day endpoint may not include the current trading day before the
+    regular close.  The old live path merged intraday rows on the same
+    session_date and therefore produced NaN prev_close/daily ATR in premarket.
+    For live decisions we need the most recent completed daily bar strictly
+    before the intraday session.
+    """
+    if daily is None or daily.empty:
+        return pd.DataFrame()
+    d = daily.copy()
+    d["timestamp"] = pd.to_datetime(d["timestamp"], utc=True, errors="coerce")
+    d = d.dropna(subset=["timestamp"])
+    if d.empty:
+        return pd.DataFrame()
+    d["symbol"] = d.get("symbol", "").astype(str).str.upper()
+    d["daily_session_date"] = d["timestamp"].dt.tz_convert(NY).dt.date
+    d = d.sort_values(["symbol", "daily_session_date", "timestamp"])
+    d = d.drop_duplicates(["symbol", "daily_session_date"], keep="last")
+    for col in ["open", "high", "low", "close", "volume"]:
+        d[col] = pd.to_numeric(d.get(col), errors="coerce")
+    d["daily_dollar_volume"] = d["volume"] * d["close"]
+    prev_close_for_tr = d.groupby("symbol")["close"].shift(1)
+    tr = pd.concat(
+        [
+            d["high"] - d["low"],
+            (d["high"] - prev_close_for_tr).abs(),
+            (d["low"] - prev_close_for_tr).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    d["daily_atr14"] = tr.groupby(d["symbol"]).transform(lambda x: x.rolling(14, min_periods=14).mean())
+    d["daily_atr14_percent"] = d["daily_atr14"] / d["close"].replace(0, pd.NA) * 100.0
+    d["avg_20d_dollar_volume"] = d.groupby("symbol")["daily_dollar_volume"].transform(lambda x: x.rolling(20, min_periods=10).mean())
+    features = d[["symbol", "daily_session_date", "high", "low", "close", "avg_20d_dollar_volume", "daily_atr14_percent"]].copy()
+    features = features.rename(columns={"high": "prev_day_high", "low": "prev_day_low", "close": "prev_close"})
+    features["feature_date_key"] = pd.to_datetime(features["daily_session_date"].astype(str), errors="coerce")
+    return features.sort_values(["symbol", "feature_date_key"])
+
+
+def _add_daily_features_live_safe(intraday: pd.DataFrame, daily: pd.DataFrame) -> pd.DataFrame:
+    """Attach previous-completed-daily features to live intraday bars.
+
+    This is intentionally used only by the live worker.  It fixes the premarket
+    / early-session case where the current 1Day Alpaca row is not available yet,
+    which otherwise caused no same-day indicator row and blank 0/0 monitor rows.
+    """
+    if intraday is None or intraday.empty:
+        return pd.DataFrame()
+    left = intraday.copy()
+    left["timestamp"] = pd.to_datetime(left["timestamp"], utc=True, errors="coerce")
+    left = left.dropna(subset=["timestamp"])
+    if left.empty:
+        return left
+    left["symbol"] = left.get("symbol", "").astype(str).str.upper()
+    if "session_date" not in left.columns:
+        left["session_date"] = left["timestamp"].dt.tz_convert(NY).dt.date
+    left["feature_date_key"] = pd.to_datetime(left["session_date"].astype(str), errors="coerce")
+    feats = _daily_feature_table_for_next_session(daily)
+    if feats.empty:
+        for col in ["prev_day_high", "prev_day_low", "prev_close", "avg_20d_dollar_volume", "daily_atr14_percent"]:
+            if col not in left.columns:
+                left[col] = pd.NA
+        return left.drop(columns=["feature_date_key"], errors="ignore")
+    frames = []
+    for sym, lgrp in left.sort_values(["symbol", "feature_date_key", "timestamp"]).groupby("symbol", sort=False):
+        fgrp = feats[feats["symbol"] == sym].sort_values("feature_date_key")
+        if fgrp.empty:
+            tmp = lgrp.copy()
+            for col in ["prev_day_high", "prev_day_low", "prev_close", "avg_20d_dollar_volume", "daily_atr14_percent"]:
+                tmp[col] = pd.NA
+            frames.append(tmp)
+            continue
+        merged = pd.merge_asof(
+            lgrp.sort_values("feature_date_key"),
+            fgrp[["feature_date_key", "prev_day_high", "prev_day_low", "prev_close", "avg_20d_dollar_volume", "daily_atr14_percent"]].sort_values("feature_date_key"),
+            on="feature_date_key",
+            direction="backward",
+            allow_exact_matches=False,
+        )
+        frames.append(merged)
+    out = pd.concat(frames, ignore_index=True) if frames else left
+    return out.drop(columns=["feature_date_key"], errors="ignore")
+
+
+def _build_qqq_context_live_safe(qqq_5m: pd.DataFrame, qqq_daily: pd.DataFrame, session_mode: str = "regular_only") -> pd.DataFrame:
+    if qqq_5m is None or qqq_5m.empty:
+        return pd.DataFrame()
+    q = add_intraday_features(qqq_5m, session_mode=session_mode)
+    q = _add_daily_features_live_safe(q, qqq_daily)
+    if q.empty:
+        return q
+    q_resample = q.set_index("timestamp_ny").copy() if "timestamp_ny" in q.columns else pd.DataFrame()
+    fifteen_frames = []
+    if not q_resample.empty:
+        for session_date, group in q_resample.groupby("session_date"):
+            ohlcv = group.resample("15min", label="right", closed="right").agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}).dropna(subset=["close"])
+            if not ohlcv.empty:
+                ohlcv["session_date"] = session_date
+                fifteen_frames.append(ohlcv)
+    if fifteen_frames:
+        q15 = pd.concat(fifteen_frames).reset_index().rename(columns={"timestamp_ny": "timestamp_ny_15m"})
+        q15["timestamp"] = q15["timestamp_ny_15m"].dt.tz_convert("UTC")
+        q15 = q15.sort_values("timestamp")
+        q15["qqq_15m_close"] = q15["close"]
+        q15["qqq_15m_ema50"] = q15["close"].ewm(span=50, adjust=False, min_periods=50).mean()
+        q15 = q15[["timestamp", "qqq_15m_close", "qqq_15m_ema50"]]
+    else:
+        q15 = pd.DataFrame(columns=["timestamp", "qqq_15m_close", "qqq_15m_ema50"])
+    needed = ["timestamp", "session_date", "close", "session_vwap", "prev_close", "session_open", "ema9", "ema20", "rsi2", "atr5m14", "daily_atr14_percent"]
+    for col in needed:
+        if col not in q.columns:
+            q[col] = pd.NA
+    q5 = q[needed].copy()
+    q5 = q5.rename(columns={"close": "qqq_close", "session_vwap": "qqq_session_vwap", "prev_close": "qqq_prev_close", "session_open": "qqq_session_open", "ema9": "qqq_ema9", "ema20": "qqq_ema20", "rsi2": "qqq_rsi2", "atr5m14": "qqq_atr5m14", "daily_atr14_percent": "qqq_daily_atr14_percent"})
+    q5["qqq_day_change_percent"] = (pd.to_numeric(q5["qqq_close"], errors="coerce") - pd.to_numeric(q5["qqq_prev_close"], errors="coerce")) / pd.to_numeric(q5["qqq_prev_close"], errors="coerce").replace(0, pd.NA) * 100
+    q5["qqq_change_from_open"] = (pd.to_numeric(q5["qqq_close"], errors="coerce") - pd.to_numeric(q5["qqq_session_open"], errors="coerce")) / pd.to_numeric(q5["qqq_session_open"], errors="coerce").replace(0, pd.NA) * 100
+    q5["qqq_15min_change_percent"] = q5.groupby("session_date")["qqq_close"].transform(lambda x: (x - x.shift(3)) / x.shift(3) * 100)
+    q5 = q5.sort_values("timestamp")
+    if not q15.empty:
+        q5 = pd.merge_asof(q5.sort_values("timestamp"), q15.sort_values("timestamp"), on="timestamp", direction="backward")
+    else:
+        q5["qqq_15m_close"] = pd.NA
+        q5["qqq_15m_ema50"] = pd.NA
+    q5["market_filter_pass"] = (
+        (pd.to_numeric(q5["qqq_15m_close"], errors="coerce") > pd.to_numeric(q5["qqq_15m_ema50"], errors="coerce"))
+        & (pd.to_numeric(q5["qqq_close"], errors="coerce") > pd.to_numeric(q5["qqq_session_vwap"], errors="coerce"))
+        & (pd.to_numeric(q5["qqq_daily_atr14_percent"], errors="coerce") <= 3.2)
+    )
+    return q5.sort_values("timestamp")
+
 def _time_in_window(ts_et: pd.Timestamp | datetime, start_hhmm: Any, end_hhmm: Any) -> bool:
     ts = pd.Timestamp(ts_et)
     if ts.tzinfo is None:
@@ -726,6 +865,44 @@ class LivePaperTradingEngine:
         """
         return "extended_hours" if bool(getattr(self.live, "allow_extended_hours_entries", False)) else "regular_only"
 
+    def _max_bar_age_minutes(self) -> int:
+        """Maximum age of a bar that may still be used for live decisions.
+
+        Alpaca Basic/free accounts usually run on IEX for equities.  IEX is a
+        single-exchange feed and can be sparse in pre/after-hours, while the
+        historical endpoint may lag the wall clock.  The worker should evaluate
+        the most recent usable bar, not require every symbol to have a print on
+        the exact same wall-clock 5-minute slot.
+        """
+        cfg = getattr(self, "_runtime_config", {}) if isinstance(getattr(self, "_runtime_config", {}), dict) else {}
+        configured = cfg.get("live_max_bar_age_minutes", cfg.get("max_bar_age_minutes"))
+        default = 45 if (str(getattr(self.live, "feed", "iex")).lower() == "iex" and bool(getattr(self.live, "allow_extended_hours_entries", False))) else 15
+        try:
+            value = int(float(configured if configured not in (None, "") else default))
+        except Exception:
+            value = default
+        return max(5, min(180, value))
+
+    def _bar_age_minutes(self, ts: Any, now: datetime | None = None) -> float | None:
+        try:
+            t = pd.Timestamp(ts)
+            if t.tzinfo is None:
+                t = t.tz_localize("UTC")
+            else:
+                t = t.tz_convert("UTC")
+            ref = pd.Timestamp(now or _now_utc())
+            if ref.tzinfo is None:
+                ref = ref.tz_localize("UTC")
+            else:
+                ref = ref.tz_convert("UTC")
+            return max(0.0, float((ref - t).total_seconds() / 60.0))
+        except Exception:
+            return None
+
+    def _is_bar_recent_enough(self, ts: Any) -> bool:
+        age = self._bar_age_minutes(ts)
+        return age is not None and age <= float(self._max_bar_age_minutes())
+
     def _is_regular_session_time(self, ts: pd.Timestamp | datetime | None = None) -> bool:
         ts = pd.Timestamp(ts or datetime.now(NY))
         if ts.tzinfo is None:
@@ -907,11 +1084,22 @@ class LivePaperTradingEngine:
 
     def _update_bar_cache(self) -> tuple[pd.DataFrame, pd.DataFrame]:
         now = _now_utc()
-        end_dt = now + timedelta(minutes=5)
+        configured_feed = str(getattr(self.live, "feed", "iex") or "iex").lower()
+        session_mode = self._live_session_mode()
+
+        # Historical bars officially accept feed=iex/sip/otc/boats.  For a
+        # free/basic paper account, the useful broad-market fallback is SIP bars
+        # with an end time safely older than the recent-data entitlement window.
+        # The UI value "delayed_sip" therefore maps to API feed "sip" plus a
+        # 16-minute delayed end time.  We do not pass feed=delayed_sip to the
+        # bars endpoint because Alpaca documents delayed_sip primarily for
+        # latest/streaming feeds, while /v2/stocks/bars lists sip/iex/otc/boats.
+        delayed_sip_mode = configured_feed in {"delayed_sip", "free_delayed_sip", "sip_delayed"}
+        primary_api_feed = "sip" if delayed_sip_mode else configured_feed
+        end_dt = now - timedelta(minutes=16) if delayed_sip_mode else now + timedelta(minutes=5)
         keep_start = now - timedelta(days=max(35, int(self.live.lookback_days)))
         symbols = list(dict.fromkeys([s.upper() for s in (self.live.symbols or []) if s]))
         all_symbols = list(dict.fromkeys(["QQQ"] + symbols))
-        session_mode = self._live_session_mode()
         if self._bars_5m_cache.empty:
             fetch_start_5m = keep_start
         else:
@@ -919,22 +1107,85 @@ class LivePaperTradingEngine:
             incremental_start = now - timedelta(days=max(1, int(self.live.incremental_fetch_days)))
             fetch_start_5m = max(incremental_start, latest - timedelta(minutes=30))
         fetch_start_daily = now - timedelta(days=max(45, int(self.live.lookback_days) + 20))
-        bars_5m_new = self.data_client.get_stock_bars(all_symbols, "5Min", fetch_start_5m, end_dt, feed=self.live.feed, adjustment="split", use_cache=False, session_mode=session_mode)
-        daily_new = self.data_client.get_stock_bars(all_symbols, "1Day", fetch_start_daily, end_dt, feed=self.live.feed, adjustment="split", use_cache=False, session_mode=session_mode)
+
+        try:
+            self.data_client.last_request_errors = []
+        except Exception:
+            pass
+        bars_5m_new = self.data_client.get_stock_bars(all_symbols, "5Min", fetch_start_5m, end_dt, feed=primary_api_feed, adjustment="split", use_cache=False, session_mode=session_mode)
+        daily_new = self.data_client.get_stock_bars(all_symbols, "1Day", fetch_start_daily, end_dt, feed=primary_api_feed, adjustment="split", use_cache=False, session_mode=session_mode)
+        effective_feed = "delayed_sip" if delayed_sip_mode else configured_feed
+        fallback_rows = 0
+        fallback_daily_rows = 0
+        fallback_reason = ""
+
+        # If the user keeps IEX selected, make a best-effort broad-market SIP
+        # delayed request.  If Alpaca rejects it for the account, the diagnostic
+        # endpoint will show the error and the worker continues on IEX.
+        should_try_delayed_sip = (
+            configured_feed == "iex"
+            and bool(getattr(self.live, "allow_extended_hours_entries", False))
+            and str(getattr(self.live, "strategy_run_mode", "single")).lower() == "all_strategies"
+        )
+        if should_try_delayed_sip:
+            delayed_end = now - timedelta(minutes=16)
+            if pd.Timestamp(delayed_end) > pd.Timestamp(fetch_start_5m):
+                try:
+                    delayed_bars = self.data_client.get_stock_bars(all_symbols, "5Min", fetch_start_5m, delayed_end, feed="sip", adjustment="split", use_cache=False, session_mode=session_mode)
+                    delayed_daily = self.data_client.get_stock_bars(all_symbols, "1Day", fetch_start_daily, delayed_end, feed="sip", adjustment="split", use_cache=False, session_mode=session_mode)
+                    fallback_rows = int(0 if delayed_bars is None else len(delayed_bars))
+                    fallback_daily_rows = int(0 if delayed_daily is None else len(delayed_daily))
+                    if delayed_bars is not None and not delayed_bars.empty:
+                        bars_5m_new = pd.concat([bars_5m_new, delayed_bars], ignore_index=True) if bars_5m_new is not None and not bars_5m_new.empty else delayed_bars
+                        effective_feed = "iex+sip_16m_delay"
+                        fallback_reason = "IEX real-time plus SIP bars delayed by 16 minutes for broader free-plan diagnostics."
+                    elif not fallback_reason:
+                        fallback_reason = "Delayed SIP/SIP fallback returned no 5-minute bars; continuing with IEX only."
+                    if delayed_daily is not None and not delayed_daily.empty:
+                        daily_new = pd.concat([daily_new, delayed_daily], ignore_index=True) if daily_new is not None and not daily_new.empty else delayed_daily
+                except Exception as exc:
+                    fallback_reason = f"delayed SIP/SIP fallback failed: {str(exc)[:220]}"
+
         try:
             latest_by_symbol = {}
+            stale_symbols = []
+            missing_symbols = []
             if bars_5m_new is not None and not bars_5m_new.empty:
                 tmp = bars_5m_new.copy()
                 tmp["timestamp"] = pd.to_datetime(tmp["timestamp"], utc=True, errors="coerce")
-                latest_by_symbol = {str(sym): ts.isoformat() for sym, ts in tmp.groupby("symbol")["timestamp"].max().items()}
+                tmp = tmp.dropna(subset=["timestamp"])
+                latest_series = tmp.groupby("symbol")["timestamp"].max()
+                latest_by_symbol = {str(sym): ts.isoformat() for sym, ts in latest_series.items()}
+                max_age = float(self._max_bar_age_minutes())
+                for sym in all_symbols:
+                    ts = latest_series.get(sym)
+                    if ts is None or pd.isna(ts):
+                        missing_symbols.append(sym)
+                    else:
+                        age = self._bar_age_minutes(ts, now=now)
+                        if age is None or age > max_age:
+                            stale_symbols.append({"symbol": sym, "age_minutes": age})
+            else:
+                missing_symbols = all_symbols
             self.store.set_state("last_bar_fetch", {
                 "updated_at_utc": utc_now_iso(),
                 "session_mode": session_mode,
-                "feed": self.live.feed,
+                "configured_feed": configured_feed,
+                "primary_api_feed": primary_api_feed,
+                "effective_feed": effective_feed,
+                "feed": effective_feed,
                 "symbols_requested": len(all_symbols),
                 "bars_5m_rows": int(0 if bars_5m_new is None else len(bars_5m_new)),
                 "daily_rows": int(0 if daily_new is None else len(daily_new)),
+                "fallback_sip_16m_rows": fallback_rows,
+                "fallback_sip_16m_daily_rows": fallback_daily_rows,
+                "fallback_note": fallback_reason,
                 "latest_5m_by_symbol": latest_by_symbol,
+                "missing_symbols": missing_symbols[:50],
+                "stale_symbols": stale_symbols[:50],
+                "max_bar_age_minutes": self._max_bar_age_minutes(),
+                "api_errors": getattr(self.data_client, "last_request_errors", [])[-20:],
+                "free_plan_note": "Alpaca Basic/free historical bars can use IEX without subscription; SIP is broad-market and may require paid real-time entitlement unless queried with enough delay. IEX is single-exchange and can be sparse in extended hours.",
             })
         except Exception:
             pass
@@ -1218,7 +1469,11 @@ class LivePaperTradingEngine:
         def rng(prefix_name: str, suffix: str, default: float) -> float:
             return float(getattr(self.params, f"{prefix_name}_{suffix}", default) or default)
 
+        age_min = self._bar_age_minutes(ts)
+        max_age_min = self._max_bar_age_minutes()
+        data_recent = bool(age_min is not None and age_min <= max_age_min)
         checks: list[dict[str, Any]] = []
+        checks.append(self._monitor_check("Data recency", "unknown" if age_min is None else round(age_min, 1), f"<= {max_age_min} min", data_recent, "data"))
         checks.append(self._monitor_check("Setup", trigger or "none", "latest bar has strategy setup", setup_signal, "required"))
         checks.append(self._monitor_check("Entry window", ts_et.strftime("%H:%M"), f"{self.live.entry_start_time_et}-{self.live.entry_end_time_et} ET", in_window, "required"))
         checks.append(self._monitor_check("Liquidity", "ok" if liquidity_ok else "blocked", "price/volume/ATR floor", liquidity_ok, "required"))
@@ -1337,8 +1592,59 @@ class LivePaperTradingEngine:
                 "abs_vwap_atr": abs_vwap,
                 "strategy_fields": {k: self._monitor_text(row, k) for k in ["quality", "v379_reason", "positive_context_profile_reason"] if k in row.index},
                 "bar_session_mode": self._live_session_mode(),
+                "bar_age_minutes": age_min,
+                "max_bar_age_minutes": max_age_min,
+                "data_recent_enough": data_recent,
             },
         }
+
+    def _monitor_record_from_feature_row(self, row: pd.Series | dict[str, Any], run_id: str, closed_ts: pd.Timestamp, status_hint: str = "Watching - no setup", reason_hint: str = "") -> dict[str, Any]:
+        """Build a symbol-monitor row from the latest usable indicator row even when no trade signal exists.
+
+        The previous implementation wrote a blank Waiting row whenever the final
+        signal frame did not line up with the wall-clock closed bar.  On the free
+        IEX feed, especially pre/after-hours, bars are sparse and can lag.  This
+        fallback keeps the professional panel useful by showing the latest close,
+        RVOL, ATR, relative-strength and VWAP readings, plus a clear reason that
+        no setup was active.
+        """
+        rec = self._monitor_record_from_latest_row(pd.Series(row), run_id, closed_ts)
+        if not bool(rec.get("setup_signal")):
+            rec["monitor_status"] = status_hint
+            rec["decision_status"] = "watching" if status_hint.lower().startswith("watching") else "waiting"
+            if reason_hint:
+                rec["reject_reason"] = reason_hint
+                base = str(rec.get("check_summary") or "")
+                rec["check_summary"] = (base + "; " if base else "") + reason_hint
+        payload = rec.get("payload") if isinstance(rec.get("payload"), dict) else {}
+        payload.update({"fallback_feature_row": True, "reason_hint": reason_hint})
+        rec["payload"] = payload
+        return rec
+
+    def _latest_feature_monitor_record(self, symbol: str, run_id: str, closed_ts: pd.Timestamp, frame: pd.DataFrame, status_hint: str, reason_hint: str) -> dict[str, Any] | None:
+        if frame is None or frame.empty or "timestamp" not in frame.columns:
+            return None
+        work = frame.copy()
+        work["timestamp"] = pd.to_datetime(work["timestamp"], utc=True, errors="coerce")
+        work = work.dropna(subset=["timestamp"]).sort_values("timestamp")
+        if work.empty:
+            return None
+        # Prefer same-session rows up to the worker's wall-clock closed bar, but
+        # keep the newest available row as a diagnostic fallback when IEX is sparse.
+        try:
+            today_ny = pd.Timestamp(closed_ts).tz_convert(NY).date()
+            same_day = work["timestamp"].dt.tz_convert(NY).dt.date.eq(today_ny)
+            candidates = work[same_day & (work["timestamp"] <= pd.Timestamp(closed_ts))].copy()
+            if candidates.empty:
+                candidates = work[work["timestamp"] <= pd.Timestamp(closed_ts)].copy()
+        except Exception:
+            candidates = work.copy()
+        if candidates.empty:
+            return None
+        row = candidates.iloc[-1].copy()
+        if "symbol" not in row.index or not str(row.get("symbol") or "").strip():
+            row["symbol"] = str(symbol).upper()
+        return self._monitor_record_from_feature_row(row, run_id, closed_ts, status_hint=status_hint, reason_hint=reason_hint)
 
     def _monitor_record_for_missing_symbol(self, symbol: str, run_id: str, closed_ts: pd.Timestamp, status: str, reason: str) -> dict[str, Any]:
         rec = self._symbol_monitor_base_config(symbol, run_id, status, reason)
@@ -1415,16 +1721,20 @@ class LivePaperTradingEngine:
                 if sym_5m.empty or sym_daily.empty:
                     monitor_records.append(self._monitor_record_for_missing_symbol(symbol, run_id, closed_ts, "Waiting - symbol data", "No recent 5-minute or daily bars for this symbol."))
                     continue
+                intraday = pd.DataFrame()
+                merged = pd.DataFrame()
                 try:
                     intraday = add_intraday_features(sym_5m, session_mode=session_mode)
-                    intraday = add_daily_features(intraday, sym_daily)
+                    intraday = _add_daily_features_live_safe(intraday, sym_daily)
                     merged = merge_market_context(intraday, qqq_context)
                     signals = compute_signals(merged, params)
                 except Exception as exc:
-                    monitor_records.append(self._monitor_record_for_missing_symbol(symbol, run_id, closed_ts, "Error - indicator calculation", str(exc)[:220]))
+                    fallback = self._latest_feature_monitor_record(symbol, run_id, closed_ts, merged if not merged.empty else (intraday if not intraday.empty else sym_5m), "Error - indicator calculation", str(exc)[:220])
+                    monitor_records.append(fallback or self._monitor_record_for_missing_symbol(symbol, run_id, closed_ts, "Error - indicator calculation", str(exc)[:220]))
                     continue
                 if signals.empty:
-                    monitor_records.append(self._monitor_record_for_missing_symbol(symbol, run_id, closed_ts, "Waiting - no indicator frame", "Indicator pipeline returned no rows."))
+                    fallback = self._latest_feature_monitor_record(symbol, run_id, closed_ts, merged if not merged.empty else intraday, "Watching - no setup", "Indicator pipeline produced rows but no strategy output for this strategy.")
+                    monitor_records.append(fallback or self._monitor_record_for_missing_symbol(symbol, run_id, closed_ts, "Waiting - no indicator frame", "Indicator pipeline returned no rows."))
                     continue
                 signals["timestamp"] = pd.to_datetime(signals["timestamp"], utc=True, errors="coerce")
                 signals["strategy_variant"] = strategy_variant
@@ -1441,10 +1751,13 @@ class LivePaperTradingEngine:
                     extra = ""
                     try:
                         if pd.notna(latest_raw):
-                            extra = f" Latest raw {self.live.feed} bar was {pd.Timestamp(latest_raw).tz_convert('America/New_York').strftime('%Y-%m-%d %H:%M')} ET."
+                            age = self._bar_age_minutes(latest_raw)
+                            age_txt = "" if age is None else f" age {age:.1f} min"
+                            extra = f" Latest raw {self.live.feed} bar was {pd.Timestamp(latest_raw).tz_convert('America/New_York').strftime('%Y-%m-%d %H:%M')} ET{age_txt}."
                     except Exception:
                         extra = ""
-                    monitor_records.append(self._monitor_record_for_missing_symbol(symbol, run_id, closed_ts, "Waiting - no latest bar", f"No same-day indicator row after {session_mode} filtering.{extra}"))
+                    fallback = self._latest_feature_monitor_record(symbol, run_id, closed_ts, merged if not merged.empty else signals, "Watching - latest usable bar", f"No same-day signal row aligned to the wall-clock bar after {session_mode} filtering; using latest available feature row for diagnostics.{extra}")
+                    monitor_records.append(fallback or self._monitor_record_for_missing_symbol(symbol, run_id, closed_ts, "Waiting - no latest bar", f"No same-day indicator row after {session_mode} filtering.{extra}"))
                 if "buy_alert" not in signals.columns:
                     continue
                 alert_mask = signals["buy_alert"].fillna(False).astype(bool)
@@ -1547,12 +1860,27 @@ class LivePaperTradingEngine:
                 self._write_symbol_monitor_records(monitor_records)
                 return selected_so_far
             selected_so_far["timestamp"] = pd.to_datetime(selected_so_far["timestamp"], utc=True, errors="coerce")
+            alerts_all["timestamp"] = pd.to_datetime(alerts_all["timestamp"], utc=True, errors="coerce")
+            # On Alpaca Basic/IEX the latest available historical bar can lag the
+            # wall-clock 5-minute slot or skip slots in pre/after-hours.  Use the
+            # latest available selected bar within a bounded age window instead of
+            # requiring timestamp == closed_ts.  Duplicate order protection still
+            # keys by strategy+symbol+signal time, so the same stale signal is not
+            # resubmitted every poll.
+            max_age_min = self._max_bar_age_minutes()
+            recent_cutoff = pd.Timestamp(closed_ts) - pd.Timedelta(minutes=max_age_min)
             if str(self.live.selection_mode).lower() == "latest_bar_only":
-                out = alerts_all[alerts_all["timestamp"] == closed_ts].copy()
+                recent_alerts = alerts_all[(alerts_all["timestamp"] <= closed_ts) & (alerts_all["timestamp"] >= recent_cutoff)].copy()
+                latest_signal_ts = recent_alerts["timestamp"].max() if not recent_alerts.empty else pd.NaT
+                out = recent_alerts[recent_alerts["timestamp"] == latest_signal_ts].copy() if pd.notna(latest_signal_ts) else pd.DataFrame()
                 selected_keys = set(out.apply(lambda r: self._candidate_audit_key(r), axis=1)) if not out.empty else set()
             else:
-                out = selected_so_far[selected_so_far["timestamp"] == closed_ts].copy()
+                selected_recent = selected_so_far[(selected_so_far["timestamp"] <= closed_ts) & (selected_so_far["timestamp"] >= recent_cutoff)].copy()
+                latest_signal_ts = selected_recent["timestamp"].max() if not selected_recent.empty else pd.NaT
+                out = selected_recent[selected_recent["timestamp"] == latest_signal_ts].copy() if pd.notna(latest_signal_ts) else pd.DataFrame()
                 selected_keys = set(out.apply(lambda r: self._candidate_audit_key(r), axis=1)) if not out.empty else set()
+            if out.empty and not selected_so_far.empty:
+                self._audit_candidates(selected_so_far.copy(), run_id, "rejected", f"no_recent_selected_bar_within_{max_age_min}_minutes_of_worker_clock", stage="topn_latest", rank_col="score")
             not_selected = alerts_all[~alerts_all.apply(lambda r: self._candidate_audit_key(r) in selected_keys, axis=1)].copy()
             self._audit_candidates(not_selected, run_id, "rejected", "not_latest_selected_candidate_or_topn_cap", stage="topn_latest", rank_col="score")
             if out.empty:
@@ -1608,7 +1936,7 @@ class LivePaperTradingEngine:
                 self.params = original_params
             self._write_symbol_monitor_records(records)
             return pd.DataFrame()
-        qqq_context = build_qqq_context(qqq_5m, qqq_daily, session_mode=session_mode)
+        qqq_context = _build_qqq_context_live_safe(qqq_5m, qqq_daily, session_mode=session_mode)
         selected_frames: list[pd.DataFrame] = []
         scan_summary = {
             "updated_at_utc": utc_now_iso(),
@@ -1616,6 +1944,7 @@ class LivePaperTradingEngine:
             "closed_bar_utc": pd.Timestamp(closed_ts).isoformat(),
             "session_mode": session_mode,
             "feed": self.live.feed,
+            "max_bar_age_minutes": self._max_bar_age_minutes(),
             "symbols": symbols,
             "strategy_run_mode": getattr(self.live, "strategy_run_mode", "single"),
             "strategies": [],
@@ -1646,6 +1975,26 @@ class LivePaperTradingEngine:
                     "error": str(exc)[:300],
                 })
                 self.store.insert_event("strategy_scan_error", {"strategy_variant": spec.get("variant"), "message": str(exc)}, status="error")
+                # Keep the Live Symbol Intelligence panel complete even if one
+                # experimental strategy errors.  Without this, all-strategies mode
+                # can show fewer strategy views than active_strategy_count and make
+                # the dashboard look like data is missing.
+                original_params = self.params
+                try:
+                    self.params = params
+                    err_records = [
+                        self._monitor_record_for_missing_symbol(
+                            s,
+                            run_id,
+                            closed_ts,
+                            "Error - strategy scan",
+                            f"Strategy scan failed before symbol checks: {str(exc)[:180]}",
+                        )
+                        for s in symbols
+                    ]
+                    self._write_symbol_monitor_records(err_records)
+                finally:
+                    self.params = original_params
         try:
             scan_summary["selected_total"] = int(sum(int(x.get("selected_signals", 0) or 0) for x in scan_summary["strategies"]))
             self.store.set_state("last_strategy_scan_summary", scan_summary)
