@@ -162,6 +162,54 @@ class AlpacaTradingClient:
             return f"{max(qty, 0.0):.3f}"
         return str(max(int(math.floor(float(qty))), 0))
 
+
+    def submit_limit_order(
+        self,
+        symbol: str,
+        side: str,
+        qty: float,
+        limit_price: float,
+        client_order_id: str,
+        fractional: bool = False,
+        extended_hours: bool = False,
+        time_in_force: str = "day",
+    ) -> OrderResult:
+        """Submit a simple equity limit order.
+
+        Alpaca extended-hours eligible orders must be limit orders with day/gtc
+        time-in-force.  This method is used by the paper worker outside regular
+        session; regular-session entries keep using market bracket orders.
+        """
+        side = str(side).lower().strip()
+        if side not in {"buy", "sell"}:
+            raise ValueError("Alpaca order side must be buy or sell.")
+        qty_text = self._round_qty(qty, fractional=fractional)
+        if float(qty_text) <= 0:
+            raise ValueError("Calculated quantity is zero. Increase risk budget or use a symbol with lower risk/share.")
+        tif = str(time_in_force or "day").lower().strip()
+        if extended_hours and tif not in {"day", "gtc"}:
+            raise ValueError("Extended-hours Alpaca orders require time_in_force day or gtc.")
+        payload = {
+            "symbol": symbol.upper(),
+            "qty": qty_text,
+            "side": side,
+            "type": "limit",
+            "time_in_force": tif,
+            "limit_price": self._round_price(limit_price),
+            "client_order_id": client_order_id[:48],
+        }
+        if extended_hours:
+            payload["extended_hours"] = True
+        response = dict(self._request("POST", "/orders", json=payload))
+        return OrderResult(
+            ok=True,
+            status=str(response.get("status", "submitted")),
+            symbol=symbol.upper(),
+            side=side,
+            qty=float(qty_text),
+            response=response,
+        )
+
     def submit_market_bracket_order(
         self,
         symbol: str,

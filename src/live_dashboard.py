@@ -824,7 +824,10 @@ def symbol_monitor_summary(df: pd.DataFrame, heartbeat: dict[str, Any] | None = 
     symbols_seen = int(df["symbol"].astype(str).str.upper().nunique()) if "symbol" in df.columns else len(df)
     strategies_seen = int(df["strategy_variant"].astype(str).nunique()) if "strategy_variant" in df.columns else active_count
     mode_text = "all strategies" if run_mode == "all_strategies" else "single strategy"
-    return f"Monitoring {symbols_seen}/{configured or symbols_seen} symbols across {strategies_seen} strategy view(s) ({mode_text}), {len(df)} rows. Selected/candidate: {selected + candidates}; blocked: {blocked}; watching: {watching}; paused/waiting: {paused}. Last symbol snapshot {last}."
+    session_mode = heartbeat.get("bar_session_mode") or ("extended_hours" if heartbeat.get("allow_extended_hours_entries") else "regular_only")
+    feed = heartbeat.get("feed", "")
+    feed_note = " IEX is a limited free feed, so some extended-hours symbols may have sparse/no bars." if str(feed).lower() == "iex" and str(session_mode).lower().startswith("extended") else ""
+    return f"Monitoring {symbols_seen}/{configured or symbols_seen} symbols across {strategies_seen} strategy view(s) ({mode_text}), {len(df)} rows. Data session: {session_mode}; feed: {feed}. Selected/candidate: {selected + candidates}; blocked: {blocked}; watching: {watching}; paused/waiting: {paused}. Last symbol snapshot {last}.{feed_note}"
 
 def format_events(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
@@ -904,9 +907,11 @@ def load_live_paper_snapshot(days: int = 7) -> dict[str, Any]:
             "symbol_monitor": len(snapshot.get("symbol_monitor")) if isinstance(snapshot.get("symbol_monitor"), pd.DataFrame) else 0,
         }
         if heartbeat:
+            session_mode = heartbeat.get('bar_session_mode') or ('extended_hours' if heartbeat.get('allow_extended_hours_entries') else 'regular_only')
             status = (
                 f"Live monitor refreshed {datetime.now(timezone.utc).astimezone().strftime('%Y-%m-%d %H:%M:%S')}. "
                 f"Worker status: {heartbeat.get('status', 'unknown')} ({_age_text(heartbeat.get('updated_at_utc'))}). "
+                f"Data session: {session_mode}; feed: {heartbeat.get('feed', '--')}. "
                 f"Loaded {counts['trades']} trades, {counts['orders']} orders, {counts['plans']} signal plans, "
                 f"{counts['open_positions']} open positions, {counts['closed_positions']} closed positions, "
                 f"{counts['symbol_monitor']} symbol monitor rows, and {counts['events']} events from the shared DB."

@@ -677,6 +677,7 @@ class LivePaperTradingEngine:
             "entry_end_time_et": getattr(self.live, "entry_end_time_et", "15:55"),
             "allow_extended_hours_entries": getattr(self.live, "allow_extended_hours_entries", False),
             "force_market_open": getattr(self.live, "force_market_open", True),
+            "bar_session_mode": self._live_session_mode(),
         }
         if extra:
             payload.update(extra)
@@ -713,6 +714,53 @@ class LivePaperTradingEngine:
             if bool(getattr(self.live, "allow_extended_hours_entries", False)):
                 return _time_in_window(pd.Timestamp(ny), getattr(self.live, "entry_start_time_et", "04:00"), getattr(self.live, "entry_end_time_et", "20:00"))
             return _time_in_window(pd.Timestamp(ny), max(str(getattr(self.live, "entry_start_time_et", "09:35")), "09:30"), min(str(getattr(self.live, "entry_end_time_et", "15:55")), "16:00"))
+
+    def _live_session_mode(self) -> str:
+        """Which bar session the live indicator pipeline should evaluate.
+
+        The original live strategies were regular-session backtests.  When the
+        dashboard explicitly enables extended-hours entries we must feed
+        pre/post-market bars into add_intraday_features()/QQQ context; otherwise
+        the indicator pipeline filters them out as regular_only and every
+        premarket symbol appears as 0/0 checks.
+        """
+        return "extended_hours" if bool(getattr(self.live, "allow_extended_hours_entries", False)) else "regular_only"
+
+    def _is_regular_session_time(self, ts: pd.Timestamp | datetime | None = None) -> bool:
+        ts = pd.Timestamp(ts or datetime.now(NY))
+        if ts.tzinfo is None:
+            ts = ts.tz_localize(NY)
+        else:
+            ts = ts.tz_convert(NY)
+        return ts.weekday() < 5 and _time_in_window(ts, "09:30", "16:00")
+
+    def _is_extended_session_order_context(self, signal_time: Any | None = None) -> bool:
+        if not bool(getattr(self.live, "allow_extended_hours_entries", False)):
+            return False
+        try:
+            sig_ts = pd.Timestamp(signal_time) if signal_time is not None else pd.Timestamp.now(tz=NY)
+            if sig_ts.tzinfo is None:
+                sig_ts = sig_ts.tz_localize("UTC")
+            return not self._is_regular_session_time(sig_ts)
+        except Exception:
+            return not self._is_regular_session_time()
+
+    def _extended_limit_price(self, plan: dict[str, Any]) -> float:
+        """Marketable protective limit for paper extended-hours entries.
+
+        Alpaca only accepts extended-hours eligible equity orders as limit orders
+        with day/gtc TIF.  For paper testing we use a small configurable buffer
+        around the quote/reference price so the order behaves similarly to a
+        marketable entry while still satisfying Alpaca's extended-hours rules.
+        """
+        ref = _safe_float(plan.get("entry_reference_price"), _safe_float(plan.get("signal_close"), 0.0))
+        if ref <= 0:
+            return 0.0
+        cfg = getattr(self, "_runtime_config", {}) if isinstance(getattr(self, "_runtime_config", {}), dict) else {}
+        bps = max(0.0, _safe_float(cfg.get("extended_limit_buffer_bps", cfg.get("slippage_bps", 5.0)), 5.0))
+        side = str(plan.get("alpaca_side", "buy")).lower()
+        price = ref * (1.0 + bps / 10000.0) if side == "buy" else ref * (1.0 - bps / 10000.0)
+        return _round_price(price)
 
     def _parse_strategy_client_order_id(self, client_order_id: str) -> dict[str, Any] | None:
         cid = str(client_order_id or "").strip()
@@ -863,6 +911,7 @@ class LivePaperTradingEngine:
         keep_start = now - timedelta(days=max(35, int(self.live.lookback_days)))
         symbols = list(dict.fromkeys([s.upper() for s in (self.live.symbols or []) if s]))
         all_symbols = list(dict.fromkeys(["QQQ"] + symbols))
+        session_mode = self._live_session_mode()
         if self._bars_5m_cache.empty:
             fetch_start_5m = keep_start
         else:
@@ -870,8 +919,25 @@ class LivePaperTradingEngine:
             incremental_start = now - timedelta(days=max(1, int(self.live.incremental_fetch_days)))
             fetch_start_5m = max(incremental_start, latest - timedelta(minutes=30))
         fetch_start_daily = now - timedelta(days=max(45, int(self.live.lookback_days) + 20))
-        bars_5m_new = self.data_client.get_stock_bars(all_symbols, "5Min", fetch_start_5m, end_dt, feed=self.live.feed, adjustment="split", use_cache=False)
-        daily_new = self.data_client.get_stock_bars(all_symbols, "1Day", fetch_start_daily, end_dt, feed=self.live.feed, adjustment="split", use_cache=False)
+        bars_5m_new = self.data_client.get_stock_bars(all_symbols, "5Min", fetch_start_5m, end_dt, feed=self.live.feed, adjustment="split", use_cache=False, session_mode=session_mode)
+        daily_new = self.data_client.get_stock_bars(all_symbols, "1Day", fetch_start_daily, end_dt, feed=self.live.feed, adjustment="split", use_cache=False, session_mode=session_mode)
+        try:
+            latest_by_symbol = {}
+            if bars_5m_new is not None and not bars_5m_new.empty:
+                tmp = bars_5m_new.copy()
+                tmp["timestamp"] = pd.to_datetime(tmp["timestamp"], utc=True, errors="coerce")
+                latest_by_symbol = {str(sym): ts.isoformat() for sym, ts in tmp.groupby("symbol")["timestamp"].max().items()}
+            self.store.set_state("last_bar_fetch", {
+                "updated_at_utc": utc_now_iso(),
+                "session_mode": session_mode,
+                "feed": self.live.feed,
+                "symbols_requested": len(all_symbols),
+                "bars_5m_rows": int(0 if bars_5m_new is None else len(bars_5m_new)),
+                "daily_rows": int(0 if daily_new is None else len(daily_new)),
+                "latest_5m_by_symbol": latest_by_symbol,
+            })
+        except Exception:
+            pass
         self._bars_5m_cache = _merge_bar_cache(self._bars_5m_cache, bars_5m_new, keep_start)
         self._daily_cache = _merge_bar_cache(self._daily_cache, daily_new, fetch_start_daily)
         return self._bars_5m_cache.copy(), self._daily_cache.copy()
@@ -1074,7 +1140,7 @@ class LivePaperTradingEngine:
             "checks_passed": 0,
             "checks_total": 0,
             "check_summary": reason or status,
-            "payload": {"reason": reason, "symbols_configured": len(self.live.symbols or [])},
+            "payload": {"reason": reason, "symbols_configured": len(self.live.symbols or []), "bar_session_mode": self._live_session_mode()},
         }
 
     def _idle_symbol_monitor_records(self, run_id: str, status: str, reason: str) -> list[dict[str, Any]]:
@@ -1270,6 +1336,7 @@ class LivePaperTradingEngine:
                 "directional_vwap_atr": dir_vwap,
                 "abs_vwap_atr": abs_vwap,
                 "strategy_fields": {k: self._monitor_text(row, k) for k in ["quality", "v379_reason", "positive_context_profile_reason"] if k in row.index},
+                "bar_session_mode": self._live_session_mode(),
             },
         }
 
@@ -1334,7 +1401,7 @@ class LivePaperTradingEngine:
             return all_live_strategy_specs()
         return [_spec_for_preset_or_variant(getattr(self.params, "live_strategy_preset", "manual"), getattr(self.params, "live_strategy_variant", getattr(self.live, "strategy_variant", "best_report_153601")), getattr(self.params, "live_quality_gate", "off"))]
 
-    def _fetch_recent_signals_for_params(self, run_id: str, closed_ts: pd.Timestamp, today_ny: Any, symbols: list[str], bars_5m: pd.DataFrame, daily: pd.DataFrame, qqq_context: pd.DataFrame, params: StrategyParams) -> pd.DataFrame:
+    def _fetch_recent_signals_for_params(self, run_id: str, closed_ts: pd.Timestamp, today_ny: Any, symbols: list[str], bars_5m: pd.DataFrame, daily: pd.DataFrame, qqq_context: pd.DataFrame, params: StrategyParams, session_mode: str = "regular_only") -> pd.DataFrame:
         monitor_records: list[dict[str, Any]] = []
         frames: list[pd.DataFrame] = []
         original_params = self.params
@@ -1349,7 +1416,7 @@ class LivePaperTradingEngine:
                     monitor_records.append(self._monitor_record_for_missing_symbol(symbol, run_id, closed_ts, "Waiting - symbol data", "No recent 5-minute or daily bars for this symbol."))
                     continue
                 try:
-                    intraday = add_intraday_features(sym_5m)
+                    intraday = add_intraday_features(sym_5m, session_mode=session_mode)
                     intraday = add_daily_features(intraday, sym_daily)
                     merged = merge_market_context(intraday, qqq_context)
                     signals = compute_signals(merged, params)
@@ -1370,7 +1437,14 @@ class LivePaperTradingEngine:
                     latest_row = latest_frame.sort_values("timestamp").iloc[-1]
                     monitor_records.append(self._monitor_record_from_latest_row(latest_row, run_id, closed_ts))
                 else:
-                    monitor_records.append(self._monitor_record_for_missing_symbol(symbol, run_id, closed_ts, "Waiting - no latest bar", "No same-day indicator row at the latest closed bar."))
+                    latest_raw = pd.to_datetime(sym_5m.get("timestamp"), utc=True, errors="coerce").max() if "timestamp" in sym_5m.columns else None
+                    extra = ""
+                    try:
+                        if pd.notna(latest_raw):
+                            extra = f" Latest raw {self.live.feed} bar was {pd.Timestamp(latest_raw).tz_convert('America/New_York').strftime('%Y-%m-%d %H:%M')} ET."
+                    except Exception:
+                        extra = ""
+                    monitor_records.append(self._monitor_record_for_missing_symbol(symbol, run_id, closed_ts, "Waiting - no latest bar", f"No same-day indicator row after {session_mode} filtering.{extra}"))
                 if "buy_alert" not in signals.columns:
                     continue
                 alert_mask = signals["buy_alert"].fillna(False).astype(bool)
@@ -1509,6 +1583,7 @@ class LivePaperTradingEngine:
         today_ny = closed_ts.tz_convert("America/New_York").date()
         symbols = list(dict.fromkeys([s.upper() for s in (self.live.symbols or []) if s]))
         bars_5m, daily = self._update_bar_cache()
+        session_mode = self._live_session_mode()
         specs = self._strategy_specs_for_current_run()
         if bars_5m.empty or daily.empty:
             records = []
@@ -1533,13 +1608,49 @@ class LivePaperTradingEngine:
                 self.params = original_params
             self._write_symbol_monitor_records(records)
             return pd.DataFrame()
-        qqq_context = build_qqq_context(qqq_5m, qqq_daily)
+        qqq_context = build_qqq_context(qqq_5m, qqq_daily, session_mode=session_mode)
         selected_frames: list[pd.DataFrame] = []
+        scan_summary = {
+            "updated_at_utc": utc_now_iso(),
+            "run_id": run_id,
+            "closed_bar_utc": pd.Timestamp(closed_ts).isoformat(),
+            "session_mode": session_mode,
+            "feed": self.live.feed,
+            "symbols": symbols,
+            "strategy_run_mode": getattr(self.live, "strategy_run_mode", "single"),
+            "strategies": [],
+        }
         for spec in specs:
             params = self._make_params_for_live_config(getattr(self, "_runtime_config", {}), spec.get("preset"), spec.get("variant"), spec.get("quality_gate"))
-            selected = self._fetch_recent_signals_for_params(run_id, closed_ts, today_ny, symbols, bars_5m, daily, qqq_context, params)
-            if selected is not None and not selected.empty:
-                selected_frames.append(selected)
+            try:
+                selected = self._fetch_recent_signals_for_params(run_id, closed_ts, today_ny, symbols, bars_5m, daily, qqq_context, params, session_mode=session_mode)
+                selected_count = int(0 if selected is None else len(selected))
+                scan_summary["strategies"].append({
+                    "variant": spec.get("variant"),
+                    "preset": spec.get("preset"),
+                    "quality_gate": spec.get("quality_gate"),
+                    "code": spec.get("code"),
+                    "selected_signals": selected_count,
+                    "status": "ok",
+                })
+                if selected is not None and not selected.empty:
+                    selected_frames.append(selected)
+            except Exception as exc:
+                scan_summary["strategies"].append({
+                    "variant": spec.get("variant"),
+                    "preset": spec.get("preset"),
+                    "quality_gate": spec.get("quality_gate"),
+                    "code": spec.get("code"),
+                    "selected_signals": 0,
+                    "status": "error",
+                    "error": str(exc)[:300],
+                })
+                self.store.insert_event("strategy_scan_error", {"strategy_variant": spec.get("variant"), "message": str(exc)}, status="error")
+        try:
+            scan_summary["selected_total"] = int(sum(int(x.get("selected_signals", 0) or 0) for x in scan_summary["strategies"]))
+            self.store.set_state("last_strategy_scan_summary", scan_summary)
+        except Exception:
+            pass
         if not selected_frames:
             return pd.DataFrame()
         out = pd.concat(selected_frames, ignore_index=True)
@@ -1808,15 +1919,37 @@ class LivePaperTradingEngine:
                 self.store.upsert_signal_plan(log_row, status="dry_run_not_submitted")
             else:
                 try:
-                    result = self.trading_client.submit_market_bracket_order(
-                        symbol=plan["symbol"],
-                        side=plan["alpaca_side"],
-                        qty=float(plan["qty"]),
-                        take_profit_price=float(plan["target_price"]),
-                        stop_price=float(plan["stop_price"]),
-                        client_order_id=plan["client_order_id"],
-                        fractional=self.risk.allow_fractional,
-                    )
+                    extended_order = self._is_extended_session_order_context(plan.get("signal_time_utc"))
+                    if extended_order:
+                        limit_price = self._extended_limit_price(plan)
+                        if limit_price <= 0:
+                            raise ValueError("Cannot submit extended-hours order without a valid limit price.")
+                        result = self.trading_client.submit_limit_order(
+                            symbol=plan["symbol"],
+                            side=plan["alpaca_side"],
+                            qty=float(plan["qty"]),
+                            limit_price=limit_price,
+                            client_order_id=plan["client_order_id"],
+                            fractional=self.risk.allow_fractional,
+                            extended_hours=True,
+                            time_in_force="day",
+                        )
+                        log_row["order_mode"] = "extended_hours_simple_limit"
+                        log_row["limit_price"] = limit_price
+                        log_row["extended_hours"] = True
+                        log_row["message"] = "Extended-hours entry submitted as simple limit order; bracket target/stop are recorded for reporting but Alpaca extended-hours API does not accept market bracket entries."
+                    else:
+                        result = self.trading_client.submit_market_bracket_order(
+                            symbol=plan["symbol"],
+                            side=plan["alpaca_side"],
+                            qty=float(plan["qty"]),
+                            take_profit_price=float(plan["target_price"]),
+                            stop_price=float(plan["stop_price"]),
+                            client_order_id=plan["client_order_id"],
+                            fractional=self.risk.allow_fractional,
+                        )
+                        log_row["order_mode"] = "regular_market_bracket"
+                        log_row["extended_hours"] = False
                     log_row["alpaca_status"] = result.status
                     log_row["alpaca_order_id"] = result.response.get("id", "")
                     self.store.upsert_order(result.response)

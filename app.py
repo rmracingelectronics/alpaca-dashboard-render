@@ -138,7 +138,7 @@ def debug_live_state():
     try:
         store = LiveStore(initialize_schema=False)
         out["store"] = {"is_postgres": store.is_postgres}
-        for key in ["live_config_override", "settings", "heartbeat", "market_clock"]:
+        for key in ["live_config_override", "settings", "heartbeat", "market_clock", "last_bar_fetch", "last_strategy_scan_summary"]:
             value, updated_at = store.get_state_with_updated_at(key, None)
             out[key] = {"updated_at_utc": updated_at, "value": _safe_diag_value(value)}
         out["table_counts"] = {
