@@ -842,6 +842,90 @@ class LivePaperTradingEngine:
         daily_pl = equity - last_equity
         return equity, high_watermark, daily_pl
 
+    def _account_buying_power(self, account: dict[str, Any] | None = None) -> float:
+        """Conservative buying-power value for order sizing.
+
+        Alpaca can reject an order even when `buying_power` looks high if the
+        Reg-T/day-trading buckets are smaller or if previous orders already
+        reserve capital.  Use the smallest positive bucket we receive instead
+        of sizing from equity/risk alone.
+        """
+        account = account or {}
+        values: list[float] = []
+        for key in ("regt_buying_power", "buying_power", "daytrading_buying_power", "non_marginable_buying_power"):
+            val = _safe_float(account.get(key), 0.0)
+            if val > 0:
+                values.append(val)
+        return min(values) if values else 0.0
+
+    def _buying_power_safety_fraction(self) -> float:
+        """Configured reserve applied to Alpaca buying power before submitting orders."""
+        cfg = getattr(self, "_runtime_config", {}) if isinstance(getattr(self, "_runtime_config", {}), dict) else {}
+        return max(0.05, min(0.95, _safe_float(cfg.get("live_buying_power_safety_pct", 80.0), 80.0) / 100.0))
+
+    def _configured_notional_caps(self, equity: float, buying_power: float) -> list[tuple[str, float]]:
+        """Optional user-configured exposure caps.
+
+        These are safety rails, not a replacement for the existing risk/compounding
+        model. By default there is no hard-coded percent cap. If the dashboard/DB
+        explicitly sets live_max_order_notional_dollars or
+        live_max_position_notional_pct/max_position_notional_pct, those caps are
+        honored.
+        """
+        cfg = getattr(self, "_runtime_config", {}) if isinstance(getattr(self, "_runtime_config", {}), dict) else {}
+        caps: list[tuple[str, float]] = []
+        dollar_cap = _safe_float(cfg.get("live_max_order_notional_dollars", cfg.get("max_order_notional_dollars", 0.0)), 0.0)
+        if dollar_cap > 0:
+            caps.append(("configured_dollar_cap", dollar_cap))
+        pct_raw = cfg.get("live_max_position_notional_pct", cfg.get("max_position_notional_pct", 0.0))
+        pct_cap = _safe_float(pct_raw, 0.0)
+        # Backtest StrategyParams historically defaulted max_position_notional_pct to
+        # 9999 to effectively disable it. Treat <=0 and >=1000 as disabled in live.
+        if 0.0 < pct_cap < 1000.0:
+            base = max(float(equity or 0.0), 0.0)
+            if base > 0:
+                caps.append(("configured_equity_pct_cap", base * pct_cap / 100.0))
+        bp_pct_cap = _safe_float(cfg.get("live_max_order_buying_power_pct", 0.0), 0.0)
+        if 0.0 < bp_pct_cap <= 100.0 and buying_power > 0:
+            caps.append(("configured_buying_power_pct_cap", buying_power * bp_pct_cap / 100.0))
+        return [(name, val) for name, val in caps if val > 0]
+
+    def _order_notional_budget(self, buying_power: float, reserved_notional: float, remaining_capacity: int, strategy_multiplier: int) -> tuple[float, str]:
+        """Return the maximum notional allowed for the next order.
+
+        The existing strategy risk model still decides the desired dollar risk
+        using fixed risk / percent equity / controlled compounding. This function
+        only prevents Alpaca rejects by translating the shared paper account's
+        current buying power into an execution budget.
+
+        In all-strategies mode, many strategies can signal in the same scan. The
+        default allocation is therefore per remaining available slot, derived from
+        max_daily_trades/max_open_positions and active_strategy_count. This is not
+        a hard-coded 10% cap; it adapts to the user's existing capacity settings
+        and current Alpaca buying power.
+        """
+        usable_bp = max(0.0, float(buying_power or 0.0) * self._buying_power_safety_fraction() - float(reserved_notional or 0.0))
+        if usable_bp <= 0:
+            return 0.0, "no_usable_buying_power"
+        cfg = getattr(self, "_runtime_config", {}) if isinstance(getattr(self, "_runtime_config", {}), dict) else {}
+        mode = str(cfg.get("live_budget_allocation_mode", "per_available_slot") or "per_available_slot").strip().lower()
+        if mode in {"full_available", "shared_full"}:
+            cap = usable_bp
+            reason = "available_buying_power"
+        elif mode in {"per_configured_slot", "per_configured_capacity"}:
+            configured_slots = max(1, int(getattr(self.live, "max_open_positions", 1) or 1) * max(1, int(strategy_multiplier or 1)))
+            cap = usable_bp / configured_slots
+            reason = f"buying_power_per_configured_slot_{configured_slots}"
+        else:
+            slots = max(1, int(remaining_capacity or 1))
+            cap = usable_bp / slots
+            reason = f"buying_power_per_remaining_slot_{slots}"
+        for cap_name, cap_val in self._configured_notional_caps(self._last_equity_for_budget if hasattr(self, "_last_equity_for_budget") else 0.0, buying_power):
+            if cap_val > 0 and cap_val < cap:
+                cap = cap_val
+                reason = cap_name
+        return max(0.0, cap), reason
+
     def _market_is_open(self) -> bool:
         if not self.live.force_market_open:
             return True
@@ -2096,7 +2180,7 @@ class LivePaperTradingEngine:
         )
         return self._make_params_for_live_config(getattr(self, "_runtime_config", {}), spec.get("preset"), spec.get("variant"), spec.get("quality_gate"))
 
-    def build_order_plan(self, signal: pd.Series, equity: float, high_watermark: float, reference_price: float | None = None, params: StrategyParams | None = None) -> dict[str, Any] | None:
+    def build_order_plan(self, signal: pd.Series, equity: float, high_watermark: float, reference_price: float | None = None, params: StrategyParams | None = None, max_notional: float | None = None, max_notional_reason: str = "") -> dict[str, Any] | None:
         params = params or self._params_for_signal(signal)
         side = str(signal.get("side", "")).lower()
         if side not in {"long", "short"}:
@@ -2107,21 +2191,43 @@ class LivePaperTradingEngine:
         if entry_price <= 0 or atr_value <= 0:
             return None
         risk_per_share = max(entry_price * float(getattr(params, "v25_min_stop_pct", 0.0015)), float(getattr(params, "v25_stop_atr_mult", 0.60)) * atr_value)
+        # Alpaca validates bracket stop/target prices against its own base price,
+        # which can move a few cents from our quote/reference price before the
+        # order reaches /orders.  A tiny ATR-based stop can round to the same
+        # cent as the base price and be rejected (for example: stop_loss.stop_price
+        # must be >= base_price + 0.01 on a short bracket).  Force a practical
+        # minimum distance before sizing so the stop widening is included in qty.
+        min_order_distance = max(0.05, entry_price * 0.0005)
+        risk_per_share = max(risk_per_share, min_order_distance)
         if risk_per_share <= 0:
             return None
         target_r = float(getattr(params, "v25_target_r", 0.75))
         if side == "long":
-            stop_price = entry_price - risk_per_share
-            target_price = entry_price + target_r * risk_per_share
+            stop_price = min(entry_price - risk_per_share, entry_price - min_order_distance)
+            target_price = max(entry_price + target_r * risk_per_share, entry_price + min_order_distance)
         else:
-            stop_price = entry_price + risk_per_share
-            target_price = entry_price - target_r * risk_per_share
+            stop_price = max(entry_price + risk_per_share, entry_price + min_order_distance)
+            target_price = min(entry_price - target_r * risk_per_share, entry_price - min_order_distance)
         risk_budget, effective_pct, dd_pct, paused = _v28_calculate_risk_budget(equity, high_watermark, params)
         if paused or risk_budget <= 0:
             return None
-        raw_qty = risk_budget / risk_per_share
+        uncapped_qty = risk_budget / risk_per_share
+        raw_qty = uncapped_qty
+        notional_cap = _safe_float(max_notional, 0.0)
+        notional_capped = False
+        if notional_cap > 0 and entry_price > 0:
+            cap_qty = notional_cap / entry_price
+            if cap_qty < raw_qty:
+                raw_qty = cap_qty
+                notional_capped = True
         qty = raw_qty if self.risk.allow_fractional else math.floor(raw_qty)
         if qty <= 0:
+            return None
+        estimated_notional = float(qty) * float(entry_price)
+        actual_risk_dollars = float(qty) * float(risk_per_share)
+        risk_budget_shortfall = max(0.0, float(risk_budget) - actual_risk_dollars)
+        min_actual_risk = max(0.0, _safe_float(getattr(params, "compounding_min_risk_dollars", self.risk.min_risk_dollars), self.risk.min_risk_dollars))
+        if notional_capped and min_actual_risk > 0 and actual_risk_dollars < min_actual_risk:
             return None
         sig_ts = pd.Timestamp(signal.get("timestamp")).tz_convert("UTC")
         ts_et = sig_ts.tz_convert("America/New_York")
@@ -2146,6 +2252,14 @@ class LivePaperTradingEngine:
             "effective_risk_pct": effective_pct,
             "drawdown_before_trade_pct": dd_pct,
             "qty": qty,
+            "uncapped_qty": uncapped_qty,
+            "estimated_notional": estimated_notional,
+            "actual_risk_dollars": actual_risk_dollars,
+            "risk_budget_shortfall": risk_budget_shortfall,
+            "risk_capped_by_budget": bool(risk_budget_shortfall > 0.01),
+            "notional_cap": notional_cap,
+            "notional_cap_reason": str(max_notional_reason or ""),
+            "notional_capped": notional_capped,
             "target_price": _round_price(target_price),
             "stop_price": _round_price(stop_price),
             "max_hold_until_utc": max_hold_until.isoformat(),
@@ -2244,6 +2358,8 @@ class LivePaperTradingEngine:
         rows.extend(self.enforce_max_hold_exits())
         existing = self._existing_symbols()
         equity, high_watermark, daily_pl = self._account_equity(account)
+        account_buying_power = self._account_buying_power(account)
+        self._last_equity_for_budget = equity
         if self._daily_loss_reached(daily_pl):
             row = {"timestamp": timestamp, "event": "daily_loss_limit", "message": "Daily loss limit reached; no new entries.", "daily_pl": daily_pl}
             rows.append(row)
@@ -2279,10 +2395,17 @@ class LivePaperTradingEngine:
             return rows
         quote_lookup = self._latest_reference_prices([str(s).upper() for s in signals["symbol"].dropna().unique().tolist()])
         taken = 0
+        reserved_notional = 0.0
+        attempted_symbols: set[str] = set()
+        buying_power_safety = self._buying_power_safety_fraction()
         for _, signal in signals.iterrows():
             sym = str(signal.get("symbol", "")).upper()
+            if sym in attempted_symbols:
+                self.store.upsert_candidate_audit(self._audit_record_from_signal(signal, timestamp, "rejected", "symbol_already_attempted_this_scan", stage="submit_checks"))
+                continue
             signal_params = self._params_for_signal(signal)
-            plan = self.build_order_plan(signal, equity, high_watermark, reference_price=quote_lookup.get(sym), params=signal_params)
+            order_notional_cap, order_notional_reason = self._order_notional_budget(account_buying_power, reserved_notional, capacity - taken, strategy_multiplier)
+            plan = self.build_order_plan(signal, equity, high_watermark, reference_price=quote_lookup.get(sym), params=signal_params, max_notional=order_notional_cap, max_notional_reason=order_notional_reason)
             if not plan:
                 self.store.upsert_candidate_audit(self._audit_record_from_signal(signal, timestamp, "rejected", "sizing_or_invalid_order_plan", stage="order_plan"))
                 continue
@@ -2296,8 +2419,12 @@ class LivePaperTradingEngine:
             if self._symbol_daily_count(plan["symbol"], plan["session_date"]) >= self.live.max_orders_per_symbol_per_day:
                 self.store.upsert_candidate_audit(self._audit_record_from_signal(signal, timestamp, "rejected", "symbol_daily_order_limit", stage="submit_checks", plan=plan))
                 continue
+            if account_buying_power > 0 and (reserved_notional + _safe_float(plan.get("estimated_notional"), 0.0)) > account_buying_power * buying_power_safety:
+                self.store.upsert_candidate_audit(self._audit_record_from_signal(signal, timestamp, "rejected", "buying_power_reserve_limit", stage="submit_checks", plan=plan))
+                continue
             self.store.upsert_candidate_audit(self._audit_record_from_signal(signal, timestamp, "accepted", "order_plan_created", stage="order_plan", plan=plan))
-            log_row = {"timestamp": timestamp, "event": "paper_order_plan", **plan, "dry_run": self.live.dry_run}
+            attempted_symbols.add(plan["symbol"])
+            log_row = {"timestamp": timestamp, "event": "paper_order_plan", **plan, "dry_run": self.live.dry_run, "account_buying_power": account_buying_power, "buying_power_safety_pct": buying_power_safety * 100.0, "reserved_notional_before_order": reserved_notional}
             if self.live.dry_run:
                 log_row["alpaca_status"] = "dry_run_not_submitted"
                 self.store.upsert_signal_plan(log_row, status="dry_run_not_submitted")
@@ -2339,6 +2466,7 @@ class LivePaperTradingEngine:
                     self.store.upsert_order(result.response)
                     self.store.upsert_signal_plan(log_row, status=result.status)
                     existing.add(plan["symbol"])
+                    reserved_notional += _safe_float(plan.get("estimated_notional"), 0.0)
                 except Exception as exc:
                     log_row["alpaca_status"] = "submit_error"
                     log_row["message"] = str(exc)

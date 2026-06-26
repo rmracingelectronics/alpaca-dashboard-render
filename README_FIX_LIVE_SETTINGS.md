@@ -155,3 +155,47 @@ Root cause: the worker wrote `live_strategy_symbol_monitor` rows one strategy at
 Fix: at the start of every all-strategies scan, the worker now publishes a complete scaffold of all active strategies x all configured symbols using status `Scanning - queued`. Each strategy then overwrites its own scaffold rows with real indicator/check data as it finishes. This makes the dashboard immediately show the expected coverage, e.g. 14 strategies x 16 symbols = 224 monitor rows, instead of showing only the first strategy that finished writing.
 
 This does not change live trading decisions, risk sizing, Alpaca order submission, data feed policy, or backtesting. It only fixes the visibility/diagnostic layer for all-strategies mode.
+
+## V13 - order budget / Alpaca rejection fix
+
+This build fixes order submission failures observed in the worker events table:
+
+- Alpaca 403 insufficient Reg-T buying power on repeated AMD short attempts.
+- Alpaca 422 bracket short stop-loss price too close to the base price.
+
+Changes:
+
+- Added conservative account buying-power detection using Alpaca account buckets (`regt_buying_power`, `buying_power`, `daytrading_buying_power`, `non_marginable_buying_power`).
+- Added a per-order notional cap so tiny stop distances cannot create very large positions. Default is 10% of equity in all-strategies mode and 25% in single-strategy mode. Override with `live_max_position_notional_pct` if needed.
+- Added an 80% buying-power safety reserve, overrideable with `live_buying_power_safety_pct`.
+- When a signal is capped, the order plan/report records `notional_capped`, `notional_cap`, `uncapped_qty`, and `estimated_notional`.
+- Added a practical minimum stop/target distance before sizing. This prevents Alpaca bracket rejections where a short stop rounds to the same cent as Alpaca's base price.
+- Prevents repeated order attempts for the same symbol inside the same worker scan after an attempted submission, reducing repeated 403/422 spam in all-strategies mode.
+
+The live Alpaca order path remains active:
+
+- Regular session: market bracket order.
+- Extended hours: simple limit order with `extended_hours=true` and `time_in_force=day`.
+
+
+## V14 risk/compounding correction
+
+V13 introduced a fixed default notional cap to prevent Alpaca buying-power rejects. That was too blunt for this project because the dashboard already has an explicit risk model: fixed-dollar risk, percent-equity risk, and controlled compounding with min/max risk dollars and drawdown throttles.
+
+V14 removes the hard-coded 10%/25% order cap. The live worker now keeps the existing risk budget calculation as the source of truth:
+
+- `fixed_dollar_risk` uses the configured fixed risk dollars.
+- `percent_equity` uses current Alpaca account equity and the configured base risk percent.
+- `controlled_compounding` uses current Alpaca equity, high-water mark, drawdown thresholds, min risk, max risk, and pause drawdown.
+
+After the target risk budget is calculated, the worker applies an execution affordability guard based on the live Alpaca paper account's current buying-power buckets. In all-strategies mode, the default allocation is based on the number of remaining configured strategy slots, derived from `max_open_positions`, `max_daily_trades`, and active strategy count. This prevents one tight-stop setup from consuming the whole paper account while keeping the user's risk model intact.
+
+The order plan now reports:
+
+- `risk_budget`: target risk from the selected risk/compounding model.
+- `actual_risk_dollars`: actual risk after any affordability sizing.
+- `risk_budget_shortfall`: difference between target and actual risk.
+- `notional_cap_reason`: why the quantity was capped, if it was capped.
+- `notional_capped`: whether the order size was reduced by the affordability guard.
+
+No strategy preset hides sizing or compounding. Risk settings remain separate from strategy selection.
